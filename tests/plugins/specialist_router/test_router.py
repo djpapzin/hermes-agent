@@ -58,6 +58,19 @@ def test_quota_rollouts_are_kept_separate_and_cached(tmp_path):
     assert q["sol"].weekly_remaining == 75
 
 
+def test_quota_uses_router_session_pool_when_codex_omits_model(tmp_path):
+    sessions = tmp_path / "codex" / "sessions"
+    sessions.mkdir(parents=True)
+    (tmp_path / "state.json").write_text(json.dumps({"attempts": [{"session_id": "spark-session", "pool": "spark"}]}))
+    (sessions / "spark.jsonl").write_text('\n'.join([
+        json.dumps({"type": "session_meta", "payload": {"session_id": "spark-session"}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "token_count", "rate_limits": {"primary": {"used_percent": 12}, "secondary": {"used_percent": 34}}}}),
+    ]))
+    q = Router(config(tmp_path)).quotas()
+    assert q["spark"].five_hour_remaining == 88
+    assert q["spark"].weekly_remaining == 66
+
+
 def test_plugin_registers_gateway_hook_status_and_tool(monkeypatch, tmp_path):
     seen = {"hooks": [], "commands": [], "tools": []}
     class Context:

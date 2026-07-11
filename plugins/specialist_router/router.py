@@ -81,17 +81,29 @@ class Router:
         if not force and self._quota_cache and now - self._quota_cache[0] < self.config.quota_cache_seconds:
             return self._quota_cache[1]
         pools = {"spark": PoolQuota(self.config.spark_model), "sol": PoolQuota(self.config.sol_model)}
+        known_sessions: dict[str, str] = {}
+        try:
+            state = json.loads(self.config.state_path.read_text())
+            known_sessions = {
+                str(a["session_id"]): str(a["pool"])
+                for a in state.get("attempts", [])
+                if a.get("session_id") and a.get("pool") in pools
+            }
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
         sessions = self.config.codex_home / "sessions"
         if sessions.exists():
             files = sorted(sessions.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
             for path in files[:250]:
                 model = None
+                session_id = None
                 latest = None
                 try:
                     for line in path.read_text(errors="replace").splitlines():
                         obj = json.loads(line)
                         payload = obj.get("payload") or {}
                         if obj.get("type") == "session_meta":
+                            session_id = payload.get("session_id") or payload.get("id")
                             model = payload.get("model") or (payload.get("model_config") or {}).get("model")
                         if obj.get("type") == "event_msg" and payload.get("type") == "thread_settings_applied":
                             model = (payload.get("thread_settings") or {}).get("model") or model
@@ -100,7 +112,9 @@ class Router:
                             latest = rate
                 except (OSError, json.JSONDecodeError):
                     continue
-                key = "spark" if model == self.config.spark_model else "sol" if model == self.config.sol_model else None
+                key = known_sessions.get(str(session_id))
+                if key is None:
+                    key = "spark" if model == self.config.spark_model else "sol" if model == self.config.sol_model else None
                 if key and latest and pools[key].observed_at is None:
                     primary, secondary = latest.get("primary") or {}, latest.get("secondary") or {}
                     pools[key] = PoolQuota(
