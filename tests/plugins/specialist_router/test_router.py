@@ -10,7 +10,9 @@ def config(tmp_path):
 
 
 def test_non_coding_stays_on_coordinator(tmp_path):
-    assert Router(config(tmp_path)).classify("What is the weather tomorrow?").route == "coordinator"
+    router = Router(config(tmp_path))
+    assert router.config.coordinator_model == "openai-api/gpt-5.6"
+    assert router.classify("What is the weather tomorrow?").route == "coordinator"
 
 
 def test_bounded_inspection_routes_spark(tmp_path):

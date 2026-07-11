@@ -4,7 +4,7 @@ The `specialist-router` plugin keeps ordinary Telegram conversation on the confi
 
 ## Policy
 
-- Coordinator: `openai/gpt-5.6` for conversation, planning, summaries, status, and final reports.
+- Coordinator: `openai-api/gpt-5.6` for conversation, planning, summaries, status, and final reports.
 - Spark: `gpt-5.3-codex-spark` for repository inspection, reproduction, focused tests, review, regression tests, and one bounded low-risk implementation attempt.
 - Sol: `gpt-5.6-sol` immediately for high-risk or multi-file work, or after one failed/uncertain/incomplete Spark attempt.
 - A successful sol implementation is independently reviewed by Spark.
@@ -21,7 +21,7 @@ plugins:
   enabled: [specialist-router]
   entries:
     specialist-router:
-      coordinator_model: openai/gpt-5.6
+      coordinator_model: openai-api/gpt-5.6
       spark_model: gpt-5.3-codex-spark
       sol_model: gpt-5.6-sol
       reserve_percent: 20

@@ -20,7 +20,7 @@ FAILURE = re.compile(r"\b(uncertain|incomplete|cannot reproduce|could not reprod
 
 @dataclass(frozen=True)
 class RouterConfig:
-    coordinator_model: str = "openai/gpt-5.6"
+    coordinator_model: str = "openai-api/gpt-5.6"
     spark_model: str = "gpt-5.3-codex-spark"
     sol_model: str = "gpt-5.6-sol"
     reserve_percent: float = 20.0
@@ -247,7 +247,14 @@ def _parse_codex_jsonl(text: str) -> tuple[str, str | None]:
 
 def _git_branch(repo: Path) -> str:
     try:
-        return subprocess.run(["git", "branch", "--show-current"], cwd=repo, text=True, capture_output=True, timeout=5).stdout.strip()
+        return subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=repo,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            capture_output=True,
+            timeout=5,
+        ).stdout.strip()
     except Exception:
         return ""
 
