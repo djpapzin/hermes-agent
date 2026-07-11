@@ -193,9 +193,9 @@ class Router:
         if simulate:
             return {"pool": pool, "model": model, "ok": False, "message": "simulated Spark failure", "session_id": None}
         if resume_session_id:
-            cmd = [self.config.codex_binary, "--ask-for-approval", "never", "exec", "resume", "--json", "-m", model, resume_session_id, prompt]
+            cmd = [self.config.codex_binary, "--ask-for-approval", "never", "exec", "resume", "--skip-git-repo-check", "--json", "-m", model, resume_session_id, prompt]
         else:
-            cmd = [self.config.codex_binary, "--ask-for-approval", "never", "exec", "--json", "--sandbox", "workspace-write", "-m", model, "-C", str(repo), prompt]
+            cmd = [self.config.codex_binary, "--ask-for-approval", "never", "exec", "--skip-git-repo-check", "--json", "--sandbox", "workspace-write", "-m", model, "-C", str(repo), prompt]
         proc = self._runner(cmd, cwd=repo, stdin=subprocess.DEVNULL, text=True, capture_output=True, timeout=self.config.timeout_seconds)
         message, session_id = _parse_codex_jsonl(proc.stdout)
         return {"pool": pool, "model": model, "ok": proc.returncode == 0 and bool(message), "message": message or proc.stderr[-2000:], "session_id": session_id}
