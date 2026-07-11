@@ -44,6 +44,19 @@ def test_sol_weekly_reserve_routes_noncritical_work_to_spark(tmp_path):
     assert r.reserve_active()
 
 
+def test_existing_specialist_session_is_resumed(tmp_path):
+    commands = []
+    def runner(cmd, **kwargs):
+        commands.append(cmd)
+        payload = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "continued"}})
+        return type("P", (), {"returncode": 0, "stdout": payload, "stderr": ""})()
+    Router(config(tmp_path), runner=runner).execute(
+        "Inspect this repository and run focused tests", str(tmp_path), resume_session_id="thread-123"
+    )
+    assert "resume" in commands[0]
+    assert "thread-123" in commands[0]
+
+
 def test_quota_rollouts_are_kept_separate_and_cached(tmp_path):
     sessions = tmp_path / "codex" / "sessions" / "2026" / "07" / "11"
     sessions.mkdir(parents=True)

@@ -30,7 +30,7 @@ plugins:
 
 Authentication remains in the existing global VM/Codex credential stores. The plugin never copies credentials into a project.
 
-The installed CLI was verified with `codex exec --model` and exposes `codex exec resume <session-id> --model ...` for session reuse. Each specialist result records its returned thread ID so a follow-up can resume the compact specialist context instead of rereading a repository.
+The installed CLI was verified with `codex exec --model` and exposes `codex exec resume <session-id> --model ...` for session reuse. Each specialist result records its returned thread ID; pass it back as `resume_session_id` so a follow-up resumes the compact specialist context instead of rereading a repository.
 
 ## Rollback
 

@@ -42,6 +42,7 @@ def register(ctx) -> None:
             repository=str(args.get("repository") or os.getcwd()),
             risk=str(args.get("risk") or "auto"),
             simulate_spark_failure=bool(args.get("simulate_spark_failure", False)),
+            resume_session_id=str(args.get("resume_session_id") or "") or None,
         )
         return json.dumps(result, ensure_ascii=False)
 
@@ -66,6 +67,7 @@ def register(ctx) -> None:
                     "repository": {"type": "string"},
                     "risk": {"type": "string", "enum": ["auto", "low", "high", "critical"]},
                     "simulate_spark_failure": {"type": "boolean"},
+                    "resume_session_id": {"type": "string", "description": "Optional Codex thread ID to resume instead of rereading repository context."},
                 },
                 "required": ["goal", "repository"],
             },

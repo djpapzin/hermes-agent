@@ -142,7 +142,7 @@ class Router:
             "Report meaningful route transitions and finish from the coordinator model.\n</specialist-route>"
         )
 
-    def execute(self, goal: str, repository: str, risk: str = "auto", simulate_spark_failure: bool = False) -> dict[str, Any]:
+    def execute(self, goal: str, repository: str, risk: str = "auto", simulate_spark_failure: bool = False, resume_session_id: str | None = None) -> dict[str, Any]:
         repo = Path(repository).expanduser().resolve()
         if not goal.strip():
             raise ValueError("goal is required")
@@ -158,11 +158,11 @@ class Router:
         handoff: dict[str, Any] | None = None
 
         if route == "sol" and decision.discovery_first:
-            discovery = self._invoke("spark", _discovery_prompt(goal), repo)
+            discovery = self._invoke("spark", _discovery_prompt(goal), repo, resume_session_id=resume_session_id)
             attempts.append(discovery)
             handoff = self._handoff(goal, repo, discovery)
         elif route == "spark":
-            spark = self._invoke("spark", goal, repo, simulate=simulate_spark_failure)
+            spark = self._invoke("spark", goal, repo, simulate=simulate_spark_failure, resume_session_id=resume_session_id)
             attempts.append(spark)
             if not spark["ok"] or FAILURE.search(spark.get("message", "")):
                 handoff = self._handoff(goal, repo, spark)
@@ -170,7 +170,7 @@ class Router:
 
         if route == "sol":
             prompt = goal if handoff is None else _handoff_prompt(handoff)
-            sol = self._invoke("sol", prompt, repo)
+            sol = self._invoke("sol", prompt, repo, resume_session_id=resume_session_id if not attempts else None)
             attempts.append(sol)
             if sol["ok"]:
                 review = self._invoke("spark", _review_prompt(goal, sol), repo)
@@ -187,12 +187,15 @@ class Router:
         self._save_state(state)
         return state
 
-    def _invoke(self, pool: str, prompt: str, repo: Path, simulate: bool = False) -> dict[str, Any]:
+    def _invoke(self, pool: str, prompt: str, repo: Path, simulate: bool = False, resume_session_id: str | None = None) -> dict[str, Any]:
         model = self.config.spark_model if pool == "spark" else self.config.sol_model
         if simulate:
             return {"pool": pool, "model": model, "ok": False, "message": "simulated Spark failure", "session_id": None}
-        cmd = ["codex", "--ask-for-approval", "never", "exec", "--json", "--sandbox", "workspace-write", "-m", model, "-C", str(repo), prompt]
-        proc = self._runner(cmd, text=True, capture_output=True, timeout=self.config.timeout_seconds)
+        if resume_session_id:
+            cmd = ["codex", "--ask-for-approval", "never", "exec", "resume", "--json", "-m", model, resume_session_id, prompt]
+        else:
+            cmd = ["codex", "--ask-for-approval", "never", "exec", "--json", "--sandbox", "workspace-write", "-m", model, "-C", str(repo), prompt]
+        proc = self._runner(cmd, cwd=repo, text=True, capture_output=True, timeout=self.config.timeout_seconds)
         message, session_id = _parse_codex_jsonl(proc.stdout)
         return {"pool": pool, "model": model, "ok": proc.returncode == 0 and bool(message), "message": message or proc.stderr[-2000:], "session_id": session_id}
 
