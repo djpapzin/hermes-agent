@@ -26,6 +26,7 @@ class RouterConfig:
     reserve_percent: float = 20.0
     quota_cache_seconds: int = 120
     timeout_seconds: int = 1800
+    codex_binary: str = "/home/ubuntu/.npm-global/bin/codex"
     codex_home: Path = Path.home() / ".codex"
     state_path: Path = Path.home() / ".hermes" / "specialist-router-state.json"
 
@@ -192,10 +193,10 @@ class Router:
         if simulate:
             return {"pool": pool, "model": model, "ok": False, "message": "simulated Spark failure", "session_id": None}
         if resume_session_id:
-            cmd = ["codex", "--ask-for-approval", "never", "exec", "resume", "--json", "-m", model, resume_session_id, prompt]
+            cmd = [self.config.codex_binary, "--ask-for-approval", "never", "exec", "resume", "--json", "-m", model, resume_session_id, prompt]
         else:
-            cmd = ["codex", "--ask-for-approval", "never", "exec", "--json", "--sandbox", "workspace-write", "-m", model, "-C", str(repo), prompt]
-        proc = self._runner(cmd, cwd=repo, text=True, capture_output=True, timeout=self.config.timeout_seconds)
+            cmd = [self.config.codex_binary, "--ask-for-approval", "never", "exec", "--json", "--sandbox", "workspace-write", "-m", model, "-C", str(repo), prompt]
+        proc = self._runner(cmd, cwd=repo, stdin=subprocess.DEVNULL, text=True, capture_output=True, timeout=self.config.timeout_seconds)
         message, session_id = _parse_codex_jsonl(proc.stdout)
         return {"pool": pool, "model": model, "ok": proc.returncode == 0 and bool(message), "message": message or proc.stderr[-2000:], "session_id": session_id}
 

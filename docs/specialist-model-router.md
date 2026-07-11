@@ -26,6 +26,7 @@ plugins:
       sol_model: gpt-5.6-sol
       reserve_percent: 20
       quota_cache_seconds: 120
+      codex_binary: /home/ubuntu/.npm-global/bin/codex
 ```
 
 Authentication remains in the existing global VM/Codex credential stores. The plugin never copies credentials into a project.
