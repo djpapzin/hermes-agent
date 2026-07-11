@@ -1,0 +1,7 @@
+name: specialist-router
+version: 1.0.0
+description: Quota-aware Codex specialist routing for coding tasks received by Hermes gateways.
+author: DJ Papzin
+hooks:
+  - pre_gateway_dispatch
+
