@@ -4,4 +4,3 @@ description: Quota-aware Codex specialist routing for coding tasks received by H
 author: DJ Papzin
 hooks:
   - pre_gateway_dispatch
-

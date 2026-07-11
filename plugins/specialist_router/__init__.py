@@ -72,4 +72,3 @@ def register(ctx) -> None:
         },
         handler=route_tool,
     )
-
