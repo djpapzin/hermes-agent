@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+FOLLOW_UP = re.compile(r"^(?:fix|repair|continue|resume|same issue|this issue|that issue|the issue|it)\b", re.I)
+
 
 CODING = re.compile(r"\b(code|repo(?:sitory)?|bug|fix|test|lint|type.?check|implement|refactor|migration|deploy|pr|diff|function|class|api|database)\b", re.I)
 HIGH_RISK = re.compile(r"\b(critical|urgent|production|security|auth(?:entication|orization)?|permission|concurren|migration|data.?integrity|architect|major refactor|multi[- ]file|state management)\b", re.I)
@@ -67,6 +69,49 @@ class Router:
         self._runner = runner
         self._clock = clock
         self._quota_cache: tuple[float, dict[str, PoolQuota]] | None = None
+
+    def _load_state(self) -> dict[str, Any]:
+        try:
+            state = json.loads(self.config.state_path.read_text())
+            return state if isinstance(state, dict) else {}
+        except (OSError, json.JSONDecodeError, TypeError):
+            return {}
+
+    def _looks_like_follow_up(self, goal: str) -> bool:
+        text = goal.strip()
+        return bool(text) and (len(text) <= 40 or bool(FOLLOW_UP.match(text)))
+
+    def _resolve_goal_context(self, goal: str) -> tuple[str, dict[str, Any] | None]:
+        state = self._load_state()
+        prior_goal = str(state.get("task") or state.get("original_task") or "").strip()
+        if not prior_goal or not self._looks_like_follow_up(goal):
+            return goal, None
+        attempts = [a for a in (state.get("attempts") or []) if isinstance(a, dict)]
+        failures = [a for a in attempts if not a.get("ok")]
+        if not failures and not state.get("routing_reason"):
+            return goal, None
+        failure_lines = []
+        for attempt in failures[-3:]:
+            pool = attempt.get("pool") or "specialist"
+            model = attempt.get("model") or "unknown-model"
+            message = str(attempt.get("message") or "").strip()
+            if message:
+                failure_lines.append(f"- {pool} ({model}): {message}")
+        if not failure_lines and state.get("routing_reason"):
+            failure_lines.append(f"- previous route reason: {state['routing_reason']}")
+        bundle_lines = [
+            "Original task:",
+            prior_goal,
+            "",
+            "Follow-up request:",
+            goal.strip(),
+        ]
+        if state.get("repository"):
+            bundle_lines.extend(["", f"Repository: {state['repository']}"])
+        if failure_lines:
+            bundle_lines.extend(["", "Previous specialist failure:"])
+            bundle_lines.extend(failure_lines)
+        return "\n".join(bundle_lines), state
 
     def classify(self, goal: str, risk: str = "auto") -> Decision:
         if not CODING.search(goal):
@@ -135,9 +180,10 @@ class Router:
 
     def route_directive(self, goal: str, decision: Decision) -> str:
         quotas = self.quotas()
+        resolved_goal, _state = self._resolve_goal_context(goal)
         route = "GPT-5.6 → Spark" if decision.route == "spark" else "GPT-5.6 → GPT-5.6-sol"
         return (
-            f"{goal}\n\n<specialist-route>\nMODEL ROUTE\nTask: {goal[:120]}\nRoute: {route}\n"
+            f"{resolved_goal}\n\n<specialist-route>\nMODEL ROUTE\nTask: {resolved_goal[:120]}\nRoute: {route}\n"
             f"Reason: {decision.reason}\nQuota: sol {_q(quotas['sol'])}; Spark {_q(quotas['spark'])}\n"
             "Status: inspecting\nCall route_specialist_task exactly once with the original goal and repository. "
             "Report meaningful route transitions and finish from the coordinator model.\n</specialist-route>"
@@ -149,7 +195,8 @@ class Router:
             raise ValueError("goal is required")
         if not repo.is_dir():
             raise ValueError(f"repository does not exist: {repo}")
-        decision = self.classify(goal, risk)
+        resolved_goal, prior_state = self._resolve_goal_context(goal)
+        decision = self.classify(resolved_goal, risk)
         quotas = self.quotas()
         reserve = self.reserve_active(quotas)
         route = decision.route
@@ -159,31 +206,47 @@ class Router:
         handoff: dict[str, Any] | None = None
 
         if route == "sol" and decision.discovery_first:
-            discovery = self._invoke("spark", _discovery_prompt(goal), repo, resume_session_id=resume_session_id)
+            discovery = self._invoke("spark", _discovery_prompt(resolved_goal), repo, resume_session_id=resume_session_id)
             attempts.append(discovery)
-            handoff = self._handoff(goal, repo, discovery)
+            handoff = self._handoff(resolved_goal, repo, discovery)
         elif route == "spark":
-            spark = self._invoke("spark", goal, repo, simulate=simulate_spark_failure, resume_session_id=resume_session_id)
+            spark = self._invoke("spark", resolved_goal, repo, simulate=simulate_spark_failure, resume_session_id=resume_session_id)
             attempts.append(spark)
             if not spark["ok"] or FAILURE.search(spark.get("message", "")):
-                handoff = self._handoff(goal, repo, spark)
+                handoff = self._handoff(resolved_goal, repo, spark)
                 route = "sol"
 
+        specialist_ok = False
         if route == "sol":
-            prompt = goal if handoff is None else _handoff_prompt(handoff)
+            prompt = resolved_goal if handoff is None else _handoff_prompt(handoff)
             sol = self._invoke("sol", prompt, repo, resume_session_id=resume_session_id if not attempts else None)
             attempts.append(sol)
-            if sol["ok"]:
-                review = self._invoke("spark", _review_prompt(goal, sol), repo)
+            specialist_ok = bool(sol["ok"])
+            if specialist_ok:
+                review = self._invoke("spark", _review_prompt(resolved_goal, sol), repo)
                 attempts.append(review)
+        elif attempts:
+            specialist_ok = bool(attempts[-1].get("ok"))
+
+        fallback_used = not specialist_ok
+        if fallback_used:
+            attempts.append(self._fallback_attempt(resolved_goal, repo, attempts, prior_state))
 
         final = attempts[-1] if attempts else {"ok": True, "message": "coordinator-only"}
         state = {
             "coordinator_model": self.config.coordinator_model,
             "active_specialist": None,
-            "task": goal[:200], "repository": str(repo), "routing_reason": decision.reason,
-            "route": [a["pool"] for a in attempts], "reserve_active": reserve,
-            "attempts": attempts, "ok": bool(final.get("ok")), "updated_at": int(self._clock()),
+            "task": resolved_goal[:200],
+            "original_task": goal[:200],
+            "repository": str(repo),
+            "routing_reason": decision.reason,
+            "route": [a["pool"] for a in attempts],
+            "reserve_active": reserve,
+            "attempts": attempts,
+            "specialist_ok": specialist_ok,
+            "fallback_used": fallback_used,
+            "ok": bool(final.get("ok")),
+            "updated_at": int(self._clock()),
         }
         self._save_state(state)
         return state
@@ -193,15 +256,55 @@ class Router:
         if simulate:
             return {"pool": pool, "model": model, "ok": False, "message": "simulated Spark failure", "session_id": None}
         if resume_session_id:
-            cmd = [self.config.codex_binary, "--ask-for-approval", "never", "exec", "resume", "--skip-git-repo-check", "--json", "-m", model, resume_session_id, prompt]
+            cmd = [self.config.codex_binary, "--ask-for-approval", "never", "exec", "resume", "--skip-git-repo-check", "--json", "-m", model, resume_session_id, "-"]
         else:
-            cmd = [self.config.codex_binary, "--ask-for-approval", "never", "exec", "--skip-git-repo-check", "--json", "--sandbox", "workspace-write", "-m", model, "-C", str(repo), prompt]
-        proc = self._runner(cmd, cwd=repo, stdin=subprocess.DEVNULL, text=True, capture_output=True, timeout=self.config.timeout_seconds)
+            cmd = [self.config.codex_binary, "--ask-for-approval", "never", "exec", "--skip-git-repo-check", "--json", "--sandbox", "workspace-write", "-m", model, "-C", str(repo), "-"]
+        proc = self._runner(
+            cmd,
+            cwd=repo,
+            stdin=subprocess.PIPE,
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=self.config.timeout_seconds,
+        )
         message, session_id = _parse_codex_jsonl(proc.stdout)
         return {"pool": pool, "model": model, "ok": proc.returncode == 0 and bool(message), "message": message or proc.stderr[-2000:], "session_id": session_id}
 
+    def _fallback_attempt(self, goal: str, repo: Path, attempts: list[dict[str, Any]], prior_state: dict[str, Any] | None) -> dict[str, Any]:
+        lines = [
+            "Specialist routing failed; continue directly in the coordinator/manual repo path.",
+            f"Goal: {goal}",
+            f"Repository: {repo}",
+        ]
+        if prior_state and prior_state.get("task"):
+            lines.append(f"Previous task: {prior_state.get('task')}")
+        if attempts:
+            lines.append("Failed specialist attempts:")
+            for attempt in attempts:
+                lines.append(f"- {attempt.get('pool')} ({attempt.get('model')}): {str(attempt.get('message') or '').strip()}")
+        lines.append("Do not ask the user to repeat the task; continue from this context.")
+        return {
+            "pool": "coordinator",
+            "model": self.config.coordinator_model,
+            "ok": True,
+            "fallback_used": True,
+            "message": "\n".join(lines),
+            "session_id": None,
+        }
+
     def _handoff(self, goal: str, repo: Path, attempt: dict[str, Any]) -> dict[str, Any]:
-        return {"original_goal": goal, "repository": str(repo), "branch": _git_branch(repo), "relevant_files": [], "findings": attempt.get("message", "")[-4000:], "attempted_changes": "See working tree", "failing_tests_and_commands": attempt.get("message", "")[-2000:], "constraints": "Implement fully, test, preserve existing changes", "acceptance_criteria": goal}
+        return {
+            "original_goal": goal,
+            "repository": str(repo),
+            "branch": _git_branch(repo),
+            "relevant_files": [],
+            "findings": attempt.get("message", "")[-4000:],
+            "attempted_changes": "See working tree",
+            "failing_tests_and_commands": attempt.get("message", "")[-2000:],
+            "constraints": "Implement fully, test, preserve existing changes",
+            "acceptance_criteria": goal,
+        }
 
     def _save_state(self, state: dict[str, Any]) -> None:
         self.config.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -216,7 +319,7 @@ class Router:
             state = json.loads(self.config.state_path.read_text())
         except (OSError, json.JSONDecodeError):
             pass
-        return "\n".join(["MODEL ROUTE STATUS", f"Coordinator: {self.config.coordinator_model}", f"Active specialist: {state.get('active_specialist') or 'none'}", f"Task/repository: {state.get('task') or 'none'} / {state.get('repository') or 'none'}", f"Reason: {state.get('routing_reason') or 'none'}", f"sol: {_q(quotas['sol'])}", f"Spark: {_q(quotas['spark'])}", f"sol reserve active: {'yes' if self.reserve_active(quotas) else 'no'}"])
+        return "\n".join(["MODEL ROUTE STATUS", f"Coordinator: {self.config.coordinator_model}", f"Active specialist: {state.get('active_specialist') or 'none'}", f"Task/repository: {state.get('task') or 'none'} / {state.get('repository') or 'none'}", f"Original task: {state.get('original_task') or 'none'}", f"Reason: {state.get('routing_reason') or 'none'}", f"sol: {_q(quotas['sol'])}", f"Spark: {_q(quotas['spark'])}", f"sol reserve active: {'yes' if self.reserve_active(quotas) else 'no'}"])
 
 
 def _remaining(window: Mapping[str, Any]) -> float | None:

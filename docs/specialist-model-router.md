@@ -10,7 +10,7 @@ The `specialist-router` plugin keeps ordinary Telegram conversation on the confi
 - A successful sol implementation is independently reviewed by Spark.
 - The router derives each pool's five-hour and weekly availability from Codex rollout telemetry and caches it for 120 seconds. At 20% weekly sol remaining, noncritical sol work stays on Spark; critical work may use the reserve.
 
-The gateway hook leaves non-coding messages byte-for-byte unchanged. Coding messages receive an ephemeral route directive instructing the coordinator to invoke `route_specialist_task` once. `/model-route-status` shows coordinator, active specialist, task/repository, reason, both quota pools, and reserve state.
+The gateway hook leaves non-coding messages byte-for-byte unchanged. Coding messages receive an ephemeral route directive instructing the coordinator to invoke `route_specialist_task` once. The specialist runner feeds the complete prompt through Codex stdin (`-` + piped input) so multiline text survives intact, and it falls back to a coordinator/manual continuation when both specialist pools refuse to start. `/model-route-status` shows coordinator, active specialist, task/repository, reason, both quota pools, reserve state, and original task context.
 
 ## Configuration
 
