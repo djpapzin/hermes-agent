@@ -26,6 +26,10 @@ class RouterConfig:
     spark_model: str = "gpt-5.3-codex-spark"
     sol_model: str = "gpt-5.6-sol"
     reserve_percent: float = 20.0
+    max_concurrent_editing: int = 2
+    banked_reset_available: str = "unknown"
+    banked_reset_expires_at: int | None = None
+    auto_review_enabled: str = "unknown"
     quota_cache_seconds: int = 120
     timeout_seconds: int = 1800
     codex_binary: str = "/home/ubuntu/.npm-global/bin/codex"
@@ -319,7 +323,30 @@ class Router:
             state = json.loads(self.config.state_path.read_text())
         except (OSError, json.JSONDecodeError):
             pass
-        return "\n".join(["MODEL ROUTE STATUS", f"Coordinator: {self.config.coordinator_model}", f"Active specialist: {state.get('active_specialist') or 'none'}", f"Task/repository: {state.get('task') or 'none'} / {state.get('repository') or 'none'}", f"Original task: {state.get('original_task') or 'none'}", f"Reason: {state.get('routing_reason') or 'none'}", f"sol: {_q(quotas['sol'])}", f"Spark: {_q(quotas['spark'])}", f"sol reserve active: {'yes' if self.reserve_active(quotas) else 'no'}"])
+        sol = quotas["sol"]
+        reserve = self.reserve_active(quotas)
+        burst = _burst_state(sol, reserve)
+        active = state.get("active_specialist_sessions", 0)
+        return "\n".join([
+            "MODEL ROUTE STATUS",
+            f"Coordinator: {self.config.coordinator_model}",
+            f"Routine route: {self.config.spark_model}",
+            f"Complex route: {self.config.sol_model}",
+            f"Active specialist sessions: {active} / {self.config.max_concurrent_editing}",
+            f"Task/repository: {state.get('task') or 'none'} / {state.get('repository') or 'none'}",
+            f"Reason: {state.get('routing_reason') or 'none'}",
+            f"Sol five-hour remaining: {_pct(sol.five_hour_remaining)}",
+            f"Sol weekly remaining: {_pct(sol.weekly_remaining)}",
+            f"Spark quota: {_q(quotas['spark'])}",
+            f"Sol reserve remaining: {self.config.reserve_percent:.0f}% weekly minimum",
+            f"Sol reserve active: {'yes' if reserve else 'no'}",
+            f"Banked reset availability: {self.config.banked_reset_available}",
+            f"Banked reset expiry: {_timestamp(self.config.banked_reset_expires_at)}",
+            "Banked reset redemption: manual recommendation only; never automatic",
+            f"Codex auto-review enabled: {self.config.auto_review_enabled}",
+            "Fresh exact-head GitHub Codex review required: yes",
+            f"Recommended burst state: {burst}",
+        ])
 
 
 def _remaining(window: Mapping[str, Any]) -> float | None:
@@ -331,6 +358,24 @@ def _q(pool: PoolQuota) -> str:
     five = "unknown" if pool.five_hour_remaining is None else f"{pool.five_hour_remaining:.0f}%/5h"
     week = "unknown" if pool.weekly_remaining is None else f"{pool.weekly_remaining:.0f}%/week"
     return f"{five}, {week}"
+
+
+def _pct(value: float | None) -> str:
+    return "unknown" if value is None else f"{value:.0f}%"
+
+
+def _timestamp(value: int | None) -> str:
+    return "unknown" if value is None else str(value)
+
+
+def _burst_state(sol: PoolQuota, reserve: bool) -> str:
+    if sol.weekly_remaining is None:
+        return "quota unknown; routine work stays on Spark and Sol is reserved for critical work"
+    if reserve:
+        return "reserve mode; routine scans/triage/docs on Spark, Sol only for critical recovery"
+    if sol.five_hour_remaining is not None and sol.five_hour_remaining <= 0:
+        return "Sol five-hour limit reached; use Spark for routine work and wait for reset"
+    return "normal burst; Spark for routine work, Sol for complex coding and release audits"
 
 
 def _parse_codex_jsonl(text: str) -> tuple[str, str | None]:

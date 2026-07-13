@@ -217,6 +217,42 @@ def test_quota_uses_router_session_pool_when_codex_omits_model(tmp_path):
     assert q["spark"].weekly_remaining == 66
 
 
+def test_status_reports_unknown_external_quota_fields_and_burst_policy(tmp_path):
+    router = Router(config(tmp_path))
+    status = router.format_status()
+    assert "Coordinator: openai-api/gpt-5.6" in status
+    assert "Routine route: gpt-5.3-codex-spark" in status
+    assert "Complex route: gpt-5.6-sol" in status
+    assert "Active specialist sessions: 0 / 2" in status
+    assert "Sol five-hour remaining: unknown" in status
+    assert "Sol weekly remaining: unknown" in status
+    assert "Banked reset availability: unknown" in status
+    assert "Banked reset redemption: manual recommendation only; never automatic" in status
+    assert "Fresh exact-head GitHub Codex review required: yes" in status
+    assert "routine work stays on Spark" in status
+
+
+def test_sol_reserve_boundary_changes_burst_state(tmp_path):
+    router = Router(config(tmp_path))
+    quotas = router.quotas()
+    quotas["sol"].weekly_remaining = 20
+    quotas["sol"].five_hour_remaining = 80
+    router._quota_cache = (router._clock(), quotas)
+    status = router.format_status()
+    assert "Sol reserve active: yes" in status
+    assert "reserve mode" in status
+
+
+def test_banked_reset_config_is_display_only(tmp_path):
+    cfg = RouterConfig.from_mapping({"banked_reset_available": "available", "banked_reset_expires_at": 123})
+    router = Router(config(tmp_path))
+    router.config = cfg
+    status = router.format_status()
+    assert "Banked reset availability: available" in status
+    assert "Banked reset expiry: 123" in status
+    assert "never automatic" in status
+
+
 def test_plugin_registers_gateway_hook_status_and_tool(monkeypatch, tmp_path):
     seen = {"hooks": [], "commands": [], "tools": []}
 

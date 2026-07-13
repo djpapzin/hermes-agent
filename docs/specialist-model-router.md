@@ -10,7 +10,9 @@ The `specialist-router` plugin keeps ordinary Telegram conversation on the confi
 - A successful sol implementation is independently reviewed by Spark.
 - The router derives each pool's five-hour and weekly availability from Codex rollout telemetry and caches it for 120 seconds. At 20% weekly sol remaining, noncritical sol work stays on Spark; critical work may use the reserve.
 
-The gateway hook leaves non-coding messages byte-for-byte unchanged. Coding messages receive an ephemeral route directive instructing the coordinator to invoke `route_specialist_task` once. The specialist runner feeds the complete prompt through Codex stdin (`-` + piped input) so multiline text survives intact, and it falls back to a coordinator/manual continuation when both specialist pools refuse to start. `/model-route-status` shows coordinator, active specialist, task/repository, reason, both quota pools, reserve state, and original task context.
+The gateway hook leaves non-coding messages byte-for-byte unchanged. Coding messages receive an ephemeral route directive instructing the coordinator to invoke `route_specialist_task` once. The specialist runner feeds the complete prompt through Codex stdin (`-` + piped input) so multiline text survives intact, and it falls back to a coordinator/manual continuation when both specialist pools refuse to start. `/model-route-status` shows coordinator, routine/complex routes, active specialist sessions, task/repository, reason, five-hour and weekly quota state, the 20% Sol reserve, banked-reset availability/expiry, auto-review state, and the recommended burst state. Unsupported external values are reported as `unknown`; no banked reset is ever redeemed automatically.
+
+Codex auto-review, if enabled by the CLI, is only a process signal. It is not code-quality approval. Every merge still requires a fresh exact-head GitHub Codex review (or an explicit human review decision), with findings resolved against the exact current SHA.
 
 ## Configuration
 
@@ -25,6 +27,10 @@ plugins:
       spark_model: gpt-5.3-codex-spark
       sol_model: gpt-5.6-sol
       reserve_percent: 20
+      max_concurrent_editing: 2
+      banked_reset_available: unknown
+      banked_reset_expires_at: null
+      auto_review_enabled: unknown
       quota_cache_seconds: 120
       codex_binary: /home/ubuntu/.npm-global/bin/codex
 ```
