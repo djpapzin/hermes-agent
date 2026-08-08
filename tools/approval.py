@@ -214,6 +214,77 @@ def get_current_session_key(default: str = "default") -> str:
     return get_session_env("HERMES_SESSION_KEY", default)
 
 
+AUTO_EXECUTE = "AUTO_EXECUTE"
+OWNER_APPROVAL = "OWNER_APPROVAL"
+DENY = "DENY"
+
+_GOAL_OWNER_RISK_RULES = (
+    (re.compile(r"\bgit\s+push\b[^\n]*(?:--force|-f\b)", re.I), "history_rewrite"),
+    (re.compile(r"\b(?:credential|token|secret|password|api[-_ ]?key)\b[^\n]*(?:rotate|revoke|expose|copy)", re.I), "credential_lifecycle"),
+    (re.compile(r"\b(?:iptables|nft|ufw|firewall)\b[^\n]*(?:flush|reset|default\s+deny)", re.I), "network_lockout"),
+    (re.compile(r"\b(?:bet|wager|withdraw|transfer|purchase|buy)\b", re.I), "real_money"),
+    (re.compile(r"\b(?:drop\s+(?:database|table)|truncate\s+table|rm\s+-r[fF]?)\b", re.I), "destructive_change"),
+)
+
+
+def get_goal_authorization() -> dict | None:
+    """Resolve a persisted active /goal into a secret-free envelope."""
+    session_key = get_current_session_key("")
+    if not session_key:
+        return None
+    try:
+        from hermes_cli.goals import GoalManager
+
+        state = GoalManager(session_id=session_key).state
+        if state is None or state.status != "active":
+            return None
+        seed = f"{session_key}:{state.created_at}:{state.goal}"
+        return {
+            "authorization_id": hashlib.sha256(seed.encode()).hexdigest()[:16],
+            "goal": state.goal,
+            "goal_status": state.status,
+            "scope": AUTO_EXECUTE,
+        }
+    except Exception:
+        logger.debug("Goal authorization lookup failed", exc_info=True)
+        return None
+
+
+def classify_goal_action(*parts: str) -> tuple[str, str]:
+    if get_goal_authorization() is None:
+        return OWNER_APPROVAL, "no_active_goal"
+    text = " ".join(str(part or "") for part in parts)
+    for pattern, reason in _GOAL_OWNER_RISK_RULES:
+        if pattern.search(text):
+            return OWNER_APPROVAL, reason
+    return AUTO_EXECUTE, "active_goal_routine_reversible"
+
+
+def _audit_goal_decision(risk_class: str, reason: str) -> None:
+    envelope = get_goal_authorization()
+    logger.info(
+        "goal_approval decision=%s reason=%s authorization_id=%s",
+        risk_class,
+        reason,
+        (envelope or {}).get("authorization_id", "none"),
+    )
+
+
+def goal_approval_status_line(session_key: str) -> str:
+    token = set_current_session_key(session_key)
+    try:
+        envelope = get_goal_authorization()
+    finally:
+        reset_current_session_key(token)
+    if envelope is None:
+        return "No active goal authorization. Set one with /goal <text>."
+    return (
+        f"Goal authorization {envelope['authorization_id']}: "
+        "AUTO_EXECUTE=authorized; OWNER_APPROVAL=required on material risk "
+        "change; DENY=always blocked; delegation=inherited."
+    )
+
+
 def _get_session_platform() -> str:
     """Return the current gateway platform from contextvars/env fallback."""
     try:
@@ -2692,6 +2763,18 @@ def _run_approval_gate(
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
+    risk_class, risk_reason = classify_goal_action(display_target, description)
+    if risk_class == AUTO_EXECUTE:
+        _audit_goal_decision(risk_class, risk_reason)
+        return {
+            "approved": True,
+            "message": None,
+            "goal_authorized": True,
+            "risk_class": risk_class,
+        }
+    if get_goal_authorization() is not None:
+        _audit_goal_decision(OWNER_APPROVAL, risk_reason)
+
     session_key = get_current_session_key()
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
@@ -3373,6 +3456,22 @@ def check_all_command_guards(command: str, env_type: str,
     if not warnings:
         return {"approved": True, "message": None}
 
+    combined_desc_for_goal = "; ".join(desc for _, desc, _ in warnings)
+    risk_class, risk_reason = classify_goal_action(command, combined_desc_for_goal)
+    # Tirith findings represent content-level security risk and therefore
+    # remain owner-gated even when the shell command itself looks routine.
+    if risk_class == AUTO_EXECUTE and not any(is_t for _, _, is_t in warnings):
+        _audit_goal_decision(risk_class, risk_reason)
+        return {
+            "approved": True,
+            "message": None,
+            "goal_authorized": True,
+            "risk_class": risk_class,
+            "description": combined_desc_for_goal,
+        }
+    if get_goal_authorization() is not None:
+        _audit_goal_decision(OWNER_APPROVAL, risk_reason)
+
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
@@ -3651,6 +3750,16 @@ def check_execute_code_guard(code: str, env_type: str,
     approval_mode = _get_approval_mode()
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
         return {"approved": True, "message": None}
+
+    risk_class, risk_reason = classify_goal_action("execute_code", description)
+    if risk_class == AUTO_EXECUTE:
+        _audit_goal_decision(risk_class, risk_reason)
+        return {
+            "approved": True,
+            "message": None,
+            "goal_authorized": True,
+            "risk_class": risk_class,
+        }
 
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")

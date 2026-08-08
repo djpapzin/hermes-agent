@@ -2307,6 +2307,17 @@ class GatewaySlashCommandsMixin:
         # Let the normal message handler process it
         return await self._handle_message(retry_event)
 
+    async def _handle_approval_status_command(self, event: "MessageEvent") -> str:
+        args = (event.get_command_args() or "").strip().lower()
+        if args not in {"", "status"}:
+            return "Usage: /approval status"
+        mgr, _session_entry = await self._get_goal_manager_for_event(event)
+        if mgr is None:
+            return "Approval status unavailable for this session."
+        from tools.approval import goal_approval_status_line
+
+        return goal_approval_status_line(mgr.session_id)
+
     async def _handle_goal_command(self, event: "MessageEvent") -> str:
         """Handle /goal for gateway platforms.
 

@@ -10534,6 +10534,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return await self._handle_goal_command(event)
                 return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
 
+            if _cmd_def_inner and _cmd_def_inner.name == "approval":
+                return await self._handle_approval_status_command(event)
+
             if _cmd_def_inner and _cmd_def_inner.name == "moa":
                 return "Agent is running — wait or /stop first, then run /moa."
 
@@ -11077,6 +11080,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "goal":
             return await self._handle_goal_command(event)
+
+        if canonical == "approval":
+            return await self._handle_approval_status_command(event)
 
         if canonical == "moa":
             # /moa is one-shot sugar only: run a single prompt through the
