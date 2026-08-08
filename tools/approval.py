@@ -50,6 +50,9 @@ _approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_tool_call_id",
     default="",
 )
+_goal_authorization: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "goal_authorization", default=None
+)
 
 # Interactive-CLI flag. Concurrent ACP sessions run on a shared
 # ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
@@ -218,6 +221,14 @@ AUTO_EXECUTE = "AUTO_EXECUTE"
 OWNER_APPROVAL = "OWNER_APPROVAL"
 DENY = "DENY"
 
+
+def set_goal_authorization(envelope: dict | None) -> contextvars.Token:
+    return _goal_authorization.set(dict(envelope) if envelope else None)
+
+
+def reset_goal_authorization(token: contextvars.Token) -> None:
+    _goal_authorization.reset(token)
+
 _GOAL_OWNER_RISK_RULES = (
     (re.compile(r"\bgit\s+push\b[^\n]*(?:--force|-f\b)", re.I), "history_rewrite"),
     (re.compile(r"\b(?:credential|token|secret|password|api[-_ ]?key)\b[^\n]*(?:rotate|revoke|expose|copy)", re.I), "credential_lifecycle"),
@@ -229,6 +240,14 @@ _GOAL_OWNER_RISK_RULES = (
 
 def get_goal_authorization() -> dict | None:
     """Resolve a persisted active /goal into a secret-free envelope."""
+    bound = _goal_authorization.get()
+    if bound is not None:
+        if (
+            bound.get("goal_status") == "active"
+            and bound.get("scope") == AUTO_EXECUTE
+        ):
+            return dict(bound)
+        return None
     session_key = get_current_session_key("")
     if not session_key:
         return None

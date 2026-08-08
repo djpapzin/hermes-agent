@@ -20627,7 +20627,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # to the user immediately.
             from tools.approval import (
                 register_gateway_notify,
+                reset_goal_authorization,
                 reset_current_session_key,
+                set_goal_authorization,
                 set_current_session_key,
                 unregister_gateway_notify,
             )
@@ -20866,6 +20868,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
+            _goal_authorization_token = None
+            try:
+                from hermes_cli.goals import GoalManager
+
+                _goal_state = GoalManager(session_id=session_id).state
+                if _goal_state is not None and _goal_state.status == "active":
+                    _goal_seed = (
+                        f"{session_id}:{_goal_state.created_at}:{_goal_state.goal}"
+                    )
+                    import hashlib as _goal_hashlib
+
+                    _goal_envelope = {
+                        "authorization_id": _goal_hashlib.sha256(
+                            _goal_seed.encode()
+                        ).hexdigest()[:16],
+                        "goal": _goal_state.goal,
+                        "goal_status": "active",
+                        "scope": "AUTO_EXECUTE",
+                    }
+                else:
+                    _goal_envelope = None
+                _goal_authorization_token = set_goal_authorization(_goal_envelope)
+            except Exception:
+                logger.debug("goal authorization binding failed", exc_info=True)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
@@ -20926,6 +20952,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _clear_clarify_session(_approval_session_key)
                 except Exception:
                     pass
+                if _goal_authorization_token is not None:
+                    reset_goal_authorization(_goal_authorization_token)
                 reset_current_session_key(_approval_session_token)
             result_holder[0] = result
 
