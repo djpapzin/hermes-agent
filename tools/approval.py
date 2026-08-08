@@ -289,6 +289,41 @@ def _audit_goal_decision(risk_class: str, reason: str) -> None:
     )
 
 
+_GOAL_PYTHONPATH_ROOTS = (
+    "/home/ubuntu/OddsEdge",
+    "/home/ubuntu/worktrees",
+    "/home/ubuntu/projects",
+    "/home/ubuntu/.hermes/workspace/hermes-agent-updated",
+)
+_PYTHONPATH_ASSIGNMENT_RE = re.compile(
+    r"(?:^|[;&|\n]\s*|\b(?:env|export)\s+)PYTHONPATH=(?:\"([^\"]*)\"|'([^']*)'|([^\s;&|]+))"
+)
+
+
+def _goal_tirith_warnings_auto_execute(command: str, warnings: list[tuple]) -> bool:
+    tirith_keys = [key for key, _, is_tirith in warnings if is_tirith]
+    if not tirith_keys:
+        return True
+    if any(key != "tirith:interpreter_hijack_env" for key in tirith_keys):
+        return False
+    assignments = _PYTHONPATH_ASSIGNMENT_RE.findall(command or "")
+    if not assignments:
+        return False
+    for groups in assignments:
+        value = next((part for part in groups if part != ""), "")
+        entries = value.split(":")
+        if not entries or any(not entry or not os.path.isabs(entry) for entry in entries):
+            return False
+        for entry in entries:
+            normalized = os.path.normpath(entry)
+            if not any(
+                normalized == root or normalized.startswith(root + os.sep)
+                for root in _GOAL_PYTHONPATH_ROOTS
+            ):
+                return False
+    return True
+
+
 def goal_approval_status_line(session_key: str) -> str:
     token = set_current_session_key(session_key)
     try:
@@ -3482,7 +3517,9 @@ def check_all_command_guards(command: str, env_type: str,
     risk_class, risk_reason = classify_goal_action(command, combined_desc_for_goal)
     # Tirith findings represent content-level security risk and therefore
     # remain owner-gated even when the shell command itself looks routine.
-    if risk_class == AUTO_EXECUTE and not any(is_t for _, _, is_t in warnings):
+    if risk_class == AUTO_EXECUTE and _goal_tirith_warnings_auto_execute(
+        command, warnings
+    ):
         _audit_goal_decision(risk_class, risk_reason)
         return {
             "approved": True,
