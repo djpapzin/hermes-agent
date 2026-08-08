@@ -2488,6 +2488,22 @@ class TestTirithImportErrorFailOpenPolicy:
         assert result.get("approved") is True
 
 
+def test_active_goal_allows_bounded_noninteractive_sudo_shell_payload():
+    from tools.approval import _goal_tirith_warnings_auto_execute
+
+    warnings = [("tirith:sudo_shell_spawn", "sudo shell", True)]
+    assert _goal_tirith_warnings_auto_execute(
+        "sudo -n sh -c 'printf ok > /var/tmp/hermes-goal-test'", warnings
+    )
+
+
+def test_active_goal_keeps_interactive_sudo_shell_owner_gated():
+    from tools.approval import _goal_tirith_warnings_auto_execute
+
+    warnings = [("tirith:sudo_shell_spawn", "sudo shell", True)]
+    assert not _goal_tirith_warnings_auto_execute("sudo -n sh", warnings)
+
+
 class TestApprovalPromptRedaction:
     """Secrets are masked in user-facing approval surfaces (#13139).
 

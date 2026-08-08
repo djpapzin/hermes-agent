@@ -304,6 +304,21 @@ def _goal_tirith_warnings_auto_execute(command: str, warnings: list[tuple]) -> b
     tirith_keys = [key for key, _, is_tirith in warnings if is_tirith]
     if not tirith_keys:
         return True
+
+    # Tirith intentionally treats every ``sudo sh`` as an interactive root
+    # shell because a bare shell would hide subsequent commands from scanning.
+    # ``sh -c <literal>`` is different: the complete bounded payload is already
+    # present in (and classified with) this command.  An active /goal may inherit
+    # approval for that non-interactive form; a bare root shell remains gated.
+    if set(tirith_keys) == {"tirith:sudo_shell_spawn"}:
+        return bool(
+            re.search(
+                r"\bsudo(?:\s+-\S+)*\s+(?:/\S*/)?(?:ba|da|z|k)?sh\s+-c\s+(?:'[^']*'|\"[^\"]*\")",
+                command or "",
+                re.S,
+            )
+        )
+
     if any(key != "tirith:interpreter_hijack_env" for key in tirith_keys):
         return False
     assignments = _PYTHONPATH_ASSIGNMENT_RE.findall(command or "")
