@@ -263,7 +263,7 @@ def classify_goal_action(*parts: str) -> tuple[str, str]:
 def _audit_goal_decision(risk_class: str, reason: str) -> None:
     envelope = get_goal_authorization()
     logger.info(
-        "goal_approval decision=%s reason=%s authorization_id=%s",
+        "%s reason=%s authorization_id=%s",
         risk_class,
         reason,
         (envelope or {}).get("authorization_id", "none"),
