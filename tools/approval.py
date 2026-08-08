@@ -627,6 +627,7 @@ def _match_user_deny_rule(command: str) -> str | None:
 
 def _user_deny_block_result(pattern: str) -> dict:
     """Build the standard block result for an ``approvals.deny`` match."""
+    _audit_goal_decision(DENY, "user_defined_deny_policy")
     return {
         "approved": False,
         "user_deny": True,
@@ -642,6 +643,7 @@ def _user_deny_block_result(pattern: str) -> dict:
 
 def _hardline_block_result(description: str) -> dict:
     """Build the standard block result for a hardline match."""
+    _audit_goal_decision(DENY, "existing_hardline_safety_policy")
     return {
         "approved": False,
         "hardline": True,
@@ -658,6 +660,7 @@ def _hardline_block_result(description: str) -> dict:
 
 def _sudo_stdin_block_result(description: str) -> dict:
     """Build the standard block result for sudo stdin guard."""
+    _audit_goal_decision(DENY, "sudo_credential_injection_policy")
     return {
         "approved": False,
         "message": (
