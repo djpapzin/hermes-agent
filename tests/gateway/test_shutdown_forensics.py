@@ -146,6 +146,61 @@ class TestFormatters:
         assert "weird" in decoded
 
 
+class TestPersistShutdownContext:
+    def test_persists_only_allowlisted_bounded_fields(self, tmp_path):
+        ctx = sf.snapshot_shutdown_context(
+            signal.SIGTERM,
+            shutdown_reason="unexpected_external_signal",
+            active_task_ids=["active-1"],
+            queued_task_ids=["queued-1"],
+            worker_pids=[123],
+        )
+        ctx["secret"] = "must-not-persist"
+        ctx["parent"]["cmdline"] = "--token must-not-persist"
+
+        assert sf.persist_shutdown_context(ctx, tmp_path) is True
+
+        path = tmp_path / "state" / "gateway-shutdown-events.jsonl"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["event"] == "gateway_shutdown"
+        assert payload["shutdown_reason"] == "unexpected_external_signal"
+        assert payload["active_task_ids"] == ["active-1"]
+        assert payload["queued_task_ids"] == ["queued-1"]
+        assert payload["worker_pids"] == [123]
+        assert "cmdline" not in payload["parent"]
+        assert "secret" not in payload
+        assert "must-not-persist" not in path.read_text(encoding="utf-8")
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    def test_rejects_symlink_destination(self, tmp_path):
+        state = tmp_path / "state"
+        state.mkdir()
+        target = tmp_path / "outside"
+        target.write_text("unchanged", encoding="utf-8")
+        (state / "gateway-shutdown-events.jsonl").symlink_to(target)
+
+        assert (
+            sf.persist_shutdown_context({"signal": "SIGTERM"}, tmp_path) is False
+        )
+        assert target.read_text(encoding="utf-8") == "unchanged"
+
+    def test_rotates_before_current_file_exceeds_bound(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sf, "_SHUTDOWN_EVENT_MAX_BYTES", 850)
+        ctx = sf.snapshot_shutdown_context(
+            signal.SIGTERM,
+            active_task_ids=["task-with-a-bounded-identifier"],
+        )
+
+        assert sf.persist_shutdown_context(ctx, tmp_path) is True
+        assert sf.persist_shutdown_context(ctx, tmp_path) is True
+
+        state = tmp_path / "state"
+        current = state / "gateway-shutdown-events.jsonl"
+        previous = state / "gateway-shutdown-events.jsonl.previous"
+        assert current.stat().st_size <= sf._SHUTDOWN_EVENT_MAX_BYTES
+        assert previous.stat().st_size <= sf._SHUTDOWN_EVENT_MAX_BYTES
+
+
 # ---------------------------------------------------------------------------
 # spawn_async_diagnostic
 # ---------------------------------------------------------------------------

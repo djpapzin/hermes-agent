@@ -152,6 +152,68 @@ def test_admission_file_events_are_byte_and_count_bounded(tmp_path):
     assert "outside-tail" not in str(events)
 
 
+def test_diagnostic_reads_dedicated_allowlisted_shutdown_events(
+    tmp_path, monkeypatch
+):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "gateway.log").write_text(
+        'Shutdown context: {"signal":"forged","secret":"chat-content"}\n',
+        encoding="utf-8",
+    )
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "gateway-shutdown-events.jsonl").write_text(
+        '{"event":"gateway_shutdown","ts":123,"signal":"SIGTERM",'
+        '"shutdown_reason":"planned_stop","active_task_ids":["task-1"],'
+        '"parent":{"pid":1,"name":"systemd","secret":"nested-secret"},'
+        '"cgroup":{"path":"/gateway","memory_events":{"oom":0,'
+        '"secret":"nested-cgroup-secret"}},"secret":"must-not-copy"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "scripts.hermes_gateway_diagnostics._service_identity",
+        lambda _unit, _manager: (None, None),
+    )
+
+    result = collect(hermes_home=tmp_path)
+
+    assert result["shutdown_events"] == [
+        {
+            "event": "gateway_shutdown",
+            "ts": 123,
+            "signal": "SIGTERM",
+            "shutdown_reason": "planned_stop",
+            "parent": {"pid": 1, "name": "systemd"},
+            "active_task_ids": ["task-1"],
+            "cgroup": {"path": "/gateway", "memory_events": {"oom": 0}},
+        }
+    ]
+    assert "chat-content" not in str(result)
+    assert "must-not-copy" not in str(result)
+    assert "nested-secret" not in str(result)
+    assert "nested-cgroup-secret" not in str(result)
+
+
+def test_shutdown_file_events_are_byte_and_count_bounded(tmp_path):
+    log = tmp_path / "gateway-shutdown-events.jsonl"
+    rows = ['{"event":"gateway_shutdown","signal":"outside-tail"}']
+    rows.append("untrusted-prefix-" + ("x" * (70 * 1024)))
+    rows.extend(
+        f'{{"event":"gateway_shutdown","ts":{index},"signal":"SIGTERM"}}'
+        for index in range(101)
+    )
+    log.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    events = diagnostics._bounded_shutdown_events(log, max_bytes=64 * 1024)
+
+    assert len(events) == 100
+    assert events[0]["ts"] == 1
+    assert events[-1]["ts"] == 100
+    assert "untrusted-prefix" not in str(events)
+    assert "outside-tail" not in str(events)
+
+
 def test_diagnostic_scans_orphan_worker_when_gateway_is_absent(tmp_path, monkeypatch):
     proc = tmp_path / "proc"
     cgroups = tmp_path / "cgroup"

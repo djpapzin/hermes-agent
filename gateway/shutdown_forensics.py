@@ -20,11 +20,17 @@ from __future__ import annotations
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+
+_SHUTDOWN_EVENT_MAX_BYTES = 512 * 1024
+_SHUTDOWN_EVENT_MAX_RECORD_BYTES = 16 * 1024
+_SHUTDOWN_EVENT_FILENAME = "gateway-shutdown-events.jsonl"
 
 
 _SIGNAL_NAME_BY_NUM: Dict[int, str] = {}
@@ -253,6 +259,131 @@ def snapshot_shutdown_context(
         pass
 
     return ctx
+
+
+def _bounded_text(value: Any, limit: int = 300) -> str:
+    """Return one line of bounded diagnostic text."""
+    return (
+        str(value or "")
+        .replace("\x00", "")
+        .replace("\r", " ")
+        .replace("\n", " ")[:limit]
+    )
+
+
+def _shutdown_event_record(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the secret-safe allowlist persisted for shutdown diagnostics."""
+    parent = ctx.get("parent") if isinstance(ctx.get("parent"), dict) else {}
+    cgroup = ctx.get("cgroup") if isinstance(ctx.get("cgroup"), dict) else {}
+    raw_events = (
+        cgroup.get("memory_events")
+        if isinstance(cgroup.get("memory_events"), dict)
+        else {}
+    )
+
+    def _integer(value: Any) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _ids(value: Any, *, numeric: bool = False) -> List[Any]:
+        if not isinstance(value, (list, tuple)):
+            return []
+        if numeric:
+            return [
+                item
+                for item in (_integer(entry) for entry in value[:100])
+                if item is not None
+            ]
+        return [_bounded_text(entry, 160) for entry in value[:100]]
+
+    event: Dict[str, Any] = {
+        "event": "gateway_shutdown",
+        "ts": ctx.get("ts"),
+        "ts_monotonic": ctx.get("ts_monotonic"),
+        "signal": _bounded_text(ctx.get("signal"), 32),
+        "signal_num": _integer(ctx.get("signal_num")),
+        "shutdown_reason": _bounded_text(ctx.get("shutdown_reason"), 80),
+        "pid": _integer(ctx.get("pid")),
+        "ppid": _integer(ctx.get("ppid")),
+        "parent": {
+            "pid": _integer(parent.get("pid")),
+            "ppid": _integer(parent.get("ppid")),
+            "name": _bounded_text(parent.get("name"), 80),
+            "state": _bounded_text(parent.get("state"), 80),
+            "uid": _bounded_text(parent.get("uid"), 32),
+        },
+        "under_systemd": bool(ctx.get("under_systemd")),
+        "systemd_invocation_id": _bounded_text(
+            ctx.get("systemd_invocation_id"), 128
+        ),
+        "active_agent_count": _integer(ctx.get("active_agent_count")) or 0,
+        "queued_task_count": _integer(ctx.get("queued_task_count")) or 0,
+        "active_task_ids": _ids(ctx.get("active_task_ids")),
+        "queued_task_ids": _ids(ctx.get("queued_task_ids")),
+        "worker_pids": _ids(ctx.get("worker_pids"), numeric=True),
+        "gateway_rss": _bounded_text(ctx.get("gateway_rss"), 64),
+        "host_mem_available_kb": _integer(ctx.get("host_mem_available_kb")),
+        "cgroup": {
+            "path": _bounded_text(cgroup.get("path"), 300),
+            "memory_current": _bounded_text(cgroup.get("memory_current"), 64),
+            "memory_high": _bounded_text(cgroup.get("memory_high"), 64),
+            "memory_max": _bounded_text(cgroup.get("memory_max"), 64),
+            "memory_events": {
+                key: value
+                for key in (
+                    "low",
+                    "high",
+                    "max",
+                    "oom",
+                    "oom_kill",
+                    "oom_group_kill",
+                )
+                if (value := _integer(raw_events.get(key))) is not None
+            },
+        },
+    }
+    return event
+
+
+def persist_shutdown_context(ctx: Dict[str, Any], hermes_home: Path) -> bool:
+    """Best-effort append of one bounded, allowlisted shutdown record.
+
+    This is deliberately a single small local write: no subprocess, fsync, or
+    mixed gateway log parsing occurs on the signal-handler path. The current
+    file is rotated before it exceeds the fixed storage bound.
+    """
+    try:
+        state_dir = Path(hermes_home) / "state"
+        state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = state_dir / _SHUTDOWN_EVENT_FILENAME
+        previous = state_dir / f"{_SHUTDOWN_EVENT_FILENAME}.previous"
+        record = json.dumps(
+            _shutdown_event_record(ctx),
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8") + b"\n"
+        if len(record) > min(
+            _SHUTDOWN_EVENT_MAX_RECORD_BYTES, _SHUTDOWN_EVENT_MAX_BYTES
+        ):
+            return False
+        if path.exists():
+            file_stat = path.stat(follow_symlinks=False)
+            if not stat.S_ISREG(file_stat.st_mode):
+                return False
+            if file_stat.st_size + len(record) > _SHUTDOWN_EVENT_MAX_BYTES:
+                os.replace(path, previous)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            return os.write(fd, record) == len(record)
+        finally:
+            os.close(fd)
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def spawn_async_diagnostic(

@@ -40,6 +40,24 @@ _ADMISSION_EVENT_FIELDS = (
     "min_headroom_mb",
 )
 _ADMISSION_LOG_TAIL_BYTES = 512 * 1024
+_SHUTDOWN_LOG_TAIL_BYTES = 512 * 1024
+
+_SHUTDOWN_SCALAR_FIELDS = (
+    "event",
+    "ts",
+    "ts_monotonic",
+    "signal",
+    "signal_num",
+    "shutdown_reason",
+    "pid",
+    "ppid",
+    "under_systemd",
+    "systemd_invocation_id",
+    "active_agent_count",
+    "queued_task_count",
+    "gateway_rss",
+    "host_mem_available_kb",
+)
 
 
 def _read(path: Path) -> str | None:
@@ -316,6 +334,77 @@ def _bounded_admission_events(
     return events[-100:]
 
 
+def _bounded_shutdown_events(
+    path: Path, *, max_bytes: int = _SHUTDOWN_LOG_TAIL_BYTES
+) -> list[dict[str, Any]]:
+    """Read allowlisted records from the dedicated shutdown JSONL tail."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            start = max(0, size - max(1, max_bytes))
+            handle.seek(start)
+            raw = handle.read(max(1, max_bytes))
+    except OSError:
+        return []
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    if start:
+        lines = lines[1:]
+    events: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("event") != "gateway_shutdown":
+            continue
+        event = {
+            key: payload[key]
+            for key in _SHUTDOWN_SCALAR_FIELDS
+            if key in payload
+        }
+        for key in ("active_task_ids", "queued_task_ids"):
+            values = payload.get(key)
+            if isinstance(values, list):
+                event[key] = [str(value)[:160] for value in values[:100]]
+        worker_pids = payload.get("worker_pids")
+        if isinstance(worker_pids, list):
+            event["worker_pids"] = [
+                value for value in worker_pids[:100] if isinstance(value, int)
+            ]
+        parent = payload.get("parent")
+        if isinstance(parent, dict):
+            event["parent"] = {
+                key: parent[key]
+                for key in ("pid", "ppid", "name", "state", "uid")
+                if key in parent
+            }
+        cgroup = payload.get("cgroup")
+        if isinstance(cgroup, dict):
+            safe_cgroup = {
+                key: cgroup[key]
+                for key in ("path", "memory_current", "memory_high", "memory_max")
+                if key in cgroup
+            }
+            memory_events = cgroup.get("memory_events")
+            if isinstance(memory_events, dict):
+                safe_cgroup["memory_events"] = {
+                    key: memory_events[key]
+                    for key in (
+                        "low",
+                        "high",
+                        "max",
+                        "oom",
+                        "oom_kill",
+                        "oom_group_kill",
+                    )
+                    if key in memory_events
+                }
+            event["cgroup"] = safe_cgroup
+        events.append(event)
+    return events[-100:]
+
+
 def collect(
     unit: str = "hermes-gateway.service",
     hermes_home: Path = Path.home() / ".hermes",
@@ -435,6 +524,9 @@ def collect(
     result["worker_count"] = len(worker_scope_rows)
     result["admission_events"] = _bounded_admission_events(
         hermes_home / "state" / "admission-events.jsonl"
+    )
+    result["shutdown_events"] = _bounded_shutdown_events(
+        hermes_home / "state" / "gateway-shutdown-events.jsonl"
     )
     return result
 

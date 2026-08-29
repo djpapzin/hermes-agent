@@ -163,13 +163,15 @@ class SystemdWatchdog:
         was_unhealthy = self._unhealthy
         self._unhealthy = not math.isfinite(lag) or lag > self._lag_tolerance()
         if self._unhealthy:
-            notify("WATCHDOG=1\nSTATUS=watchdog delayed: event loop recovered")
+            message = "WATCHDOG=1\nSTATUS=watchdog delayed: event loop recovered"
         elif was_unhealthy:
-            notify("WATCHDOG=1\nSTATUS=Hermes Gateway running")
+            message = "WATCHDOG=1\nSTATUS=Hermes Gateway running"
         else:
-            notify("WATCHDOG=1")
-        self._last_heartbeat_at = now
-        return True
+            message = "WATCHDOG=1"
+        sent = notify(message)
+        if sent:
+            self._last_heartbeat_at = now
+        return sent
 
     async def _run(self) -> None:
         interval = self.interval_seconds
@@ -182,7 +184,8 @@ class SystemdWatchdog:
             while not self._stopping:
                 await asyncio.sleep(max(0.0, scheduled_at - loop.time()))
                 now = loop.time()
-                if not self.record_tick(scheduled_at=scheduled_at, now=now):
+                self.record_tick(scheduled_at=scheduled_at, now=now)
+                if self._expired:
                     return
                 scheduled_at += cadence
                 if scheduled_at < now:

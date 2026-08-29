@@ -15,15 +15,18 @@ It reports the gateway PID/RSS, systemd `Result`/`ExecMainCode`/
 `ExecMainStatus`, host `MemAvailable`, the gateway cgroup's
 current/high/max values and memory events, independently scoped worker
 PIDs/RSS, and each worker cgroup's current/high/max values and OOM events.
-Shutdown log records include the signal, explicit reason, parent,
-gateway RSS, host headroom, active and queued task IDs, worker PIDs, and cgroup
-OOM counters.
+The gateway persists an allowlisted shutdown record to
+`state/gateway-shutdown-events.jsonl`; it includes the signal, explicit reason,
+safe parent fields, gateway RSS, host headroom, active and queued task IDs,
+worker PIDs, and cgroup OOM counters. Parent command lines and unknown fields
+are excluded so secrets cannot enter the diagnostic stream.
 
 The same output includes at most 100 filtered lifecycle/resource journal
 events from the gateway, health guard, and kernel, plus at most 100 structured
 admission records from a bounded 512 KiB tail of
-`state/admission-events.jsonl`. The gateway writes only controlled admission
-fields to that dedicated stream; the diagnostic allowlists them again and
+`state/admission-events.jsonl`, plus at most 100 shutdown records from the same
+bounded tail of the dedicated shutdown stream. The gateway writes only
+controlled fields to these streams; the diagnostic allowlists them again and
 never parses mixed human-readable chat or command logs.
 
 Admission uses the tighter of host `MemAvailable` and finite gateway-cgroup
