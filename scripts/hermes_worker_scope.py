@@ -9,6 +9,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -209,6 +210,59 @@ def _stop(argv: list[str]) -> int:
     ).returncode
 
 
+def _oom_evidence(argv: list[str]) -> int:
+    """Emit a bounded OOM attestation for one recent worker scope."""
+
+    if len(argv) != 3:
+        raise ValueError("evidence requires UNIT SINCE_EPOCH")
+    unit = _validate_unit(argv[1])
+    try:
+        since = int(argv[2])
+    except ValueError as exc:
+        raise ValueError("evidence timestamp is not an integer") from exc
+    now = int(time.time())
+    if since < now - 300 or since > now + 5:
+        raise ValueError("evidence timestamp is outside the recent proof window")
+    result = subprocess.run(
+        [
+            "/usr/bin/journalctl",
+            "--unit",
+            unit,
+            "--since",
+            f"@{since}",
+            "--no-pager",
+            "--output=json",
+            "--lines=100",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    marker = "A process of this unit has been killed by the OOM killer."
+    observed = False
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            try:
+                row = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if (
+                row.get("_PID") == "1"
+                and row.get("_UID") == "0"
+                and row.get("_COMM") == "systemd"
+                and row.get("SYSLOG_IDENTIFIER") == "systemd"
+                and row.get("_TRANSPORT") == "journal"
+                and row.get("UNIT") == unit
+                and str(row.get("MESSAGE") or "").strip()
+                in {marker, f"{unit}: {marker}"}
+            ):
+                observed = True
+                break
+    print(json.dumps({"unit": unit, "oom_kill": observed}, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     try:
@@ -221,8 +275,10 @@ def main(argv: list[str] | None = None) -> int:
             return _run(args)
         if args[0] == "stop":
             return _stop(args)
-        raise ValueError("expected run or stop")
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        if args[0] == "evidence":
+            return _oom_evidence(args)
+        raise ValueError("expected run, stop, or evidence")
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
         return _fail(str(exc))
 
 

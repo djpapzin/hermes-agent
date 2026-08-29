@@ -1276,6 +1276,8 @@ def execute_code(
     exec_start = time.monotonic()
     server_sock = None
     stop_event = threading.Event()
+    worker_scope_unit = None
+    stop_worker_scope = None
 
     try:
         # Write the auto-generated hermes_tools module.
@@ -1395,16 +1397,46 @@ def execute_code(
         _child_cwd = _resolve_child_cwd(_mode, tmpdir, task_id=task_id or "")
         _script_path = os.path.join(tmpdir, "script.py")
 
-        proc = subprocess.Popen(
-            [_child_python, _script_path],
-            cwd=_child_cwd,
-            env=child_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
-        )
+        child_argv = [_child_python, _script_path]
+        worker_scope_unit = None
+        if not _IS_WINDOWS:
+            from tools.process_registry import (
+                _cleanup_scope_environment_when_done,
+                _discard_scope_environment,
+                _stop_systemd_unit,
+                build_gateway_worker_scope_argv,
+            )
+
+            child_argv, worker_scope_unit = build_gateway_worker_scope_argv(
+                child_argv,
+                unit_suffix=f"execute-code-{os.getpid()}-{uuid.uuid4().hex[:12]}",
+                environment=child_env,
+            )
+            stop_worker_scope = _stop_systemd_unit
+        try:
+            proc = subprocess.Popen(
+                child_argv,
+                cwd=_child_cwd,
+                env=child_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            )
+        except BaseException:
+            if not _IS_WINDOWS:
+                _discard_scope_environment(child_argv)
+            raise
+        if not _IS_WINDOWS:
+            _cleanup_scope_environment_when_done(proc, child_argv)
+
+        def _stop_execute_code_child(*, escalate: bool = False) -> None:
+            nonlocal worker_scope_unit
+            if worker_scope_unit and _stop_systemd_unit(worker_scope_unit):
+                worker_scope_unit = None
+                return
+            _kill_process_group(proc, escalate=escalate)
 
         # --- Poll loop: watch for exit, timeout, and interrupt ---
         deadline = time.monotonic() + timeout
@@ -1493,12 +1525,12 @@ def execute_code(
         poll_interval = 0.005
         while proc.poll() is None:
             if _is_interrupted():
-                _kill_process_group(proc)
+                _stop_execute_code_child()
                 status = "interrupted"
                 break
             now = time.monotonic()
             if now > deadline:
-                _kill_process_group(proc, escalate=True)
+                _stop_execute_code_child(escalate=True)
                 status = "timeout"
                 break
             # Periodic activity touch so the gateway's inactivity timeout
@@ -1605,6 +1637,12 @@ def execute_code(
         }, ensure_ascii=False)
 
     finally:
+        if worker_scope_unit and stop_worker_scope is not None:
+            if not stop_worker_scope(worker_scope_unit):
+                logger.warning(
+                    "Could not reap execute_code worker scope %s",
+                    worker_scope_unit,
+                )
         # Cleanup temp dir and socket
         if server_sock is not None:
             try:

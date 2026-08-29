@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import socket
 import threading
 import time
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 def _notify_address(raw: str) -> str:
@@ -73,6 +76,8 @@ class SystemdWatchdog:
         self._lag_tolerance_seconds = lag_tolerance_seconds
         self._task: Optional[asyncio.Task[None]] = None
         self._unhealthy = False
+        self._expired = False
+        self._last_heartbeat_at: Optional[float] = None
         self._stopping = False
         self._stopping_notified = False
         self._shutdown_keepalive: Optional[threading.Thread] = None
@@ -114,6 +119,8 @@ class SystemdWatchdog:
             return False
         self._stopping = False
         self._unhealthy = False
+        self._expired = False
+        self._last_heartbeat_at = None
         self._stopping_notified = False
         self._task = asyncio.create_task(self._run(), name="hermes-systemd-watchdog")
         return True
@@ -123,22 +130,90 @@ class SystemdWatchdog:
         if not self.enabled:
             return False
         safe_status = str(status or "Gateway running").replace("\n", " ")
-        return notify(f"READY=1\nSTATUS={safe_status}")
+        sent = notify(f"READY=1\nSTATUS={safe_status}")
+        if sent:
+            self._last_heartbeat_at = time.monotonic()
+        return sent
 
     def record_tick(self, *, scheduled_at: float, now: float) -> bool:
-        """Feed systemd only when the event loop woke within its lag budget."""
-        if not self.enabled or self._stopping or self._unhealthy:
+        """Feed systemd whenever the event loop demonstrates forward progress.
+
+        ``WatchdogSec`` is the authoritative hard deadline.  A callback that
+        runs late still proves that the loop recovered before that deadline;
+        withholding this heartbeat would turn one transient delay into a
+        guaranteed service abort even after the gateway became responsive.
+        """
+        if not self.enabled or self._stopping or self._expired:
             return False
         try:
             lag = float(now) - float(scheduled_at)
         except (TypeError, ValueError):
             lag = float("inf")
-        if not math.isfinite(lag) or lag > self._lag_tolerance():
+        interval = self.interval_seconds or 0.0
+        last_heartbeat_at = self._last_heartbeat_at
+        if (
+            last_heartbeat_at is not None
+            and (
+                not math.isfinite(now)
+                or now - last_heartbeat_at >= interval
+            )
+        ):
             self._unhealthy = True
-            notify("STATUS=watchdog unhealthy: event loop progress is late")
+            self._expired = True
+            notify("STATUS=watchdog expired: hard deadline exceeded")
             return False
-        notify("WATCHDOG=1")
-        return True
+
+        was_unhealthy = self._unhealthy
+        self._unhealthy = not math.isfinite(lag) or lag > self._lag_tolerance()
+        if self._unhealthy:
+            message = "WATCHDOG=1\nSTATUS=watchdog delayed: event loop recovered"
+        elif was_unhealthy:
+            message = "WATCHDOG=1\nSTATUS=Hermes Gateway running"
+        else:
+            message = "WATCHDOG=1"
+        sent = notify(message)
+        if sent:
+            self._last_heartbeat_at = now
+        return sent
+
+    def _retry_delay(self, *, now: float, cadence: float) -> float:
+        """Retry strictly before the last successful heartbeat deadline."""
+        last_success = self._last_heartbeat_at
+        interval = self.interval_seconds
+        if last_success is None or interval is None:
+            return max(0.0, cadence / 4.0)
+        remaining = interval - (now - last_success)
+        return max(0.0, min(cadence / 4.0, remaining / 2.0))
+
+    def _send_shutdown_heartbeat(
+        self,
+        *,
+        stopping_confirmed: bool,
+        cadence: float,
+    ) -> tuple[bool, float]:
+        """Send STOPPING until confirmed, then heartbeat within the deadline."""
+        now = time.monotonic()
+        last_heartbeat_at = self._last_heartbeat_at
+        watchdog_interval = self.interval_seconds
+        if (
+            last_heartbeat_at is not None
+            and watchdog_interval is not None
+            and now - last_heartbeat_at >= watchdog_interval
+        ):
+            self._unhealthy = True
+            self._expired = True
+            notify("STATUS=watchdog expired: hard deadline exceeded during shutdown")
+            return stopping_confirmed, 0.0
+        message = (
+            "WATCHDOG=1"
+            if stopping_confirmed
+            else "STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining"
+        )
+        sent = notify(message)
+        if sent:
+            self._last_heartbeat_at = now
+            return True, cadence
+        return stopping_confirmed, self._retry_delay(now=now, cadence=cadence)
 
     async def _run(self) -> None:
         interval = self.interval_seconds
@@ -148,11 +223,16 @@ class SystemdWatchdog:
         loop = asyncio.get_running_loop()
         scheduled_at = loop.time() + cadence
         try:
-            while not self._stopping and not self._unhealthy:
+            while not self._stopping:
                 await asyncio.sleep(max(0.0, scheduled_at - loop.time()))
                 now = loop.time()
-                if not self.record_tick(scheduled_at=scheduled_at, now=now):
+                sent = self.record_tick(scheduled_at=scheduled_at, now=now)
+                if self._expired:
                     return
+                if not sent:
+                    retry_delay = self._retry_delay(now=now, cadence=cadence)
+                    scheduled_at = now + retry_delay
+                    continue
                 scheduled_at += cadence
                 if scheduled_at < now:
                     scheduled_at = now + cadence
@@ -180,23 +260,70 @@ class SystemdWatchdog:
             except Exception:
                 pass
         self._task = None
-        if self.enabled and not self._stopping_notified:
-            notify("STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining")
+        interval_seconds = self.interval_seconds
+        last_heartbeat_at = self._last_heartbeat_at
+        if (
+            self.enabled
+            and not self._expired
+            and interval_seconds is not None
+            and last_heartbeat_at is not None
+            and time.monotonic() - last_heartbeat_at >= interval_seconds
+        ):
+            self._unhealthy = True
+            self._expired = True
+            notify("STATUS=watchdog expired: hard deadline exceeded during shutdown")
+        if self.enabled and not self._expired and not self._stopping_notified:
             self._stopping_notified = True
             interval = max(0.1, (self.interval_seconds or 1.0) / 2.0)
+            stopping_confirmed, initial_delay = self._send_shutdown_heartbeat(
+                stopping_confirmed=False,
+                cadence=interval,
+            )
+            if self._expired:
+                return
 
             def _feed_during_shutdown() -> None:
                 # The process-wide shutdown watchdog remains the hard bound.
                 # This cap merely prevents a leaked daemon from running forever
                 # if a caller invokes stop() outside process teardown.
                 deadline = time.monotonic() + 900.0
+                delay = initial_delay
+                confirmed = stopping_confirmed
                 while time.monotonic() < deadline:
-                    time.sleep(interval)
-                    notify("WATCHDOG=1")
+                    time.sleep(delay)
+                    now = time.monotonic()
+                    last_heartbeat_at = self._last_heartbeat_at
+                    watchdog_interval = self.interval_seconds
+                    if (
+                        last_heartbeat_at is not None
+                        and watchdog_interval is not None
+                        and now - last_heartbeat_at >= watchdog_interval
+                    ):
+                        self._unhealthy = True
+                        self._expired = True
+                        notify(
+                            "STATUS=watchdog expired: hard deadline exceeded "
+                            "during shutdown"
+                        )
+                        return
+                    confirmed, delay = self._send_shutdown_heartbeat(
+                        stopping_confirmed=confirmed,
+                        cadence=interval,
+                    )
+                    if self._expired:
+                        return
 
-            self._shutdown_keepalive = threading.Thread(
-                target=_feed_during_shutdown,
-                name="hermes-systemd-shutdown-watchdog",
-                daemon=True,
-            )
-            self._shutdown_keepalive.start()
+            try:
+                self._shutdown_keepalive = threading.Thread(
+                    target=_feed_during_shutdown,
+                    name="hermes-systemd-shutdown-watchdog",
+                    daemon=True,
+                )
+                self._shutdown_keepalive.start()
+            except Exception as exc:
+                self._shutdown_keepalive = None
+                logger.warning(
+                    "Could not start systemd shutdown keepalive; "
+                    "continuing bounded teardown: %s",
+                    exc,
+                )

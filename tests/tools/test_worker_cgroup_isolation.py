@@ -43,6 +43,29 @@ def test_kill_all_reaps_finished_launcher_scope():
     stop.assert_called_once_with(session.systemd_unit)
 
 
+def test_system_worker_scope_stop_routes_through_root_wrapper(monkeypatch, tmp_path):
+    import tools.process_registry as pr
+
+    wrapper = tmp_path / "hermes-worker-scope"
+    wrapper.touch()
+    monkeypatch.setattr(pr, "_SYSTEM_SCOPE_WRAPPER", wrapper)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: {"systemctl": "/usr/bin/systemctl", "sudo": "/usr/bin/sudo"}.get(name),
+    )
+    completed = MagicMock(returncode=0, stderr=b"")
+    monkeypatch.setattr(pr.subprocess, "run", MagicMock(return_value=completed))
+    unit = "hermes-worker-system-detached-child.scope"
+
+    assert pr._stop_systemd_unit(unit) is True
+    pr.subprocess.run.assert_called_once_with(
+        ["/usr/bin/sudo", "-n", str(wrapper), "stop", unit],
+        capture_output=True,
+        timeout=15,
+        stdin=pr.subprocess.DEVNULL,
+    )
+
+
 def test_system_scope_routes_through_validating_root_wrapper(monkeypatch, tmp_path):
     import tools.process_registry as pr
 
@@ -74,6 +97,15 @@ def test_system_scope_routes_through_validating_root_wrapper(monkeypatch, tmp_pa
         "-c",
         "true",
     ]
+
+
+def test_scope_builder_never_silently_returns_unscoped_command(monkeypatch):
+    import tools.process_registry as pr
+
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+
+    with pytest.raises(RuntimeError, match="systemd-run is unavailable"):
+        pr._build_systemd_scope_argv(["/bin/true"], "test", backend="user")
 
 
 def test_system_scope_serializes_environment_outside_sudo_arguments(
@@ -134,6 +166,33 @@ def test_failed_launcher_removes_private_environment_payload(monkeypatch, tmp_pa
             thread.join(timeout=1)
 
     assert not payload.exists()
+
+
+def test_cleanup_thread_start_failure_is_best_effort(monkeypatch, tmp_path):
+    import tools.process_registry as pr
+
+    wrapper = tmp_path / "hermes-worker-scope"
+    wrapper.touch()
+    payload = tmp_path / "payload.json"
+    payload.write_text('{"TOKEN": "secret"}', encoding="utf-8")
+    monkeypatch.setattr(pr, "_SYSTEM_SCOPE_WRAPPER", wrapper)
+    argv = [
+        "/usr/bin/sudo", "-n", str(wrapper), "run", "scope", "67108864",
+        str(payload), "--", "/bin/true",
+    ]
+
+    class UnstartableThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("cannot start new thread")
+
+    monkeypatch.setattr(pr.threading, "Thread", UnstartableThread)
+
+    pr._cleanup_scope_environment_when_done(object(), argv)
+
+    assert payload.exists()
 
 
 def test_gateway_startup_removes_dead_creator_payload(monkeypatch, tmp_path):
@@ -283,9 +342,33 @@ def test_required_mode_refuses_worker_in_gateway_cgroup(monkeypatch, tmp_path):
     monkeypatch.setattr(pr, "_worker_scope_backend", lambda: None)
 
     with patch("subprocess.Popen") as spawn:
-        with pytest.raises(RuntimeError, match="cgroup isolation is required"):
+        with pytest.raises(RuntimeError, match="worker cgroup isolation is unavailable"):
             registry.spawn_local("echo unsafe", cwd=str(tmp_path))
     spawn.assert_not_called()
+
+
+def test_pty_gateway_retains_initial_isolation_decision_on_preparation_failure(
+    monkeypatch, tmp_path
+):
+    import tools.process_registry as pr
+
+    registry = pr.ProcessRegistry()
+    monkeypatch.setattr(pr, "_find_shell", lambda: "/bin/bash")
+    supervised_identity = MagicMock(side_effect=[True, False])
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", supervised_identity)
+    monkeypatch.setattr(pr, "_worker_scope_backend", lambda: "system")
+    monkeypatch.setattr(
+        pr,
+        "_build_systemd_scope_argv",
+        MagicMock(side_effect=OSError("read-only worker environment")),
+    )
+
+    with patch("subprocess.Popen") as spawn:
+        with pytest.raises(OSError, match="read-only worker environment"):
+            registry.spawn_local("echo unsafe", cwd=str(tmp_path), use_pty=True)
+
+    spawn.assert_not_called()
+    supervised_identity.assert_called_once_with()
 
 
 def test_explicit_system_mode_refuses_unbounded_fallback(monkeypatch):
@@ -295,8 +378,35 @@ def test_explicit_system_mode_refuses_unbounded_fallback(monkeypatch):
     monkeypatch.setattr(pr, "_worker_cgroup_mode", lambda: "system")
     monkeypatch.setattr(pr, "_worker_scope_backend", lambda: None)
 
-    with pytest.raises(RuntimeError, match="cgroup isolation is required"):
+    with pytest.raises(RuntimeError, match="worker cgroup isolation is unavailable"):
         pr.build_gateway_worker_scope_argv(["/bin/true"], unit_suffix="test")
+
+
+@pytest.mark.parametrize("mode", ["auto", "user", "off"])
+def test_supervised_gateway_never_falls_back_to_unscoped_worker(
+    monkeypatch, mode
+):
+    import tools.process_registry as pr
+
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setattr(pr, "_worker_cgroup_mode", lambda: mode)
+    monkeypatch.setattr(pr, "_worker_scope_backend", lambda: None)
+
+    with pytest.raises(RuntimeError, match="control-plane cgroup"):
+        pr.build_gateway_worker_scope_argv(["/bin/true"], unit_suffix="test")
+
+
+def test_launchd_gateway_keeps_non_linux_local_worker_compatibility(monkeypatch):
+    import tools.process_registry as pr
+
+    monkeypatch.setattr(pr, "_IS_LINUX", False)
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+
+    argv = ["/bin/true"]
+    assert pr.build_gateway_worker_scope_argv(argv, unit_suffix="test") == (
+        argv,
+        None,
+    )
 
 
 def test_foreground_system_scope_receives_sanitized_run_environment(
@@ -323,3 +433,30 @@ def test_foreground_system_scope_receives_sanitized_run_environment(
     scoped_env = build.call_args.kwargs["environment"]
     assert scoped_env["HERMES_HOME"] == "/profiles/friend"
     assert scoped_env["CUSTOM_SETTING"] == "yes"
+
+
+def test_foreground_gateway_propagates_every_scope_preparation_failure(
+    monkeypatch, tmp_path
+):
+    import tools.environments.local as local
+    import tools.process_registry as pr
+
+    env = object.__new__(local.LocalEnvironment)
+    env.cwd = str(tmp_path)
+    env.env = {}
+    monkeypatch.setattr(local, "_find_bash", lambda: "/bin/bash")
+    supervised_identity = MagicMock(side_effect=[True, False])
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", supervised_identity)
+    monkeypatch.setattr(pr, "_worker_scope_backend", lambda: "system")
+    monkeypatch.setattr(
+        pr,
+        "_build_systemd_scope_argv",
+        MagicMock(side_effect=OSError("read-only worker environment")),
+    )
+
+    with patch.object(local.subprocess, "Popen") as spawn:
+        with pytest.raises(OSError, match="read-only worker environment"):
+            env._run_bash("true")
+
+    spawn.assert_not_called()
+    supervised_identity.assert_called_once_with()

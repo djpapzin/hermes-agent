@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import sys
 import time
 from pathlib import Path
@@ -12,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from gateway import shutdown_forensics as sf
+from gateway import structured_journal as sj
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +146,115 @@ class TestFormatters:
         decoded = json.loads(payload)
         assert decoded["signal"] == "SIGTERM"
         assert "weird" in decoded
+
+
+class TestEmitShutdownContext:
+    @pytest.mark.skipif(
+        not hasattr(socket, "AF_UNIX"), reason="Unix datagram sockets unavailable"
+    )
+    def test_emits_real_native_journal_datagram(self, tmp_path, monkeypatch):
+        journal_socket = tmp_path / "journal.sock"
+        receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        receiver.bind(str(journal_socket))
+        receiver.settimeout(1.0)
+        monkeypatch.setattr(sf, "_JOURNAL_SOCKET", str(journal_socket))
+
+        try:
+            ctx = sf.snapshot_shutdown_context(signal.SIGTERM)
+            assert sf.emit_shutdown_context(ctx) is True
+            message = receiver.recv(64 * 1024)
+        finally:
+            receiver.close()
+
+        assert message.startswith(b"MESSAGE=HERMES_SHUTDOWN ")
+        assert b"\nHERMES_EVENT=gateway_shutdown" in message
+
+    def test_emits_nonblocking_allowlisted_native_journal_event(self, monkeypatch):
+        calls = []
+
+        class _Sender:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def setblocking(self, value):
+                calls.append(("setblocking", value))
+
+            def connect(self, address):
+                calls.append(("connect", address))
+
+            def send(self, message):
+                calls.append(("send", message))
+                return len(message)
+
+        monkeypatch.setattr(sj.socket, "socket", lambda *_args: _Sender())
+        ctx = sf.snapshot_shutdown_context(
+            signal.SIGTERM,
+            shutdown_reason="unexpected_external_signal",
+            active_task_ids=["active-1"],
+            queued_task_ids=["queued-1"],
+            worker_pids=[123],
+        )
+        ctx["secret"] = "must-not-persist"
+        ctx["parent"]["cmdline"] = "--token must-not-persist"
+
+        assert sf.emit_shutdown_context(ctx) is True
+
+        assert calls[0] == ("setblocking", False)
+        assert calls[1] == ("connect", sf._JOURNAL_SOCKET)
+        message = calls[2][1]
+        assert b"SYSLOG_IDENTIFIER=hermes-shutdown-forensics" in message
+        raw_payload = message.split(b"\n", 1)[0].removeprefix(
+            b"MESSAGE=HERMES_SHUTDOWN "
+        )
+        payload = json.loads(raw_payload)
+        assert payload["event"] == "gateway_shutdown"
+        assert payload["shutdown_reason"] == "unexpected_external_signal"
+        assert payload["active_task_ids"] == ["active-1"]
+        assert payload["queued_task_ids"] == ["queued-1"]
+        assert payload["worker_pids"] == [123]
+        assert "cmdline" not in payload["parent"]
+        assert "secret" not in payload
+        assert b"must-not-persist" not in message
+
+    def test_native_journal_send_failure_is_nonfatal(self, monkeypatch):
+        class _Sender:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def setblocking(self, _value):
+                return None
+
+            def connect(self, _address):
+                raise BlockingIOError
+
+        monkeypatch.setattr(sj.socket, "socket", lambda *_args: _Sender())
+
+        assert sf.emit_shutdown_context({"signal": "SIGTERM"}) is False
+
+    def test_large_task_lists_are_truncated_without_losing_record(self):
+        identifiers = [f"task-{index}-" + ("x" * 200) for index in range(200)]
+        ctx = sf.snapshot_shutdown_context(
+            signal.SIGTERM,
+            active_task_ids=identifiers,
+            queued_task_ids=identifiers,
+            worker_pids=list(range(200)),
+        )
+
+        encoded = sf._encoded_shutdown_event(ctx)
+        payload = json.loads(encoded)
+
+        assert len(encoded) <= sf._SHUTDOWN_EVENT_MAX_RECORD_BYTES
+        assert payload["event"] == "gateway_shutdown"
+        assert payload["active_agent_count"] == 200
+        assert payload["queued_task_count"] == 200
+        assert payload["active_task_ids_omitted"] > 0
+        assert payload["queued_task_ids_omitted"] > 0
 
 
 # ---------------------------------------------------------------------------

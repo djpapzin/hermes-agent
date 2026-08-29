@@ -1,9 +1,14 @@
+import json
 from pathlib import Path
 
 import pytest
 
 from scripts import stress_gateway_worker_scope as worker_scope
-from scripts.stress_gateway_worker_scope import build_scope_command, validate_bounds
+from scripts.stress_gateway_worker_scope import (
+    build_scope_command,
+    validate_bounds,
+    worker_oom_observed,
+)
 
 
 def test_system_scope_command_has_tight_memory_boundary_and_unprivileged_uid():
@@ -55,3 +60,91 @@ def test_documented_system_proof_bounds_reach_real_parser(monkeypatch):
     ]) == 0
     assert seen["memory_max_mb"] == 64
     assert seen["allocation_mb"] == 96
+
+
+def test_worker_oom_classifier_accepts_unit_attestation():
+    assert worker_oom_observed(
+        unit="hermes-worker-proof",
+        kernel_rows=[],
+        unit_attested=True,
+    )
+
+
+def test_worker_oom_classifier_rejects_unrelated_failure():
+    assert not worker_oom_observed(
+        unit="hermes-worker-proof",
+        kernel_rows=["another-worker.scope: oom-kill"],
+    )
+
+
+def test_worker_oom_classifier_rejects_bare_sigkill_exit_without_evidence():
+    assert not worker_oom_observed(
+        unit="hermes-worker-proof",
+        kernel_rows=[],
+        unit_attested=False,
+    )
+
+
+def test_user_scope_oom_evidence_is_exact_and_bounded(monkeypatch):
+    calls = []
+    marker = json.dumps({
+        "_COMM": "systemd",
+        "SYSLOG_IDENTIFIER": "systemd",
+        "_TRANSPORT": "journal",
+        "_SYSTEMD_USER_UNIT": "init.scope",
+        "USER_UNIT": "hermes-worker-proof.scope",
+        "MESSAGE": (
+            "hermes-worker-proof.scope: A process of this unit has been killed "
+            "by the OOM killer."
+        ),
+    }) + "\n"
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return type("Result", (), {"returncode": 0, "stdout": marker})()
+
+    monkeypatch.setattr(worker_scope.subprocess, "run", run)
+
+    assert worker_scope._user_scope_oom_evidence("hermes-worker-proof", 123.9)
+    argv, kwargs = calls[0]
+    assert argv[:4] == [
+        "journalctl",
+        "--user-unit",
+        "hermes-worker-proof.scope",
+        "--since",
+    ]
+    assert argv[4] == "@123"
+    assert kwargs["timeout"] == 8
+
+
+def test_user_scope_oom_evidence_rejects_forged_marker(monkeypatch):
+    forged = json.dumps({
+        "_COMM": "logger",
+        "_TRANSPORT": "syslog",
+        "_SYSTEMD_USER_UNIT": "hermes-worker-proof.scope",
+        "MESSAGE": (
+            "hermes-worker-proof.scope: A process of this unit has been killed "
+            "by the OOM killer."
+        ),
+    }) + "\n"
+    monkeypatch.setattr(
+        worker_scope.subprocess,
+        "run",
+        lambda *args, **kwargs: type(
+            "Result", (), {"returncode": 0, "stdout": forged}
+        )(),
+    )
+
+    assert not worker_scope._user_scope_oom_evidence("hermes-worker-proof", 123)
+
+
+def test_user_scope_oom_evidence_rejects_non_oom_journal(monkeypatch):
+    monkeypatch.setattr(
+        worker_scope.subprocess,
+        "run",
+        lambda *args, **kwargs: type(
+            "Result", (), {"returncode": 0, "stdout": "Killed by SIGKILL\n"}
+        )(),
+    )
+
+    assert not worker_scope._user_scope_oom_evidence("hermes-worker-proof", 123)

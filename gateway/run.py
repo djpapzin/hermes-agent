@@ -1407,6 +1407,10 @@ def _clear_planned_restart_notification() -> None:
 # knows not to clobber TERMINAL_CWD if lazily imported.
 os.environ["_HERMES_GATEWAY"] = "1"
 
+from gateway.runtime_identity import mark_gateway_control_plane_process
+
+mark_gateway_control_plane_process()
+
 _ensure_ssl_certs()
 
 # Add parent directory to path
@@ -23045,6 +23049,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         try:
             from gateway.shutdown_forensics import (
                 format_context_for_log,
+                emit_shutdown_context,
                 snapshot_shutdown_context,
                 spawn_async_diagnostic,
             )
@@ -23108,6 +23113,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # line when diagnosing "the gateway keeps dying" tickets.  Format
         # is one line, key=value, parent_cmdline last (often long).
         if _shutdown_ctx is not None:
+            try:
+                if not emit_shutdown_context(_shutdown_ctx):
+                    logger.warning("Structured shutdown context was not persisted")
+            except Exception as _e:
+                logger.debug("emit_shutdown_context failed: %s", _e)
             try:
                 logger.warning(
                     "Shutdown context: %s", format_context_for_log(_shutdown_ctx)

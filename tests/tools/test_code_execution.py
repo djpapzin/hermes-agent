@@ -824,6 +824,26 @@ class TestEnvVarFiltering(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 # execute_code edge cases
+
+
+def test_execute_code_routes_local_child_through_gateway_scope(monkeypatch):
+    import tools.process_registry as process_registry
+
+    build_scope = unittest.mock.MagicMock(
+        side_effect=lambda argv, **_kwargs: (argv, "hermes-worker-test.scope")
+    )
+    stop_scope = unittest.mock.MagicMock(return_value=True)
+    monkeypatch.setattr(
+        process_registry, "build_gateway_worker_scope_argv", build_scope
+    )
+    monkeypatch.setattr(process_registry, "_stop_systemd_unit", stop_scope)
+
+    result = json.loads(execute_code("print('scoped')", task_id="scope-test"))
+
+    assert result["status"] == "success"
+    assert "scoped" in result["output"]
+    build_scope.assert_called_once()
+    stop_scope.assert_called_once_with("hermes-worker-test.scope")
 # ---------------------------------------------------------------------------
 
 class TestExecuteCodeEdgeCases(unittest.TestCase):

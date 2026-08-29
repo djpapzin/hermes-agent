@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import queue
+import threading
 
 import pytest
 
+from gateway import admission as admission_module
 from gateway.admission import (
     AdmissionRejected,
     AgentAdmissionController,
@@ -17,6 +20,101 @@ from gateway.admission import (
     install_gateway_admission,
     notify_gateway_admission_changed,
 )
+
+
+def test_structured_admission_journal_is_dedicated_and_bounded(monkeypatch):
+    emitted = []
+    monkeypatch.setattr(
+        admission_module,
+        "emit_native_journal",
+        lambda payload, **kwargs: emitted.append((payload, kwargs)) or True,
+    )
+    monkeypatch.setattr(admission_module.os, "getpid", lambda: 4321)
+    monkeypatch.setattr(admission_module.time, "time", lambda: 123.25)
+
+    admission_module._emit_admission_event(
+        {
+            "decision": "queue",
+            "task_id": "task-1",
+            "active_workers": 0,
+            "queued_tasks": 0,
+        }
+    )
+
+    row = admission_module.json.loads(emitted[0][0])
+    kwargs = emitted[0][1]
+    assert row["event"] == "gateway_admission"
+    assert row["gateway_pid"] == 4321
+    assert row["decision"] == "queue"
+    assert row["task_id"] == "task-1"
+    assert row["active_workers"] == 0
+    assert row["queued_tasks"] == 0
+    assert row["timestamp"] == 123.25
+    assert kwargs["identifier"] == "hermes-admission"
+    assert kwargs["event"] == "gateway_admission"
+
+
+def test_admission_persistence_runs_off_controller_thread(monkeypatch):
+    event_queue = queue.Queue(maxsize=1)
+    writer_entered = threading.Event()
+    writer_release = threading.Event()
+
+    def blocked_writer(_payload):
+        writer_entered.set()
+        writer_release.wait(2)
+
+    monkeypatch.setattr(admission_module, "_admission_event_queue", event_queue)
+    monkeypatch.setattr(admission_module, "_admission_writer_started", False)
+    monkeypatch.setattr(admission_module, "_emit_admission_event", blocked_writer)
+
+    admission_module._queue_admission_event({"decision": "queue"})
+
+    assert writer_entered.wait(1)
+    assert not writer_release.is_set()
+    writer_release.set()
+
+
+def test_admission_timestamp_is_captured_before_queueing(monkeypatch):
+    event_queue = queue.Queue(maxsize=1)
+    monkeypatch.setattr(admission_module, "_admission_event_queue", event_queue)
+    monkeypatch.setattr(admission_module, "_admission_writer_started", True)
+    monkeypatch.setattr(admission_module.time, "time", lambda: 123.25)
+
+    admission_module._queue_admission_event({"decision": "queue"})
+
+    assert event_queue.get_nowait() == {
+        "decision": "queue",
+        "timestamp": 123.25,
+    }
+
+
+@pytest.mark.asyncio
+async def test_admission_writer_start_failure_does_not_strand_slot(monkeypatch):
+    event_queue = queue.Queue(maxsize=1)
+
+    class UnstartableThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("cannot start new thread")
+
+    monkeypatch.setattr(admission_module, "_admission_event_queue", event_queue)
+    monkeypatch.setattr(admission_module, "_admission_writer_started", False)
+    monkeypatch.setattr(admission_module.threading, "Thread", UnstartableThread)
+
+    controller = AgentAdmissionController(
+        max_parallel=1,
+        queue_limit=1,
+        memory_reader=lambda: 4096,
+    )
+    await controller.acquire("task-1")
+    assert controller.snapshot().active == 1
+    await controller.release("task-1")
+
+    assert event_queue.empty()
+    assert admission_module._admission_writer_started is False
+    assert controller.snapshot().active == 0
 
 
 def test_cgroup_headroom_uses_memory_max_minus_current(tmp_path):

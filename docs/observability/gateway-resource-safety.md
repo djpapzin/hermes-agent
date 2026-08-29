@@ -11,16 +11,28 @@ Run this read-only snapshot before changing a service or resource limit:
 python3 scripts/hermes_gateway_diagnostics.py --since-minutes 30
 ```
 
-It reports the gateway PID/RSS, host `MemAvailable`, the gateway cgroup's
+It reports the gateway PID/RSS, systemd `Result`/`ExecMainCode`/
+`ExecMainStatus`, host `MemAvailable`, the gateway cgroup's
 current/high/max values and memory events, independently scoped worker
 PIDs/RSS, and each worker cgroup's current/high/max values and OOM events.
-Shutdown log records include the signal, explicit reason, parent,
+The gateway emits an allowlisted shutdown record through a dedicated native
+journald datagram; it includes the signal, explicit reason, safe parent fields,
 gateway RSS, host headroom, active and queued task IDs, worker PIDs, and cgroup
-OOM counters.
+OOM counters. Parent command lines and unknown fields are excluded. The
+diagnostic requires trusted journald PID/unit metadata to match the payload, so
+same-UID workers in independent scopes cannot forge gateway evidence.
 
 The same output includes at most 100 filtered lifecycle/resource journal
-events from the gateway, health guard, and kernel. It deliberately excludes
-general chat and command logs.
+events from the gateway, health guard, and kernel, plus at most 100
+manager-attested structured admission records and 100 manager-attested
+structured shutdown records from native journald. Both queries apply exact
+event and identifier matches before their bounded result cap. The gateway
+writes only controlled fields to these channels; the diagnostic requires the
+trusted unit and PID metadata to match each payload, allowlists fields again,
+and never parses same-UID files or mixed human-readable chat/command logs.
+Gateway lifecycle queries likewise apply systemd-manager provenance matches
+before their 300-row input cap, so replacement-process stdout cannot evict the
+older exit/watchdog evidence before Python validates it.
 
 Admission uses the tighter of host `MemAvailable` and finite gateway-cgroup
 headroom (`MemoryMax - MemoryCurrent`). Structured admission logs expose both
@@ -43,6 +55,21 @@ Do not label an incident OOM unless kernel or cgroup `memory.events` evidence
 supports it. A service-manager SIGTERM, watchdog abort, updater, deployment,
 or external health guard is a different failure path.
 
+### Systemd watchdog semantics
+
+The gateway heartbeat reports every event-loop tick that recovers before the
+last successful heartbeat reaches `WatchdogSec`. Such a late callback is
+recorded as `watchdog delayed: event loop recovered` and must not permanently
+latch the heartbeat off. A callback at or beyond the hard deadline records
+`watchdog expired` without sending `WATCHDOG=1`, so it cannot race systemd and
+re-arm an already-expired watchdog.
+
+This distinction matters under parallel load. A transient delay shorter than
+`WatchdogSec` must recover in place; otherwise one late tick becomes a
+guaranteed later gateway abort that interrupts healthy, unrelated sessions.
+Correlate `Failed with result 'watchdog'` and `status=6/ABRT` with the bounded
+admission and memory evidence before changing the watchdog interval.
+
 ## Supervisor policy
 
 - SQLite `database is locked`, task count, aggregate memory, or low host
@@ -56,6 +83,17 @@ or external health guard is a different failure path.
 - For production Linux gateways, verify either `systemd-run --user --scope` or
   the same-UID `sudo -n systemd-run --system --scope --uid=<runtime-user>` path
   works before selecting `terminal.worker_cgroup_mode: required`.
+- A systemd-supervised Linux gateway fails closed if no worker-scope backend is
+  available, including `auto`, `user`, or `off` configurations. This covers
+  terminal, browser, computer-use, local `execute_code`, and configured stdio
+  MCP children. Running model-controlled work inside the control-plane cgroup would defeat both
+  resource isolation and manager-attested diagnostic provenance. Supervision
+  is latched to the gateway PID once at startup; later deletion or replacement
+  of same-UID runtime PID, lock, or state files cannot disable isolation.
+  Forked/execed children do not inherit that process identity. CLI processes
+  outside the systemd-supervised gateway and non-systemd supervisors such as
+  the official s6 container retain their existing behavior unless they provide
+  their own compatible isolation backend.
 
 ### Replace restart-on-pressure health guards
 

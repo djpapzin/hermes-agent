@@ -13,18 +13,50 @@ from hermes_constants import get_hermes_home
 
 
 _INCIDENT_MARKERS = (
-    "HERMES_ADMISSION",
-    "HERMES_HEALTH",
-    "HERMES_RECOVERY",
-    "Shutdown context:",
-    "Received SIG",
     "Watchdog timeout",
     "watchdog timeout",
+    "Main process exited",
+    "Failed with result",
+    "Scheduled restart job",
+    "Stopping Hermes Agent Gateway",
+    "Started Hermes Agent Gateway",
+)
+_KERNEL_INCIDENT_MARKERS = (
     "killed by the OOM killer",
     "Killed process",
     "Out of memory",
-    "Stopping Hermes Agent Gateway",
-    "Started Hermes Agent Gateway",
+)
+
+_ADMISSION_EVENT_FIELDS = (
+    "decision",
+    "task_id",
+    "reason",
+    "active_workers",
+    "queued_tasks",
+    "max_parallel",
+    "available_memory_mb",
+    "host_available_memory_mb",
+    "cgroup_available_memory_mb",
+    "min_headroom_mb",
+)
+_ADMISSION_MESSAGE_PREFIX = "HERMES_ADMISSION "
+_SHUTDOWN_MESSAGE_PREFIX = "HERMES_SHUTDOWN "
+
+_SHUTDOWN_SCALAR_FIELDS = (
+    "event",
+    "ts",
+    "ts_monotonic",
+    "signal",
+    "signal_num",
+    "shutdown_reason",
+    "pid",
+    "ppid",
+    "under_systemd",
+    "systemd_invocation_id",
+    "active_agent_count",
+    "queued_task_count",
+    "gateway_rss",
+    "host_mem_available_kb",
 )
 
 
@@ -72,6 +104,80 @@ def _service_pid(unit: str, manager: str = "auto") -> int | None:
     return _service_identity(unit, manager)[0]
 
 
+def _service_exit_statuses(
+    unit: str, manager: str = "auto"
+) -> dict[str, dict[str, Any]]:
+    """Read durable exit classifications for every matching manager scope."""
+    managers = ("system", "user") if manager == "auto" else (manager,)
+    properties = (
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "Result",
+        "ExecMainCode",
+        "ExecMainStatus",
+        "NRestarts",
+    )
+    statuses: dict[str, dict[str, Any]] = {}
+    for candidate in managers:
+        argv = ["systemctl"]
+        if candidate == "user":
+            argv.append("--user")
+        try:
+            result = subprocess.run(
+                [
+                    *argv,
+                    "show",
+                    unit,
+                    *(f"--property={name}" for name in properties),
+                    "--no-pager",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode != 0:
+            continue
+        values = dict(
+            line.split("=", 1)
+            for line in result.stdout.splitlines()
+            if "=" in line
+        )
+        if values.get("LoadState") in {None, "not-found"}:
+            continue
+
+        def _integer(name: str) -> int | None:
+            try:
+                return int(values[name])
+            except (KeyError, TypeError, ValueError):
+                return None
+
+        statuses[candidate] = {
+            "load_state": values.get("LoadState"),
+            "active_state": values.get("ActiveState"),
+            "sub_state": values.get("SubState"),
+            "result": values.get("Result"),
+            "exec_main_code": _integer("ExecMainCode"),
+            "exec_main_status": _integer("ExecMainStatus"),
+            "n_restarts": _integer("NRestarts"),
+        }
+    return statuses
+
+
+def _service_exit_status(
+    unit: str, manager: str = "auto"
+) -> dict[str, Any] | None:
+    statuses = _service_exit_statuses(unit, manager)
+    if manager != "auto":
+        return statuses.get(manager)
+    if len(statuses) == 1:
+        return next(iter(statuses.values()))
+    return None
+
+
 def _runtime_status(path: Path) -> dict[str, Any] | None:
     raw = _read(path)
     if raw is None:
@@ -97,18 +203,49 @@ def _bounded_incident_journal(
     unit: str, since_minutes: int, manager: str = "auto"
 ) -> list[dict[str, str]]:
     """Return only lifecycle/resource evidence, never general chat logs."""
-    gateway_commands = []
+    commands: list[tuple[list[str], str]] = []
     if manager in {"auto", "system"}:
-        gateway_commands.append(["journalctl", "-u", unit])
+        commands.append(
+            (
+                [
+                    "journalctl",
+                    "--unit",
+                    unit,
+                    "_PID=1",
+                    "_UID=0",
+                    "_COMM=systemd",
+                    "SYSLOG_IDENTIFIER=systemd",
+                    "_TRANSPORT=journal",
+                    "_SYSTEMD_UNIT=init.scope",
+                    f"UNIT={unit}",
+                ],
+                "gateway-system",
+            )
+        )
     if manager in {"auto", "user"}:
-        gateway_commands.append(["journalctl", "--user", "-u", unit])
-    commands = [
-        *gateway_commands,
-        ["journalctl", "-u", "hermes-health-guard.service"],
-        ["journalctl", "-k"],
-    ]
+        commands.append(
+            (
+                [
+                    "journalctl",
+                    "--user-unit",
+                    unit,
+                    "_COMM=systemd",
+                    "SYSLOG_IDENTIFIER=systemd",
+                    "_TRANSPORT=journal",
+                    "_SYSTEMD_USER_UNIT=init.scope",
+                    f"USER_UNIT={unit}",
+                ],
+                "gateway-user",
+            )
+        )
+    commands.extend(
+        [
+            (["journalctl", "--unit", "hermes-health-guard.service"], "health"),
+            (["journalctl", "--dmesg"], "kernel"),
+        ]
+    )
     events: list[dict[str, str]] = []
-    for base in commands:
+    for base, source in commands:
         try:
             result = subprocess.run(
                 [
@@ -134,17 +271,291 @@ def _bounded_incident_journal(
             except (TypeError, ValueError):
                 continue
             message = str(row.get("MESSAGE") or "")
-            if not any(marker in message for marker in _INCIDENT_MARKERS):
+            if source == "gateway-system":
+                trusted = (
+                    row.get("_PID") == "1"
+                    and row.get("_UID") == "0"
+                    and row.get("_COMM") == "systemd"
+                    and row.get("SYSLOG_IDENTIFIER") == "systemd"
+                    and row.get("_TRANSPORT") == "journal"
+                    and row.get("_SYSTEMD_UNIT") == "init.scope"
+                    and row.get("UNIT") == unit
+                    and any(marker in message for marker in _INCIDENT_MARKERS)
+                )
+                event_unit = unit
+            elif source == "gateway-user":
+                trusted = (
+                    row.get("_COMM") == "systemd"
+                    and row.get("SYSLOG_IDENTIFIER") == "systemd"
+                    and row.get("_TRANSPORT") == "journal"
+                    and row.get("_SYSTEMD_USER_UNIT") == "init.scope"
+                    and row.get("USER_UNIT") == unit
+                    and any(marker in message for marker in _INCIDENT_MARKERS)
+                )
+                event_unit = unit
+            elif source == "health":
+                trusted = (
+                    row.get("_SYSTEMD_UNIT") == "hermes-health-guard.service"
+                    and message.startswith(("HERMES_HEALTH ", "HERMES_RECOVERY "))
+                )
+                event_unit = "hermes-health-guard.service"
+            else:
+                trusted = (
+                    row.get("_TRANSPORT") == "kernel"
+                    and any(marker in message for marker in _KERNEL_INCIDENT_MARKERS)
+                )
+                event_unit = "kernel"
+            if not trusted:
                 continue
             events.append(
                 {
                     "timestamp_realtime_usec": str(
                         row.get("__REALTIME_TIMESTAMP") or ""
                     ),
-                    "unit": str(row.get("_SYSTEMD_UNIT") or "kernel"),
+                    "unit": event_unit,
                     "message": message[:500],
                 }
             )
+    events.sort(
+        key=lambda event: int(event["timestamp_realtime_usec"])
+        if event["timestamp_realtime_usec"].isdigit()
+        else -1
+    )
+    return events[-100:]
+
+
+def _journal_commands(
+    unit: str,
+    manager: str,
+    *,
+    identifier: str,
+    event: str,
+) -> list[tuple[list[str], str]]:
+    commands: list[tuple[list[str], str]] = []
+    matches = [
+        f"SYSLOG_IDENTIFIER={identifier}",
+        f"HERMES_EVENT={event}",
+    ]
+    if manager in {"auto", "system"}:
+        commands.append((["journalctl", "--unit", unit, *matches], "system"))
+    if manager in {"auto", "user"}:
+        commands.append((["journalctl", "--user-unit", unit, *matches], "user"))
+    return commands
+
+
+def _bounded_admission_journal(
+    unit: str, since_minutes: int, manager: str = "auto"
+) -> list[dict[str, Any]]:
+    """Return manager-attested native-journal admission records."""
+    commands = _journal_commands(
+        unit,
+        manager,
+        identifier="hermes-admission",
+        event="gateway_admission",
+    )
+    events: list[dict[str, Any]] = []
+    for base, source in commands:
+        try:
+            result = subprocess.run(
+                [
+                    *base,
+                    "--since",
+                    f"{max(1, since_minutes)} minutes ago",
+                    "-n",
+                    "300",
+                    "-o",
+                    "json",
+                    "--no-pager",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        for line in result.stdout.splitlines():
+            try:
+                row = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            message = str(row.get("MESSAGE") or "")
+            if not message.startswith(_ADMISSION_MESSAGE_PREFIX):
+                continue
+            trusted_unit = (
+                row.get("_SYSTEMD_UNIT") == unit
+                if source == "system"
+                else row.get("_SYSTEMD_USER_UNIT") == unit
+            )
+            if not (
+                trusted_unit
+                and row.get("_TRANSPORT") == "journal"
+                and row.get("SYSLOG_IDENTIFIER") == "hermes-admission"
+                and row.get("HERMES_EVENT") == "gateway_admission"
+            ):
+                continue
+            try:
+                payload = json.loads(message[len(_ADMISSION_MESSAGE_PREFIX):])
+            except (TypeError, ValueError):
+                continue
+            row_pid = str(row.get("_PID") or "")
+            if not (
+                isinstance(payload, dict)
+                and payload.get("event") == "gateway_admission"
+                and row_pid.isdigit()
+                and payload.get("gateway_pid") == int(row_pid)
+            ):
+                continue
+            safe = {
+                key: payload[key]
+                for key in ("event", "gateway_pid", "timestamp", *_ADMISSION_EVENT_FIELDS)
+                if key in payload
+            }
+            events.append(
+                {
+                    "timestamp_realtime_usec": str(
+                        row.get("__REALTIME_TIMESTAMP") or ""
+                    ),
+                    "unit": unit,
+                    "event": safe,
+                }
+            )
+    events.sort(
+        key=lambda event: int(event["timestamp_realtime_usec"])
+        if event["timestamp_realtime_usec"].isdigit()
+        else -1
+    )
+    return events[-100:]
+
+
+def _safe_shutdown_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Recursively allowlist a previously authenticated shutdown payload."""
+    event = {
+        key: payload[key]
+        for key in _SHUTDOWN_SCALAR_FIELDS
+        if key in payload
+    }
+    for key in (
+        "active_task_ids",
+        "queued_task_ids",
+        "worker_pids",
+        "active_task_ids_omitted",
+        "queued_task_ids_omitted",
+        "worker_pids_omitted",
+    ):
+        value = payload.get(key)
+        if key.endswith("_omitted") and isinstance(value, int):
+            event[key] = value
+        elif key == "worker_pids" and isinstance(value, list):
+            event[key] = [item for item in value[:100] if isinstance(item, int)]
+        elif isinstance(value, list):
+            event[key] = [str(item)[:160] for item in value[:100]]
+    parent = payload.get("parent")
+    if isinstance(parent, dict):
+        event["parent"] = {
+            key: parent[key]
+            for key in ("pid", "ppid", "name", "state", "uid")
+            if key in parent
+        }
+    cgroup = payload.get("cgroup")
+    if isinstance(cgroup, dict):
+        safe_cgroup = {
+            key: cgroup[key]
+            for key in ("path", "memory_current", "memory_high", "memory_max")
+            if key in cgroup
+        }
+        memory_events = cgroup.get("memory_events")
+        if isinstance(memory_events, dict):
+            safe_cgroup["memory_events"] = {
+                key: memory_events[key]
+                for key in (
+                    "low",
+                    "high",
+                    "max",
+                    "oom",
+                    "oom_kill",
+                    "oom_group_kill",
+                )
+                if key in memory_events
+            }
+        event["cgroup"] = safe_cgroup
+    return event
+
+
+def _bounded_shutdown_journal(
+    unit: str, since_minutes: int, manager: str = "auto"
+) -> list[dict[str, Any]]:
+    """Return manager-attested native-journal shutdown records."""
+    commands = _journal_commands(
+        unit,
+        manager,
+        identifier="hermes-shutdown-forensics",
+        event="gateway_shutdown",
+    )
+    events: list[dict[str, Any]] = []
+    for base, source in commands:
+        try:
+            result = subprocess.run(
+                [
+                    *base,
+                    "--since",
+                    f"{max(1, since_minutes)} minutes ago",
+                    "-n",
+                    "300",
+                    "-o",
+                    "json",
+                    "--no-pager",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        for line in result.stdout.splitlines():
+            try:
+                row = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            message = str(row.get("MESSAGE") or "")
+            if not message.startswith(_SHUTDOWN_MESSAGE_PREFIX):
+                continue
+            trusted_unit = (
+                row.get("_SYSTEMD_UNIT") == unit
+                if source == "system"
+                else row.get("_SYSTEMD_USER_UNIT") == unit
+            )
+            if not (
+                trusted_unit
+                and row.get("_TRANSPORT") == "journal"
+                and row.get("SYSLOG_IDENTIFIER") == "hermes-shutdown-forensics"
+                and row.get("HERMES_EVENT") == "gateway_shutdown"
+            ):
+                continue
+            try:
+                payload = json.loads(message[len(_SHUTDOWN_MESSAGE_PREFIX):])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict) or payload.get("event") != "gateway_shutdown":
+                continue
+            row_pid = str(row.get("_PID") or "")
+            if not row_pid.isdigit() or payload.get("pid") != int(row_pid):
+                continue
+            events.append(
+                {
+                    "timestamp_realtime_usec": str(
+                        row.get("__REALTIME_TIMESTAMP") or ""
+                    ),
+                    "unit": unit,
+                    "event": _safe_shutdown_payload(payload),
+                }
+            )
+    events.sort(
+        key=lambda event: int(event["timestamp_realtime_usec"])
+        if event["timestamp_realtime_usec"].isdigit()
+        else -1
+    )
     return events[-100:]
 
 
@@ -156,10 +567,22 @@ def collect(
     manager: str = "auto",
 ) -> dict[str, Any]:
     pid, resolved_manager = _service_identity(unit, manager)
+    service_statuses = _service_exit_statuses(
+        unit, resolved_manager or manager
+    )
+    service_status = (
+        service_statuses.get(resolved_manager)
+        if resolved_manager is not None
+        else next(iter(service_statuses.values()))
+        if len(service_statuses) == 1
+        else None
+    )
     result: dict[str, Any] = {
         "unit": unit,
         "service_manager": resolved_manager or manager,
         "gateway_pid": pid,
+        "service_status": service_status,
+        "service_statuses": service_statuses,
         "host_memory_kb": _fields(proc_root / "meminfo"),
     }
     runtime_path = hermes_home / "gateway_state.json"
@@ -265,6 +688,12 @@ def main() -> int:
     args = parser.parse_args()
     result = collect(args.unit, args.hermes_home, manager=args.manager)
     result["incident_events"] = _bounded_incident_journal(
+        args.unit, args.since_minutes, result.get("service_manager", args.manager)
+    )
+    result["shutdown_events"] = _bounded_shutdown_journal(
+        args.unit, args.since_minutes, result.get("service_manager", args.manager)
+    )
+    result["admission_events"] = _bounded_admission_journal(
         args.unit, args.since_minutes, result.get("service_manager", args.manager)
     )
     print(json.dumps(result, indent=2, sort_keys=True))

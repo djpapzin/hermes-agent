@@ -92,7 +92,7 @@ def test_watchdog_interval_is_disabled_for_missing_invalid_or_nonpositive_values
     assert watchdog_interval_seconds() is None
 
 
-def test_watchdog_latches_when_loop_progress_is_late(monkeypatch):
+def test_watchdog_late_tick_still_proves_liveness_and_can_recover(monkeypatch):
     calls: list[str] = []
     monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
     monkeypatch.setenv("WATCHDOG_USEC", "1000000")
@@ -106,10 +106,269 @@ def test_watchdog_latches_when_loop_progress_is_late(monkeypatch):
 
     assert watchdog.record_tick(scheduled_at=10.0, now=10.05) is True
     assert calls == ["WATCHDOG=1"]
-    assert watchdog.record_tick(scheduled_at=10.0, now=10.2) is False
+
+    # A delayed callback proves that the event loop is making progress again.
+    # Do not permanently stop heartbeats and guarantee a later systemd abort;
+    # systemd's WatchdogSec remains the hard bound for a genuinely wedged loop.
+    assert watchdog.record_tick(scheduled_at=10.0, now=10.2) is True
     assert watchdog.unhealthy is True
-    assert calls[-1].startswith("STATUS=watchdog unhealthy")
-    assert watchdog.record_tick(scheduled_at=10.0, now=10.3) is False
+    assert calls[-1].startswith("WATCHDOG=1\nSTATUS=watchdog delayed")
+
+    assert watchdog.record_tick(scheduled_at=10.3, now=10.35) is True
+    assert watchdog.unhealthy is False
+    assert calls[-1] == "WATCHDOG=1\nSTATUS=Hermes Gateway running"
+
+
+def test_watchdog_does_not_rearm_after_hard_deadline(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    monkeypatch.setattr(
+        notify_mod, "notify", lambda message: calls.append(message) or True
+    )
+    watchdog = notify_mod.SystemdWatchdog(lag_tolerance_seconds=0.1)
+
+    assert watchdog.record_tick(scheduled_at=10.0, now=10.0) is True
+    assert watchdog.record_tick(scheduled_at=10.5, now=11.01) is False
+    assert watchdog.unhealthy is True
+    assert calls[-1].startswith("STATUS=watchdog expired")
+    assert "WATCHDOG=1" not in calls[-1]
+
+
+def test_watchdog_failed_notify_does_not_advance_success_deadline(monkeypatch):
+    calls: list[str] = []
+    outcomes = iter((True, False, True))
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    monkeypatch.setattr(
+        notify_mod,
+        "notify",
+        lambda message: calls.append(message) or next(outcomes),
+    )
+    watchdog = notify_mod.SystemdWatchdog(lag_tolerance_seconds=1.0)
+
+    assert watchdog.record_tick(scheduled_at=10.0, now=10.0) is True
+    assert watchdog.record_tick(scheduled_at=10.5, now=10.5) is False
+    # The failed send at 10.5 is not fictitious proof of liveness. The next
+    # callback is beyond one second from the last successful send at 10.0.
+    assert watchdog.record_tick(scheduled_at=11.0, now=11.01) is False
+    assert calls[-1].startswith("STATUS=watchdog expired")
+    assert "WATCHDOG=1" not in calls[-1]
+
+
+def test_watchdog_retry_is_strictly_before_remaining_deadline(monkeypatch):
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    watchdog = notify_mod.SystemdWatchdog()
+    watchdog._last_heartbeat_at = 10.0
+
+    remaining = 0.001
+    delay = watchdog._retry_delay(now=10.0 + 1.0 - remaining, cadence=0.5)
+
+    assert 0 <= delay < remaining
+
+
+@pytest.mark.asyncio
+async def test_watchdog_sampler_retries_after_transient_notify_failure(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "100000")
+
+    import gateway.systemd_notify as notify_mod
+
+    def send(message: str) -> bool:
+        calls.append(message)
+        # READY succeeds, the first periodic heartbeat fails, and the retry
+        # succeeds before the manager's deadline.
+        return len(calls) != 2
+
+    monkeypatch.setattr(notify_mod, "notify", send)
+    watchdog = notify_mod.SystemdWatchdog(lag_tolerance_seconds=1.0)
+
+    assert watchdog.start() is True
+    assert watchdog.ready() is True
+    await asyncio.sleep(0.09)
+    await watchdog.stop()
+
+    heartbeat_calls = [call for call in calls if call.startswith("WATCHDOG=1")]
+    assert len(heartbeat_calls) >= 2
+    assert not any(call.startswith("STATUS=watchdog expired") for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_expired_watchdog_shutdown_does_not_rearm_manager(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    monkeypatch.setattr(
+        notify_mod, "notify", lambda message: calls.append(message) or True
+    )
+    watchdog = notify_mod.SystemdWatchdog()
+    watchdog._expired = True
+
+    await watchdog.stop()
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_rechecks_expired_heartbeat_before_stopping_notify(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    monkeypatch.setattr(
+        notify_mod, "notify", lambda message: calls.append(message) or True
+    )
+    monkeypatch.setattr(notify_mod.time, "monotonic", lambda: 20.0)
+    watchdog = notify_mod.SystemdWatchdog()
+    watchdog._last_heartbeat_at = 18.0
+
+    await watchdog.stop()
+
+    assert watchdog.unhealthy is True
+    assert watchdog._expired is True
+    assert calls == ["STATUS=watchdog expired: hard deadline exceeded during shutdown"]
+    assert not any("STOPPING=1" in message or "WATCHDOG=1" in message for message in calls)
+
+
+@pytest.mark.asyncio
+async def test_failed_stopping_notify_retries_inside_remaining_deadline(monkeypatch):
+    calls: list[str] = []
+    captured_target = None
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    class CapturingThread:
+        def __init__(self, *, target, **_kwargs):
+            nonlocal captured_target
+            captured_target = target
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(
+        notify_mod, "notify", lambda message: calls.append(message) or False
+    )
+    monkeypatch.setattr(notify_mod.threading, "Thread", CapturingThread)
+    watchdog = notify_mod.SystemdWatchdog()
+    watchdog._last_heartbeat_at = notify_mod.time.monotonic() - 0.95
+
+    await watchdog.stop()
+
+    assert calls == ["STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining"]
+    assert captured_target is not None
+    closure = dict(
+        zip(
+            captured_target.__code__.co_freevars,
+            (cell.cell_contents for cell in captured_target.__closure__),
+        )
+    )
+    assert 0 < closure["initial_delay"] < 0.05
+
+
+def test_failed_stopping_notify_retries_full_stopping_payload(monkeypatch):
+    calls: list[str] = []
+    outcomes = iter((False, True, True))
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    monkeypatch.setattr(
+        notify_mod,
+        "notify",
+        lambda message: calls.append(message) or next(outcomes),
+    )
+    watchdog = notify_mod.SystemdWatchdog()
+    watchdog._last_heartbeat_at = notify_mod.time.monotonic()
+
+    confirmed, _ = watchdog._send_shutdown_heartbeat(
+        stopping_confirmed=False, cadence=0.5
+    )
+    assert confirmed is False
+    confirmed, _ = watchdog._send_shutdown_heartbeat(
+        stopping_confirmed=confirmed, cadence=0.5
+    )
+    assert confirmed is True
+    watchdog._send_shutdown_heartbeat(
+        stopping_confirmed=confirmed, cadence=0.5
+    )
+
+    assert calls[:2] == [
+        "STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining",
+        "STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining",
+    ]
+    assert calls[2] == "WATCHDOG=1"
+
+
+def test_shutdown_send_helper_refuses_expired_watchdog_rearm(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    monkeypatch.setattr(
+        notify_mod, "notify", lambda message: calls.append(message) or True
+    )
+    watchdog = notify_mod.SystemdWatchdog()
+    watchdog._last_heartbeat_at = notify_mod.time.monotonic() - 1.0
+
+    watchdog._send_shutdown_heartbeat(
+        stopping_confirmed=False,
+        cadence=0.5,
+    )
+
+    assert watchdog._expired is True
+    assert calls == [
+        "STATUS=watchdog expired: hard deadline exceeded during shutdown"
+    ]
+    assert not any("WATCHDOG=1" in call for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_keepalive_thread_start_failure_does_not_abort_stop(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    class UnstartableThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("cannot start new thread")
+
+    monkeypatch.setattr(
+        notify_mod, "notify", lambda message: calls.append(message) or True
+    )
+    monkeypatch.setattr(notify_mod.threading, "Thread", UnstartableThread)
+    watchdog = notify_mod.SystemdWatchdog()
+    watchdog._last_heartbeat_at = notify_mod.time.monotonic()
+
+    await watchdog.stop()
+
+    assert calls == ["STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining"]
+    assert watchdog._shutdown_keepalive is None
 
 
 @pytest.mark.asyncio

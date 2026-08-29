@@ -1751,14 +1751,19 @@ healthy older task to start a newer one. On cgroups-v2 Linux, Hermes uses the
 smaller of host `MemAvailable` and the gateway cgroup's `MemoryMax -
 MemoryCurrent`, so a service-local limit cannot be hidden by ample host RAM.
 
-On Linux, `terminal.worker_cgroup_mode: required` refuses to start a local
-background executor unless Hermes can put it in an independent systemd user
-scope. `required` tries a user scope first, then a root-manager scope through
-passwordless `sudo` while explicitly retaining the gateway's UID/GID. Each
-scope receives `MemoryHigh`, `MemoryMax`, and `MemorySwapMax=0`; its crash or OOM does
-not stop the gateway or sibling scopes. Use `auto` where a systemd user manager
-is not available, but treat the emitted fallback warning as an operational
-readiness failure on production gateways.
+On Linux, a systemd-supervised gateway refuses to start a local executor unless
+Hermes can put it in an independent systemd scope. This is fail-closed for every
+mode, including `auto`, `user`, and `off`; those modes retain their historical
+fallback behavior outside a systemd-supervised gateway. `required` tries a user
+scope first, then a root-manager scope through passwordless `sudo` while
+explicitly retaining the gateway's UID/GID. Each scope receives `MemoryHigh`,
+`MemoryMax`, and `MemorySwapMax=0`; its crash or OOM does not stop the gateway
+or sibling scopes. Local terminal, browser, computer-use, `execute_code`, and
+configured stdio MCP children share this boundary. Non-systemd supervisors,
+including macOS launchd and the
+official Linux s6 container, are not subject to this systemd-specific
+requirement unless they provide a compatible isolation backend. Verify a scope
+backend before starting a production systemd Linux gateway.
 
 Control whether shared chats keep one conversation per room or one conversation per participant:
 

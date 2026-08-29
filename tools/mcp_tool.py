@@ -102,6 +102,7 @@ import shutil
 import sys
 import threading
 import time
+import uuid
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -2270,12 +2271,6 @@ class MCPServerTask:
         # package, not the watchdog wrapper.
         command, args = _wrap_command_with_watchdog(command, args)
 
-        server_params = StdioServerParameters(
-            command=command,
-            args=args,
-            env=safe_env if safe_env else None,
-        )
-
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
         if self._elicitation:
             sampling_kwargs.update(self._elicitation.session_kwargs())
@@ -2305,7 +2300,22 @@ class MCPServerTask:
         # ~/.hermes/logs/mcp-stderr.log.
         _write_stderr_log_header(self.name)
         _errlog = _get_mcp_stderr_log()
+        scope_argv = [command, *args]
+        worker_scope_unit = None
+        if os.name != "nt":
+            from tools.process_registry import build_gateway_worker_scope_argv
+
+            scope_argv, worker_scope_unit = build_gateway_worker_scope_argv(
+                scope_argv,
+                unit_suffix=f"mcp-{self.name}-{os.getpid()}-{uuid.uuid4().hex[:8]}",
+                environment=safe_env,
+            )
         try:
+            server_params = StdioServerParameters(
+                command=scope_argv[0],
+                args=scope_argv[1:],
+                env=safe_env if safe_env else None,
+            )
             async with stdio_client(server_params, errlog=_errlog) as (
                 read_stream,
                 write_stream,
@@ -2374,6 +2384,23 @@ class MCPServerTask:
                     # consistency with _run_http.
                     return await self._wait_for_lifecycle_event()
         finally:
+            if os.name != "nt":
+                from tools.process_registry import (
+                    _discard_scope_environment,
+                    _stop_systemd_unit,
+                )
+
+                _discard_scope_environment(scope_argv)
+                if worker_scope_unit:
+                    stopped = await asyncio.to_thread(
+                        _stop_systemd_unit, worker_scope_unit
+                    )
+                    if not stopped:
+                        logger.warning(
+                            "MCP server '%s': could not reap worker scope %s",
+                            self.name,
+                            worker_scope_unit,
+                        )
             # Runs on clean exit, exceptions, AND asyncio cancellation.
             # If any of the spawned PIDs are still alive, the SDK's
             # teardown failed (common when the task is cancelled mid-way

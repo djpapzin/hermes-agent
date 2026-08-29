@@ -137,6 +137,91 @@ def service_state(unit: str) -> ServiceState:
     )
 
 
+def worker_oom_observed(
+    *, unit: str, kernel_rows: list[str], unit_attested: bool = False
+) -> bool:
+    """Classify the bounded probe's OOM outcome across launch backends.
+
+    Exit status is deliberately insufficient: the root wrapper converts a
+    child SIGKILL to 247, but an administrative SIGKILL has the same status.
+    Require an exact kernel row or the wrapper's recent, unit-bound systemd
+    journal attestation.
+    """
+
+    return unit_attested or any(
+        unit in line and "oom" in line.lower() for line in kernel_rows
+    )
+
+
+def _system_scope_oom_evidence(unit: str, started_at: float) -> bool:
+    sudo = shutil.which("sudo") or "/usr/bin/sudo"
+    result = subprocess.run(
+        [
+            sudo,
+            "-n",
+            str(_SYSTEM_SCOPE_WRAPPER),
+            "evidence",
+            unit + ".scope",
+            str(int(started_at)),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        result.returncode == 0
+        and isinstance(payload, dict)
+        and payload.get("unit") == unit + ".scope"
+        and payload.get("oom_kill") is True
+    )
+
+
+def _user_scope_oom_evidence(unit: str, started_at: float) -> bool:
+    """Read only the caller's recent exact-unit user-manager journal."""
+
+    result = subprocess.run(
+        [
+            "journalctl",
+            "--user-unit",
+            unit + ".scope",
+            "--since",
+            f"@{int(started_at)}",
+            "--no-pager",
+            "--output=json",
+            "--lines=100",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+    marker = "A process of this unit has been killed by the OOM killer."
+    scope_unit = unit + ".scope"
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.splitlines():
+        try:
+            row = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if (
+            row.get("_COMM") == "systemd"
+            and row.get("SYSLOG_IDENTIFIER") == "systemd"
+            and row.get("_TRANSPORT") == "journal"
+            and row.get("_SYSTEMD_USER_UNIT") == "init.scope"
+            and row.get("USER_UNIT") == scope_unit
+            and str(row.get("MESSAGE") or "").strip()
+            in {marker, f"{scope_unit}: {marker}"}
+        ):
+            return True
+    return False
+
+
 def run_proof(
     *,
     backend: str,
@@ -208,15 +293,22 @@ def run_proof(
         for line in kernel.stdout.splitlines()
         if unit in line or ("oom" in line.lower() and "hermes-worker" in line)
     ][-20:]
-    worker_oom_observed = result.returncode in {137, -9} or any(
-        unit in line and "oom" in line.lower() for line in kernel_rows
+    unit_attested = (
+        _system_scope_oom_evidence(unit, started_at)
+        if backend == "system"
+        else _user_scope_oom_evidence(unit, started_at)
+    )
+    oom_observed = worker_oom_observed(
+        unit=unit,
+        kernel_rows=kernel_rows,
+        unit_attested=unit_attested,
     )
     gateway_survived = (
         after.active_state == "active"
         and after.main_pid == before.main_pid
         and after.restarts == before.restarts
     )
-    if not worker_oom_observed:
+    if not oom_observed:
         _stop_scope(backend, unit)
     return {
         "unit": unit + ".scope",
@@ -224,7 +316,8 @@ def run_proof(
         "memory_max_mb": memory_max_mb,
         "allocation_mb": allocation_mb,
         "worker_returncode": result.returncode,
-        "worker_oom_observed": worker_oom_observed,
+        "worker_oom_observed": oom_observed,
+        "unit_oom_attested": unit_attested,
         "gateway_before": asdict(before),
         "gateway_after": asdict(after),
         "gateway_survived": gateway_survived,

@@ -43,6 +43,7 @@ import uuid
 from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
+_IS_LINUX = platform.system() == "Linux"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
@@ -177,11 +178,18 @@ def _cleanup_scope_environment_when_done(process: Any, argv: List[str]) -> None:
                 return
             time.sleep(0.05)
 
-    threading.Thread(
-        target=cleanup,
-        daemon=True,
-        name="hermes-worker-env-cleanup",
-    ).start()
+    try:
+        threading.Thread(
+            target=cleanup,
+            daemon=True,
+            name="hermes-worker-env-cleanup",
+        ).start()
+    except Exception as exc:
+        logger.warning(
+            "Could not start worker environment cleanup watcher; "
+            "startup remains tracked: %s",
+            exc,
+        )
 
 
 def _cleanup_orphaned_worker_environments() -> None:
@@ -355,15 +363,35 @@ def _worker_scope_backend() -> Optional[str]:
 
 
 def _is_supervised_gateway_process() -> bool:
-    if os.environ.get("_HERMES_GATEWAY") != "1":
-        return False
     try:
-        from gateway.restart import is_gateway_supervisor_process
-        from gateway.status import get_running_pid
-        return is_gateway_supervisor_process() and get_running_pid(cleanup_stale=False) == os.getpid()
+        from gateway.runtime_identity import (
+            is_systemd_gateway_control_plane_process,
+        )
+
+        return is_systemd_gateway_control_plane_process()
     except Exception as exc:
-        logger.debug("Could not verify supervised gateway process identity: %s", exc)
+        logger.debug("Could not read gateway control-plane identity: %s", exc)
         return False
+
+
+def _gateway_worker_scope_backend(
+    *, isolation_required: bool
+) -> Optional[str]:
+    """Resolve a worker backend without re-reading a cached gateway identity."""
+    if not isolation_required:
+        return None
+    backend = _worker_scope_backend()
+    if backend is None:
+        raise RuntimeError(
+            "Supervised gateway worker cgroup isolation is unavailable; "
+            "refusing to run workload in the control-plane cgroup"
+        )
+    return backend
+
+
+def _gateway_worker_isolation_required() -> bool:
+    """Return whether this Linux gateway must isolate model-controlled work."""
+    return _IS_LINUX and _is_supervised_gateway_process()
 
 
 def _build_systemd_scope_argv(
@@ -373,7 +401,7 @@ def _build_systemd_scope_argv(
     import shutil
     binary = shutil.which("systemd-run")
     if binary is None:
-        return shell_argv
+        raise RuntimeError("systemd-run is unavailable for worker isolation")
     safe_suffix = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(unit_suffix)).strip("-.")
     safe_suffix = (safe_suffix or uuid.uuid4().hex)[:160]
     memory_max = _worker_memory_max_bytes()
@@ -381,7 +409,9 @@ def _build_systemd_scope_argv(
     if backend == "system":
         sudo = shutil.which("sudo")
         if sudo is None or not _SYSTEM_SCOPE_WRAPPER.is_file():
-            return shell_argv
+            raise RuntimeError(
+                "system worker scope wrapper is unavailable for worker isolation"
+            )
         env_path = _write_worker_environment(environment, safe_suffix)
         return [
             sudo,
@@ -407,17 +437,12 @@ def build_gateway_worker_scope_argv(
     argv: List[str], *, unit_suffix: str,
     environment: Optional[Dict[str, str]] = None,
 ) -> tuple[List[str], Optional[str]]:
-    if _IS_WINDOWS or not _is_supervised_gateway_process():
+    isolation_required = _gateway_worker_isolation_required()
+    if not isolation_required:
         return argv, None
-    mode = _worker_cgroup_mode()
-    if mode == "off":
-        return argv, None
-    backend = _worker_scope_backend()
-    if backend is None:
-        if mode in {"required", "system"}:
-            raise RuntimeError("Worker cgroup isolation is required but no systemd scope backend is available")
-        logger.warning("Gateway workload %s is not isolated in a systemd scope", unit_suffix)
-        return argv, None
+    backend = _gateway_worker_scope_backend(isolation_required=isolation_required)
+    if backend is None:  # pragma: no cover - guarded by supervised identity above
+        raise RuntimeError("Supervised gateway worker isolation is unavailable")
     wrapped = _build_systemd_scope_argv(argv, unit_suffix, backend, environment)
     safe_suffix = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(unit_suffix)).strip("-.")
     safe_suffix = (safe_suffix or "worker")[:160]
@@ -428,6 +453,32 @@ def _stop_systemd_unit(unit_name: str) -> bool:
     import shutil
     binary = shutil.which("systemctl")
     if binary is None:
+        return False
+    command = [binary, "--user", "stop", unit_name]
+    if unit_name.startswith("hermes-worker-system-"):
+        sudo = shutil.which("sudo")
+        if sudo is None or not _SYSTEM_SCOPE_WRAPPER.is_file():
+            return False
+        command = [
+            sudo,
+            "-n",
+            str(_SYSTEM_SCOPE_WRAPPER),
+            "stop",
+            unit_name,
+        ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, timeout=15, stdin=subprocess.DEVNULL
+        )
+        if result.returncode == 0:
+            return True
+        stderr = (result.stderr or b"").decode(errors="replace").lower()
+        return any(
+            marker in stderr
+            for marker in ("not loaded", "not found", "does not exist")
+        )
+    except Exception as exc:
+        logger.debug("systemctl stop %s failed: %s", unit_name, exc)
         return False
 
 
@@ -464,29 +515,6 @@ def _systemd_unit_has_processes(
         return False
     except (OSError, subprocess.TimeoutExpired):
         return True
-    command = [binary, "--user", "stop", unit_name]
-    if unit_name.startswith("hermes-worker-system-"):
-        sudo = shutil.which("sudo")
-        if sudo is None or not _SYSTEM_SCOPE_WRAPPER.is_file():
-            return False
-        command = [
-            sudo,
-            "-n",
-            str(_SYSTEM_SCOPE_WRAPPER),
-            "stop",
-            unit_name,
-        ]
-    try:
-        result = subprocess.run(
-            command, capture_output=True, timeout=15, stdin=subprocess.DEVNULL
-        )
-        if result.returncode == 0:
-            return True
-        stderr = (result.stderr or b"").decode(errors="replace").lower()
-        return any(marker in stderr for marker in ("not loaded", "not found", "does not exist"))
-    except Exception as exc:
-        logger.debug("systemctl stop %s failed: %s", unit_name, exc)
-        return False
 
 
 def format_uptime_short(seconds: int) -> str:
@@ -1128,6 +1156,7 @@ class ProcessRegistry:
             started_at=time.time(),
         )
 
+        gateway_isolation_required = _gateway_worker_isolation_required()
         pty_scope_attempted = False
         if use_pty:
             # Try PTY mode for interactive CLI tools
@@ -1142,10 +1171,15 @@ class ProcessRegistry:
                 pty_env.setdefault("GIT_PAGER", "cat")
                 pty_env.setdefault("PAGER", "cat")
                 pty_argv = [user_shell, "-lic", f"set +m; {command}"]
-                pty_in_supervised_gateway = not _IS_WINDOWS and _is_supervised_gateway_process()
-                pty_cgroup_mode = _worker_cgroup_mode()
-                pty_scope_backend = _worker_scope_backend() if pty_in_supervised_gateway else None
-                if pty_in_supervised_gateway and pty_cgroup_mode != "off" and pty_scope_backend:
+                pty_in_supervised_gateway = gateway_isolation_required
+                pty_scope_backend = (
+                    _gateway_worker_scope_backend(
+                        isolation_required=gateway_isolation_required
+                    )
+                    if pty_in_supervised_gateway
+                    else None
+                )
+                if pty_in_supervised_gateway and pty_scope_backend:
                     pty_argv = _build_systemd_scope_argv(
                         pty_argv, session.id, pty_scope_backend, pty_env
                     )
@@ -1153,12 +1187,6 @@ class ProcessRegistry:
                         f"hermes-worker-{'system-' if pty_scope_backend == 'system' else ''}{session.id}.scope"
                     )
                     pty_scope_attempted = True
-                elif pty_in_supervised_gateway:
-                    if pty_cgroup_mode in {"required", "system"}:
-                        raise RuntimeError(
-                            "Worker cgroup isolation is required but no systemd scope backend is available"
-                        )
-                    logger.warning("PTY worker %s shares the gateway cgroup", session.id)
                 try:
                     pty_proc = _PtyProcessCls.spawn(
                         pty_argv,
@@ -1195,6 +1223,8 @@ class ProcessRegistry:
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
+                if gateway_isolation_required and not pty_scope_attempted:
+                    raise
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
                 if pty_scope_attempted and session.systemd_unit:
                     if not _stop_systemd_unit(session.systemd_unit):
@@ -1215,10 +1245,15 @@ class ProcessRegistry:
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
         shell_argv = [user_shell, "-lic", f"set +m; {command}"]
-        in_supervised_gateway = not _IS_WINDOWS and _is_supervised_gateway_process()
-        cgroup_mode = _worker_cgroup_mode()
-        scope_backend = _worker_scope_backend() if in_supervised_gateway else None
-        if in_supervised_gateway and cgroup_mode != "off" and scope_backend:
+        in_supervised_gateway = gateway_isolation_required
+        scope_backend = (
+            _gateway_worker_scope_backend(
+                isolation_required=gateway_isolation_required
+            )
+            if in_supervised_gateway
+            else None
+        )
+        if in_supervised_gateway and scope_backend:
             unit_suffix = f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id
             spawn_argv = _build_systemd_scope_argv(
                 shell_argv, unit_suffix, scope_backend, bg_env
@@ -1228,12 +1263,6 @@ class ProcessRegistry:
             )
         else:
             spawn_argv = shell_argv
-            if in_supervised_gateway:
-                if cgroup_mode in {"required", "system"}:
-                    raise RuntimeError(
-                        "Worker cgroup isolation is required but no systemd scope backend is available"
-                    )
-                logger.warning("Local worker %s shares the gateway cgroup", session.id)
 
         try:
             proc = subprocess.Popen(
@@ -2311,7 +2340,7 @@ class ProcessRegistry:
                 s
                 for s in (*self._running.values(), *self._finished.values())
                 if (task_id is None or s.task_id == task_id)
-                and (not s.exited or bool(s.systemd_unit))
+                and (not s.exited or bool(getattr(s, "systemd_unit", "")))
             ]
 
         killed = 0
@@ -2332,13 +2361,17 @@ class ProcessRegistry:
         # First prune expired finished sessions
         now = time.time()
         for session in self._finished.values():
-            if session.systemd_unit and not _systemd_unit_has_processes(
-                session.systemd_unit
+            if not hasattr(session, "systemd_unit"):
+                session.systemd_unit = ""
+            systemd_unit = getattr(session, "systemd_unit", "")
+            if systemd_unit and not _systemd_unit_has_processes(
+                systemd_unit
             ):
                 session.systemd_unit = ""
         expired = [
             sid for sid, s in self._finished.items()
-            if not s.systemd_unit and (now - s.started_at) > FINISHED_TTL_SECONDS
+            if not getattr(s, "systemd_unit", "")
+            and (now - s.started_at) > FINISHED_TTL_SECONDS
         ]
         for sid in expired:
             del self._finished[sid]
@@ -2347,7 +2380,11 @@ class ProcessRegistry:
 
         # If still over limit, remove oldest finished
         total = len(self._running) + len(self._finished)
-        prunable = [sid for sid, s in self._finished.items() if not s.systemd_unit]
+        prunable = [
+            sid
+            for sid, s in self._finished.items()
+            if not getattr(s, "systemd_unit", "")
+        ]
         if total >= MAX_PROCESSES and prunable:
             oldest_id = min(prunable, key=lambda sid: self._finished[sid].started_at)
             del self._finished[oldest_id]
@@ -2374,7 +2411,11 @@ class ProcessRegistry:
             with self._lock:
                 sessions = [
                     *(s for s in self._running.values() if not s.exited),
-                    *(s for s in self._finished.values() if s.systemd_unit),
+                    *(
+                        s
+                        for s in self._finished.values()
+                        if getattr(s, "systemd_unit", "")
+                    ),
                 ]
                 entries = []
                 for s in sessions:

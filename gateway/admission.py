@@ -8,19 +8,87 @@ import functools
 import inspect
 import json
 import logging
+import os
+import queue
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
+from gateway.structured_journal import emit_native_journal
+
 logger = logging.getLogger(__name__)
 
 _QUEUE_NOTICE_TIMEOUT_SECONDS = 5.0
+_ADMISSION_EVENT_MAX_RECORD_BYTES = 8 * 1024
+_ADMISSION_MESSAGE_PREFIX = b"HERMES_ADMISSION "
 
 _registry_lock = threading.Lock()
 _gateway_controller: Optional["AgentAdmissionController"] = None
 _gateway_loop: Optional[asyncio.AbstractEventLoop] = None
+_admission_event_queue: queue.Queue[dict] = queue.Queue(maxsize=1024)
+_admission_writer_lock = threading.Lock()
+_admission_writer_started = False
+
+
+def _emit_admission_event(payload: dict) -> None:
+    """Emit one controlled record through journald's manager-attested channel."""
+    record = dict(payload)
+    record.setdefault("timestamp", time.time())
+    record["event"] = "gateway_admission"
+    record["gateway_pid"] = os.getpid()
+    encoded = json.dumps(record, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
+    if len(encoded) > _ADMISSION_EVENT_MAX_RECORD_BYTES:
+        return
+    if not emit_native_journal(
+        encoded,
+        message_prefix=_ADMISSION_MESSAGE_PREFIX,
+        identifier="hermes-admission",
+        event="gateway_admission",
+    ):
+        logger.debug("Could not emit admission event to native journal")
+
+
+def _admission_event_writer(event_queue: queue.Queue[dict]) -> None:
+    while True:
+        payload = event_queue.get()
+        try:
+            _emit_admission_event(payload)
+        finally:
+            event_queue.task_done()
+
+
+def _queue_admission_event(payload: dict) -> None:
+    """Enqueue evidence without filesystem I/O on the gateway event loop."""
+
+    global _admission_writer_started
+    record = dict(payload)
+    record.setdefault("timestamp", time.time())
+    if not _admission_writer_started:
+        with _admission_writer_lock:
+            if not _admission_writer_started:
+                try:
+                    threading.Thread(
+                        target=_admission_event_writer,
+                        args=(_admission_event_queue,),
+                        name="hermes-admission-events",
+                        daemon=True,
+                    ).start()
+                except Exception as exc:
+                    logger.warning(
+                        "Could not start admission evidence writer; dropping event: %s",
+                        exc,
+                    )
+                    return
+                _admission_writer_started = True
+    try:
+        _admission_event_queue.put_nowait(record)
+    except queue.Full:
+        logger.warning("Admission evidence queue is full; dropping one event")
 
 
 def install_gateway_admission(
@@ -339,24 +407,23 @@ class AgentAdmissionController:
 
     def _log(self, decision: str, task_id: str, reason: str = "") -> None:
         snap = self.snapshot()
+        payload = {
+            "decision": decision,
+            "task_id": task_id,
+            "reason": reason,
+            "active_workers": snap.active,
+            "queued_tasks": snap.queued,
+            "max_parallel": snap.max_parallel,
+            "available_memory_mb": snap.available_memory_mb,
+            "host_available_memory_mb": snap.host_available_memory_mb,
+            "cgroup_available_memory_mb": snap.cgroup_available_memory_mb,
+            "min_headroom_mb": snap.min_headroom_mb,
+        }
         logger.info(
             "HERMES_ADMISSION %s",
-            json.dumps(
-                {
-                    "decision": decision,
-                    "task_id": task_id,
-                    "reason": reason,
-                    "active_workers": snap.active,
-                    "queued_tasks": snap.queued,
-                    "max_parallel": snap.max_parallel,
-                    "available_memory_mb": snap.available_memory_mb,
-                    "host_available_memory_mb": snap.host_available_memory_mb,
-                    "cgroup_available_memory_mb": snap.cgroup_available_memory_mb,
-                    "min_headroom_mb": snap.min_headroom_mb,
-                },
-                sort_keys=True,
-            ),
+            json.dumps(payload, sort_keys=True),
         )
+        _queue_admission_event(payload)
 
     async def acquire(
         self,

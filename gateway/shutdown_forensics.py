@@ -26,6 +26,13 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from gateway.structured_journal import emit_native_journal
+
+
+_SHUTDOWN_EVENT_MAX_RECORD_BYTES = 16 * 1024
+_JOURNAL_SOCKET = "/run/systemd/journal/socket"
+_SHUTDOWN_MESSAGE_PREFIX = "HERMES_SHUTDOWN "
+
 
 _SIGNAL_NAME_BY_NUM: Dict[int, str] = {}
 for _name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT", "SIGUSR1", "SIGUSR2"):
@@ -253,6 +260,144 @@ def snapshot_shutdown_context(
         pass
 
     return ctx
+
+
+def _bounded_text(value: Any, limit: int = 300) -> str:
+    """Return one line of bounded diagnostic text."""
+    return (
+        str(value or "")
+        .replace("\x00", "")
+        .replace("\r", " ")
+        .replace("\n", " ")[:limit]
+    )
+
+
+def _shutdown_event_record(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the secret-safe allowlist persisted for shutdown diagnostics."""
+    parent = ctx.get("parent") if isinstance(ctx.get("parent"), dict) else {}
+    cgroup = ctx.get("cgroup") if isinstance(ctx.get("cgroup"), dict) else {}
+    raw_events = (
+        cgroup.get("memory_events")
+        if isinstance(cgroup.get("memory_events"), dict)
+        else {}
+    )
+
+    def _integer(value: Any) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _ids(value: Any, *, numeric: bool = False) -> List[Any]:
+        if not isinstance(value, (list, tuple)):
+            return []
+        if numeric:
+            return [
+                item
+                for item in (_integer(entry) for entry in value[:100])
+                if item is not None
+            ]
+        return [_bounded_text(entry, 160) for entry in value[:100]]
+
+    event: Dict[str, Any] = {
+        "event": "gateway_shutdown",
+        "ts": ctx.get("ts"),
+        "ts_monotonic": ctx.get("ts_monotonic"),
+        "signal": _bounded_text(ctx.get("signal"), 32),
+        "signal_num": _integer(ctx.get("signal_num")),
+        "shutdown_reason": _bounded_text(ctx.get("shutdown_reason"), 80),
+        "pid": _integer(ctx.get("pid")),
+        "ppid": _integer(ctx.get("ppid")),
+        "parent": {
+            "pid": _integer(parent.get("pid")),
+            "ppid": _integer(parent.get("ppid")),
+            "name": _bounded_text(parent.get("name"), 80),
+            "state": _bounded_text(parent.get("state"), 80),
+            "uid": _bounded_text(parent.get("uid"), 32),
+        },
+        "under_systemd": bool(ctx.get("under_systemd")),
+        "systemd_invocation_id": _bounded_text(
+            ctx.get("systemd_invocation_id"), 128
+        ),
+        "active_agent_count": _integer(ctx.get("active_agent_count")) or 0,
+        "queued_task_count": _integer(ctx.get("queued_task_count")) or 0,
+        "active_task_ids": _ids(ctx.get("active_task_ids")),
+        "queued_task_ids": _ids(ctx.get("queued_task_ids")),
+        "worker_pids": _ids(ctx.get("worker_pids"), numeric=True),
+        "gateway_rss": _bounded_text(ctx.get("gateway_rss"), 64),
+        "host_mem_available_kb": _integer(ctx.get("host_mem_available_kb")),
+        "cgroup": {
+            "path": _bounded_text(cgroup.get("path"), 300),
+            "memory_current": _bounded_text(cgroup.get("memory_current"), 64),
+            "memory_high": _bounded_text(cgroup.get("memory_high"), 64),
+            "memory_max": _bounded_text(cgroup.get("memory_max"), 64),
+            "memory_events": {
+                key: value
+                for key in (
+                    "low",
+                    "high",
+                    "max",
+                    "oom",
+                    "oom_kill",
+                    "oom_group_kill",
+                )
+                if (value := _integer(raw_events.get(key))) is not None
+            },
+        },
+    }
+    return event
+
+
+def _encoded_shutdown_event(ctx: Dict[str, Any]) -> bytes:
+    """Serialize an allowlisted event, shrinking lists to the fixed cap."""
+    event = _shutdown_event_record(ctx)
+    list_fields = ("active_task_ids", "queued_task_ids", "worker_pids")
+    original_lengths = {
+        key: (
+            len(ctx.get(key))
+            if isinstance(ctx.get(key), (list, tuple))
+            else len(event.get(key) or [])
+        )
+        for key in list_fields
+    }
+    while True:
+        for key in list_fields:
+            omitted = original_lengths[key] - len(event.get(key) or [])
+            event[f"{key}_omitted"] = omitted
+        payload = json.dumps(
+            event,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(payload) <= _SHUTDOWN_EVENT_MAX_RECORD_BYTES:
+            return payload
+        longest = max(
+            list_fields,
+            key=lambda key: len(event.get(key) or []),
+        )
+        values = event.get(longest)
+        if not values:
+            # All variable-length lists are empty and every text field is
+            # already bounded, so this is a defensive last resort only.
+            return b'{"event":"gateway_shutdown","record_truncated":true}'
+        values.pop()
+
+
+def emit_shutdown_context(ctx: Dict[str, Any]) -> bool:
+    """Emit one authenticated native-journal event without blocking the loop.
+
+    journald attaches trusted PID/cgroup/unit metadata to the datagram. The
+    diagnostic requires that metadata and payload PID to agree, separating the
+    gateway from same-UID workers in independent systemd scopes.
+    """
+    return emit_native_journal(
+        _encoded_shutdown_event(ctx),
+        message_prefix=_SHUTDOWN_MESSAGE_PREFIX.encode("ascii"),
+        identifier="hermes-shutdown-forensics",
+        event="gateway_shutdown",
+        priority=4,
+        journal_socket=_JOURNAL_SOCKET,
+    )
 
 
 def spawn_async_diagnostic(

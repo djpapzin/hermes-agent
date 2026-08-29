@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import subprocess
 
@@ -98,6 +99,165 @@ def test_diagnostic_reads_bounded_admission_runtime_status(tmp_path, monkeypatch
     assert "secret" not in result["runtime_status"]
 
 
+def test_diagnostic_reads_manager_attested_allowlisted_admission_event(monkeypatch):
+    payload = {
+        "event": "gateway_admission",
+        "gateway_pid": 123,
+        "timestamp": 123.25,
+        "decision": "queue",
+        "queued_tasks": 1,
+        "secret": "must-not-copy",
+    }
+    row = {
+        "__REALTIME_TIMESTAMP": "456",
+        "_PID": "123",
+        "_TRANSPORT": "journal",
+        "_SYSTEMD_UNIT": "hermes-gateway.service",
+        "SYSLOG_IDENTIFIER": "hermes-admission",
+        "HERMES_EVENT": "gateway_admission",
+        "MESSAGE": "HERMES_ADMISSION " + json.dumps(payload),
+    }
+    calls = []
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, json.dumps(row) + "\n", "")
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", run)
+
+    events = diagnostics._bounded_admission_journal(
+        "hermes-gateway.service", 30, "system"
+    )
+
+    assert events == [
+        {
+            "timestamp_realtime_usec": "456",
+            "unit": "hermes-gateway.service",
+            "event": {
+                "event": "gateway_admission",
+                "gateway_pid": 123,
+                "timestamp": 123.25,
+                "decision": "queue",
+                "queued_tasks": 1,
+            },
+        }
+    ]
+    assert "must-not-copy" not in str(events)
+    assert calls[0].index("HERMES_EVENT=gateway_admission") < calls[0].index("-n")
+
+
+def test_admission_journal_rejects_same_uid_worker_scope_forgery(monkeypatch):
+    payload = {
+        "event": "gateway_admission",
+        "gateway_pid": 999,
+        "decision": "forged",
+    }
+    forged = {
+        "__REALTIME_TIMESTAMP": "456",
+        "_PID": "999",
+        "_UID": "996",
+        "_TRANSPORT": "journal",
+        "_SYSTEMD_UNIT": "hermes-worker-forged.scope",
+        "SYSLOG_IDENTIFIER": "hermes-admission",
+        "HERMES_EVENT": "gateway_admission",
+        "MESSAGE": "HERMES_ADMISSION " + json.dumps(payload),
+    }
+    monkeypatch.setattr(
+        diagnostics.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 0, json.dumps(forged) + "\n", ""
+        ),
+    )
+
+    assert diagnostics._bounded_admission_journal(
+        "hermes-gateway.service", 30, "system"
+    ) == []
+
+
+def test_diagnostic_reads_manager_attested_allowlisted_shutdown_event(monkeypatch):
+    payload = {
+        "event": "gateway_shutdown",
+        "pid": 123,
+        "ts": 123,
+        "signal": "SIGTERM",
+        "shutdown_reason": "planned_stop",
+        "active_task_ids": ["task-1"],
+        "parent": {"pid": 1, "name": "systemd", "secret": "nested-secret"},
+        "cgroup": {
+            "path": "/gateway",
+            "memory_events": {"oom": 0, "secret": "nested-cgroup-secret"},
+        },
+        "secret": "must-not-copy",
+    }
+    row = {
+        "__REALTIME_TIMESTAMP": "456",
+        "_PID": "123",
+        "_TRANSPORT": "journal",
+        "_SYSTEMD_UNIT": "hermes-gateway.service",
+        "SYSLOG_IDENTIFIER": "hermes-shutdown-forensics",
+        "HERMES_EVENT": "gateway_shutdown",
+        "MESSAGE": "HERMES_SHUTDOWN " + json.dumps(payload),
+    }
+    calls = []
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, json.dumps(row) + "\n", "")
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", run)
+
+    events = diagnostics._bounded_shutdown_journal(
+        "hermes-gateway.service", 30, "system"
+    )
+
+    assert events == [
+        {
+            "timestamp_realtime_usec": "456",
+            "unit": "hermes-gateway.service",
+            "event": {
+                "event": "gateway_shutdown",
+                "pid": 123,
+                "ts": 123,
+                "signal": "SIGTERM",
+                "shutdown_reason": "planned_stop",
+                "parent": {"pid": 1, "name": "systemd"},
+                "active_task_ids": ["task-1"],
+                "cgroup": {"path": "/gateway", "memory_events": {"oom": 0}},
+            },
+        }
+    ]
+    assert "must-not-copy" not in str(events)
+    assert "nested-secret" not in str(events)
+    assert "nested-cgroup-secret" not in str(events)
+    assert calls[0].index("HERMES_EVENT=gateway_shutdown") < calls[0].index("-n")
+
+
+def test_shutdown_journal_rejects_same_uid_worker_scope_forgery(monkeypatch):
+    payload = {"event": "gateway_shutdown", "pid": 999, "signal": "forged"}
+    forged = {
+        "__REALTIME_TIMESTAMP": "456",
+        "_PID": "999",
+        "_UID": "996",
+        "_TRANSPORT": "journal",
+        "_SYSTEMD_UNIT": "hermes-worker-forged.scope",
+        "SYSLOG_IDENTIFIER": "hermes-shutdown-forensics",
+        "HERMES_EVENT": "gateway_shutdown",
+        "MESSAGE": "HERMES_SHUTDOWN " + json.dumps(payload),
+    }
+    monkeypatch.setattr(
+        diagnostics.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 0, json.dumps(forged) + "\n", ""
+        ),
+    )
+
+    assert diagnostics._bounded_shutdown_journal(
+        "hermes-gateway.service", 30, "system"
+    ) == []
+
+
 def test_diagnostic_scans_orphan_worker_when_gateway_is_absent(tmp_path, monkeypatch):
     proc = tmp_path / "proc"
     cgroups = tmp_path / "cgroup"
@@ -145,11 +305,21 @@ def test_diagnostic_defaults_to_active_profile_home(tmp_path, monkeypatch, capsy
         "_bounded_incident_journal",
         lambda _unit, _since, manager: journal_managers.append(manager) or [],
     )
+    monkeypatch.setattr(
+        diagnostics,
+        "_bounded_shutdown_journal",
+        lambda _unit, _since, manager: journal_managers.append(manager) or [],
+    )
+    monkeypatch.setattr(
+        diagnostics,
+        "_bounded_admission_journal",
+        lambda _unit, _since, manager: journal_managers.append(manager) or [],
+    )
     monkeypatch.setattr("sys.argv", ["hermes_gateway_diagnostics.py"])
 
     assert diagnostics.main() == 0
     assert seen == [(tmp_path, "auto")]
-    assert journal_managers == ["user"]
+    assert journal_managers == ["user", "user", "user"]
     capsys.readouterr()
 
 
@@ -167,6 +337,223 @@ def test_service_pid_auto_detects_user_manager(monkeypatch):
     assert diagnostics._service_pid("hermes-gateway.service") == 4321
     assert calls[0][0] == "systemctl" and "--user" not in calls[0]
     assert "--user" in calls[1]
+
+
+def test_service_exit_status_records_systemd_result_code_and_signal(monkeypatch):
+    calls = []
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "\n".join(
+                [
+                    "LoadState=loaded",
+                    "ActiveState=failed",
+                    "SubState=failed",
+                    "Result=signal",
+                    "ExecMainCode=2",
+                    "ExecMainStatus=9",
+                    "NRestarts=1",
+                ]
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", run)
+
+    assert diagnostics._service_exit_status(
+        "hermes-gateway.service", "user"
+    ) == {
+        "load_state": "loaded",
+        "active_state": "failed",
+        "sub_state": "failed",
+        "result": "signal",
+        "exec_main_code": 2,
+        "exec_main_status": 9,
+        "n_restarts": 1,
+    }
+    assert calls[0][:2] == ["systemctl", "--user"]
+
+
+def test_auto_service_status_returns_both_loaded_manager_candidates(monkeypatch):
+    def run(argv, **_kwargs):
+        user = "--user" in argv
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "\n".join(
+                [
+                    "LoadState=loaded",
+                    f"ActiveState={'failed' if user else 'inactive'}",
+                    f"SubState={'failed' if user else 'dead'}",
+                    f"Result={'signal' if user else 'success'}",
+                    f"ExecMainCode={2 if user else 0}",
+                    f"ExecMainStatus={9 if user else 0}",
+                    "NRestarts=0",
+                ]
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", run)
+    monkeypatch.setattr(
+        diagnostics, "_service_identity", lambda _unit, _manager: (None, None)
+    )
+
+    result = diagnostics.collect(hermes_home=Path("/nonexistent"))
+
+    assert result["service_status"] is None
+    assert result["service_statuses"]["system"]["active_state"] == "inactive"
+    assert result["service_statuses"]["user"]["result"] == "signal"
+    assert result["service_statuses"]["user"]["exec_main_status"] == 9
+
+
+def test_incident_journal_preserves_exit_code_after_restart(monkeypatch):
+    calls = []
+    exit_message = (
+        "hermes-gateway.service: Main process exited, "
+        "code=killed, status=9/KILL"
+    )
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        row = {
+            "__REALTIME_TIMESTAMP": "123",
+            "_PID": "1",
+            "_UID": "0",
+            "_COMM": "systemd",
+            "SYSLOG_IDENTIFIER": "systemd",
+            "_TRANSPORT": "journal",
+            "_SYSTEMD_UNIT": "init.scope",
+            "UNIT": "hermes-gateway.service",
+            "MESSAGE": (
+                exit_message if "hermes-gateway.service" in argv else "unrelated"
+            ),
+        }
+        return subprocess.CompletedProcess(argv, 0, json.dumps(row) + "\n", "")
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", run)
+
+    events = diagnostics._bounded_incident_journal(
+        "hermes-gateway.service", 30, "system"
+    )
+
+    assert any(event["message"] == exit_message for event in events)
+    cap_index = calls[0].index("-n")
+    for trusted_match in (
+        "_PID=1",
+        "_UID=0",
+        "_COMM=systemd",
+        "SYSLOG_IDENTIFIER=systemd",
+        "_TRANSPORT=journal",
+        "_SYSTEMD_UNIT=init.scope",
+        "UNIT=hermes-gateway.service",
+    ):
+        assert calls[0].index(trusted_match) < cap_index
+
+
+def test_user_incident_journal_uses_user_unit_and_manager_owned_rows(monkeypatch):
+    calls = []
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        row = {
+            "__REALTIME_TIMESTAMP": "321",
+            "_COMM": "systemd",
+            "SYSLOG_IDENTIFIER": "systemd",
+            "_TRANSPORT": "journal",
+            "_SYSTEMD_USER_UNIT": "init.scope",
+            "USER_UNIT": "hermes-gateway.service",
+            "MESSAGE": "hermes-gateway.service: Main process exited, status=9/KILL",
+        }
+        return subprocess.CompletedProcess(argv, 0, json.dumps(row) + "\n", "")
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", run)
+
+    events = diagnostics._bounded_incident_journal(
+        "hermes-gateway.service", 30, "user"
+    )
+
+    assert calls[0][:3] == [
+        "journalctl",
+        "--user-unit",
+        "hermes-gateway.service",
+    ]
+    cap_index = calls[0].index("-n")
+    for trusted_match in (
+        "_COMM=systemd",
+        "SYSLOG_IDENTIFIER=systemd",
+        "_TRANSPORT=journal",
+        "_SYSTEMD_USER_UNIT=init.scope",
+        "USER_UNIT=hermes-gateway.service",
+    ):
+        assert calls[0].index(trusted_match) < cap_index
+    assert len(events) == 1
+
+
+def test_incident_journal_rejects_forged_gateway_lifecycle_text(monkeypatch):
+    forged = {
+        "__REALTIME_TIMESTAMP": "123",
+        "_PID": "999",
+        "_UID": "996",
+        "_COMM": "hermes",
+        "_TRANSPORT": "stdout",
+        "_SYSTEMD_UNIT": "hermes-gateway.service",
+        "MESSAGE": "Failed with result forged-secret-content",
+    }
+    monkeypatch.setattr(
+        diagnostics.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 0, json.dumps(forged) + "\n", ""
+        ),
+    )
+
+    events = diagnostics._bounded_incident_journal(
+        "hermes-gateway.service", 30, "system"
+    )
+
+    assert events == []
+
+
+def test_incident_journal_sorts_sources_before_global_cap(monkeypatch):
+    gateway = {
+        "__REALTIME_TIMESTAMP": "999",
+        "_PID": "1",
+        "_UID": "0",
+        "_COMM": "systemd",
+        "SYSLOG_IDENTIFIER": "systemd",
+        "_TRANSPORT": "journal",
+        "_SYSTEMD_UNIT": "init.scope",
+        "UNIT": "hermes-gateway.service",
+        "MESSAGE": "hermes-gateway.service: Main process exited, status=9/KILL",
+    }
+    health = [
+        {
+            "__REALTIME_TIMESTAMP": str(index),
+            "_SYSTEMD_UNIT": "hermes-health-guard.service",
+            "MESSAGE": "HERMES_HEALTH {}",
+        }
+        for index in range(1, 101)
+    ]
+
+    def run(argv, **_kwargs):
+        rows = [gateway] if "hermes-gateway.service" in argv else health if "hermes-health-guard.service" in argv else []
+        return subprocess.CompletedProcess(
+            argv, 0, "".join(json.dumps(row) + "\n" for row in rows), ""
+        )
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", run)
+
+    events = diagnostics._bounded_incident_journal(
+        "hermes-gateway.service", 30, "system"
+    )
+
+    assert len(events) == 100
+    assert events[-1]["timestamp_realtime_usec"] == "999"
+    assert any("Main process exited" in event["message"] for event in events)
 
 
 def test_auto_manager_journal_uses_only_selected_manager(monkeypatch):
