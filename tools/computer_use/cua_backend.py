@@ -670,6 +670,7 @@ class _CuaDriverSession:
         # an opaque "never reached ready".
         self._startup_phase = "binary-check"
 
+        scoped_argv: list[str] = []
         try:
             if not cua_driver_binary_available():
                 raise RuntimeError(cua_driver_install_hint())
@@ -680,12 +681,19 @@ class _CuaDriverSession:
             self._startup_phase = "manifest-discovery"
             command, args = _resolve_mcp_invocation(_CUA_DRIVER_CMD)
             _t_manifest = _time.monotonic()
+            sanitized_child_env = _sanitize_subprocess_env(cua_driver_child_env())
+            from tools.process_registry import build_gateway_worker_scope_argv
+            scoped_argv, _scope_unit = build_gateway_worker_scope_argv(
+                [command, *args],
+                unit_suffix=f"cua-mcp-{uuid.uuid4().hex[:8]}",
+                environment=sanitized_child_env,
+            )
             params = StdioServerParameters(
-                command=command,
-                args=args,
+                command=scoped_argv[0],
+                args=scoped_argv[1:],
                 # Apply the telemetry policy first (default: disabled), then
                 # sanitize Hermes-managed secrets out of the child env.
-                env=_sanitize_subprocess_env(cua_driver_child_env()),
+                env=sanitized_child_env,
             )
 
             async with stdio_client(params) as (read, write):
@@ -720,6 +728,16 @@ class _CuaDriverSession:
             self._ready_event.set()
             raise
         finally:
+            if scoped_argv:
+                try:
+                    from tools.process_registry import _discard_scope_environment
+
+                    _discard_scope_environment(scoped_argv)
+                except Exception:
+                    logger.debug(
+                        "Could not remove CUA worker environment payload",
+                        exc_info=True,
+                    )
             # Clearing _session before the contexts unwind would let a
             # racing call_tool see None during teardown — but the
             # outer context-manager exits AFTER this block, so set to
@@ -2504,4 +2522,3 @@ class CuaDriverBackend(ComputerUseBackend):
             meta.update(structured)
         return _action_result_from(name, ok, message, meta, structured,
                                    requested_delivery=args.get("delivery_mode"))
-

@@ -61,6 +61,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import requests
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
@@ -103,6 +104,72 @@ def _build_browser_env() -> dict:
         if _key in os.environ:
             env[_key] = os.environ[_key]
     return env
+
+
+def _scope_browser_workload(
+    argv: List[str],
+    *,
+    environment: Dict[str, str],
+    session_name: str,
+) -> tuple[List[str], Optional[str]]:
+    """Place agent-browser and all inherited Chrome children in a worker scope."""
+    from tools.process_registry import build_gateway_worker_scope_argv
+
+    return build_gateway_worker_scope_argv(
+        argv,
+        unit_suffix=f"browser-{session_name}-{uuid.uuid4().hex[:8]}",
+        environment=environment,
+    )
+
+
+def _stop_scoped_browser_workload(
+    proc: subprocess.Popen,
+    session_info: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Stop a browser's complete transient scope after a timeout."""
+    units = [getattr(proc, "_hermes_systemd_unit", None)]
+    if session_info is not None:
+        units.append(session_info.get("daemon_systemd_unit"))
+    for unit in dict.fromkeys(item for item in units if item):
+        try:
+            from tools.process_registry import _stop_systemd_unit
+
+            _stop_systemd_unit(unit)
+        except Exception as exc:
+            logger.warning("Could not stop timed-out browser scope %s: %s", unit, exc)
+    if proc.poll() is None:
+        proc.kill()
+
+
+def _remember_browser_daemon_scope(
+    session_info: Dict[str, Any], browser_scope: Optional[str]
+) -> None:
+    if not browser_scope:
+        return
+    with _cleanup_lock:
+        prior_unit = session_info.get("daemon_systemd_unit")
+    if prior_unit:
+        from tools.process_registry import _systemd_unit_has_processes
+
+        replace_origin = not _systemd_unit_has_processes(prior_unit)
+    else:
+        replace_origin = True
+    if replace_origin:
+        with _cleanup_lock:
+            if session_info.get("daemon_systemd_unit") == prior_unit:
+                session_info["daemon_systemd_unit"] = browser_scope
+
+
+def _track_scope_environment(proc: subprocess.Popen, argv: List[str]) -> None:
+    from tools.process_registry import _cleanup_scope_environment_when_done
+
+    _cleanup_scope_environment_when_done(proc, argv)
+
+
+def _discard_scope_environment(argv: List[str]) -> None:
+    from tools.process_registry import _discard_scope_environment as discard
+
+    discard(argv)
 
 try:
     from tools.website_policy import check_website_access
@@ -1145,18 +1212,29 @@ def _run_chrome_fallback_command(
                 _si = subprocess.STARTUPINFO()
                 _si.dwFlags |= subprocess.STARTF_USESTDHANDLES
                 _popen_extra["startupinfo"] = _si
-            proc = subprocess.Popen(
-                full, stdout=stdout_fd, stderr=stderr_fd,
-                stdin=subprocess.DEVNULL, env=browser_env,
-                **_popen_extra,
+            full, browser_scope = _scope_browser_workload(
+                full,
+                environment=browser_env,
+                session_name=tmp_session,
             )
+            try:
+                proc = subprocess.Popen(
+                    full, stdout=stdout_fd, stderr=stderr_fd,
+                    stdin=subprocess.DEVNULL, env=browser_env,
+                    **_popen_extra,
+                )
+            except BaseException:
+                _discard_scope_environment(full)
+                raise
+            _track_scope_environment(proc, full)
+            proc._hermes_systemd_unit = browser_scope
         finally:
             os.close(stdout_fd)
             os.close(stderr_fd)
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _stop_scoped_browser_workload(proc)
             proc.wait()
             return {"success": False, "error": f"Chrome fallback '{cmd}' timed out"}
         try:
@@ -2486,14 +2564,31 @@ def _run_browser_command(
                 _si = subprocess.STARTUPINFO()
                 _si.dwFlags |= subprocess.STARTF_USESTDHANDLES
                 _popen_extra["startupinfo"] = _si
-            proc = subprocess.Popen(
+            cmd_parts, browser_scope = _scope_browser_workload(
                 cmd_parts,
-                stdout=stdout_fd,
-                stderr=stderr_fd,
-                stdin=subprocess.DEVNULL,
-                env=browser_env,
-                **_popen_extra,
+                environment=browser_env,
+                session_name=session_info["session_name"],
             )
+            try:
+                proc = subprocess.Popen(
+                    cmd_parts,
+                    stdout=stdout_fd,
+                    stderr=stderr_fd,
+                    stdin=subprocess.DEVNULL,
+                    env=browser_env,
+                    **_popen_extra,
+                )
+            except BaseException:
+                _discard_scope_environment(cmd_parts)
+                raise
+            _track_scope_environment(proc, cmd_parts)
+            proc._hermes_systemd_unit = browser_scope
+            if browser_scope:
+                # The first local agent-browser command starts the persistent
+                # daemon and Chrome descendants inside this scope. Later CLI
+                # invocations get separate short-lived scopes, so retain the
+                # origin scope for timeout and session cleanup.
+                _remember_browser_daemon_scope(session_info, browser_scope)
         finally:
             os.close(stdout_fd)
             os.close(stderr_fd)
@@ -2501,7 +2596,7 @@ def _run_browser_command(
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _stop_scoped_browser_workload(proc, session_info)
             proc.wait()
             stdout, stderr = _read_command_output_files(stdout_path, stderr_path)
             _unlink_command_output_files(stdout_path, stderr_path)
@@ -4463,6 +4558,23 @@ def _cleanup_single_browser_session(task_id: str) -> None:
             logger.debug("agent-browser close command completed for task %s", task_id)
         except Exception as e:
             logger.warning("agent-browser close failed for task %s: %s", task_id, e)
+
+        daemon_unit = session_info.get("daemon_systemd_unit")
+        if daemon_unit:
+            try:
+                from tools.process_registry import _stop_systemd_unit
+
+                if not _stop_systemd_unit(daemon_unit):
+                    logger.warning(
+                        "Could not stop browser daemon origin scope %s",
+                        daemon_unit,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Could not stop browser daemon origin scope %s: %s",
+                    daemon_unit,
+                    exc,
+                )
 
         # Now remove from tracking under lock
         with _cleanup_lock:

@@ -33,12 +33,14 @@ import json
 import logging
 import os
 import platform
+import re
 import shlex
 import signal
 import subprocess
 import threading
 import time
 import uuid
+from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
@@ -76,6 +78,417 @@ WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 
 
+# Gateway-owned local workers must not share the gateway's memory cgroup.
+_SYSTEMD_SCOPE_AVAILABLE: Optional[bool] = None
+_SYSTEMD_SCOPE_PROBE_LOCK = threading.Lock()
+_SYSTEMD_SCOPE_PROBED_AT = 0.0
+_SYSTEMD_SCOPE_FAILURE_TTL_SECONDS = 60.0
+_SYSTEMD_SYSTEM_SCOPE_AVAILABLE: Optional[bool] = None
+_SYSTEMD_SYSTEM_SCOPE_PROBED_AT = 0.0
+_MIN_WORKER_MEMORY_MAX_BYTES = 64 * 1024 * 1024
+_DEFAULT_WORKER_MEMORY_MAX_BYTES = 1024 * 1024 * 1024
+_WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
+_SYSTEM_SCOPE_WRAPPER = Path("/usr/local/sbin/hermes-worker-scope")
+
+
+def _host_process_start_time(pid: int) -> Optional[int]:
+    try:
+        return int(Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[21])
+    except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
+        try:
+            import psutil
+
+            return int(round(psutil.Process(pid).create_time() * 100))
+        except Exception:
+            return None
+
+
+def _write_worker_environment(
+    environment: Optional[Dict[str, str]], unit_suffix: str
+) -> Path:
+    """Write a private, one-shot environment payload for the root wrapper."""
+    env_dir = get_hermes_home() / "state" / "worker-env"
+    env_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    creator_pid = os.getpid()
+    creator_start = _host_process_start_time(creator_pid)
+    identity = str(creator_start) if creator_start is not None else "unknown"
+    path = env_dir / f"{creator_pid}-{identity}-{unit_suffix}-{uuid.uuid4().hex}.json"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags | nofollow, 0o600)
+    try:
+        payload = {
+            str(key): str(value)
+            for key, value in (environment or {}).items()
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key))
+        }
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return path
+
+
+def _scope_environment_path(argv: List[str]) -> Optional[Path]:
+    """Return the private system-scope payload referenced by wrapper argv."""
+    try:
+        wrapper_index = argv.index(str(_SYSTEM_SCOPE_WRAPPER))
+        if argv[wrapper_index + 1] != "run" or argv[wrapper_index + 5] != "--":
+            return None
+        return Path(argv[wrapper_index + 4])
+    except (IndexError, ValueError):
+        return None
+
+
+def _discard_scope_environment(argv: List[str]) -> None:
+    path = _scope_environment_path(argv)
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("Could not remove worker environment payload %s: %s", path, exc)
+
+
+def _cleanup_scope_environment_when_done(process: Any, argv: List[str]) -> None:
+    """Remove a payload if sudo/wrapper exits before consuming it."""
+    path = _scope_environment_path(argv)
+    if path is None:
+        return
+
+    def cleanup() -> None:
+        deadline = time.monotonic() + 60
+        while path.exists() and time.monotonic() < deadline:
+            try:
+                poll = getattr(process, "poll", None)
+                if callable(poll) and poll() is not None:
+                    _discard_scope_environment(argv)
+                    return
+                isalive = getattr(process, "isalive", None)
+                if callable(isalive) and not isalive():
+                    _discard_scope_environment(argv)
+                    return
+            except Exception:
+                return
+            time.sleep(0.05)
+
+    threading.Thread(
+        target=cleanup,
+        daemon=True,
+        name="hermes-worker-env-cleanup",
+    ).start()
+
+
+def _cleanup_orphaned_worker_environments() -> None:
+    """Delete crash leftovers whose creating gateway PID no longer exists."""
+    import psutil
+
+    root = get_hermes_home() / "state" / "worker-env"
+    try:
+        candidates = list(root.glob("*.json"))
+    except OSError:
+        return
+    for path in candidates:
+        try:
+            parts = path.name.split("-", 2)
+            creator_pid = int(parts[0])
+            creator_start = int(parts[1]) if len(parts) > 2 and parts[1].isdigit() else None
+            if psutil.pid_exists(creator_pid):
+                if creator_start is None:
+                    continue
+                if _host_process_start_time(creator_pid) == creator_start:
+                    continue
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        except (OSError, TypeError, ValueError):
+            continue
+
+
+def _worker_memory_max_bytes() -> int:
+    """Return a finite per-worker limit bounded by config and host capacity."""
+    override_bound: Optional[int] = None
+    override = ""
+    try:
+        from hermes_cli.config import read_raw_config
+        terminal_cfg = (read_raw_config() or {}).get("terminal", {})
+        configured = terminal_cfg.get("local_memory_max_mb") if isinstance(terminal_cfg, dict) else None
+        if configured is not None:
+            override = str(configured).strip()
+    except Exception:
+        pass
+    if not override:
+        override = os.getenv("TERMINAL_LOCAL_MEMORY_MAX_MB", "").strip()
+    if override:
+        try:
+            parsed = int(override) * 1024 * 1024
+            if parsed >= _MIN_WORKER_MEMORY_MAX_BYTES:
+                override_bound = parsed
+            else:
+                raise ValueError
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid TERMINAL_LOCAL_MEMORY_MAX_MB=%r; expected at least %d MiB",
+                override, _MIN_WORKER_MEMORY_MAX_BYTES // (1024 * 1024),
+            )
+
+    candidates: List[int] = []
+    try:
+        for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines():
+            if line.startswith("0::"):
+                relative = line.partition("::")[2].lstrip("/")
+                raw_limit = (Path("/sys/fs/cgroup") / relative / "memory.max").read_text(encoding="utf-8").strip()
+                if raw_limit.isdigit() and int(raw_limit) >= _MIN_WORKER_MEMORY_MAX_BYTES:
+                    candidates.append(int(raw_limit))
+                break
+    except (OSError, ValueError):
+        pass
+    try:
+        physical_bytes = int(os.sysconf("SC_PHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+        candidates.append(min(
+            _WORKER_MEMORY_MAX_CAP_BYTES,
+            max(_MIN_WORKER_MEMORY_MAX_BYTES, physical_bytes // 2),
+        ))
+    except (OSError, ValueError, TypeError):
+        pass
+    safe_bound = min(candidates) if candidates else _DEFAULT_WORKER_MEMORY_MAX_BYTES
+    return min(override_bound, safe_bound) if override_bound else safe_bound
+
+
+def _worker_cgroup_mode() -> str:
+    try:
+        from hermes_cli.config import read_raw_config
+        terminal_cfg = (read_raw_config() or {}).get("terminal", {})
+        raw = terminal_cfg.get("worker_cgroup_mode", "auto") if isinstance(terminal_cfg, dict) else "auto"
+    except Exception:
+        raw = "auto"
+    mode = str(raw or "auto").strip().lower()
+    return mode if mode in {"auto", "required", "user", "system", "off"} else "auto"
+
+
+def _systemd_run_user_scope_available() -> bool:
+    global _SYSTEMD_SCOPE_AVAILABLE, _SYSTEMD_SCOPE_PROBED_AT
+    now = time.monotonic()
+    if _SYSTEMD_SCOPE_AVAILABLE is True:
+        return True
+    if _SYSTEMD_SCOPE_AVAILABLE is False and now - _SYSTEMD_SCOPE_PROBED_AT < _SYSTEMD_SCOPE_FAILURE_TTL_SECONDS:
+        return False
+    with _SYSTEMD_SCOPE_PROBE_LOCK:
+        now = time.monotonic()
+        if _SYSTEMD_SCOPE_AVAILABLE is True:
+            return True
+        if _SYSTEMD_SCOPE_AVAILABLE is False and now - _SYSTEMD_SCOPE_PROBED_AT < _SYSTEMD_SCOPE_FAILURE_TTL_SECONDS:
+            return False
+        available = False
+        try:
+            import shutil
+            binary = shutil.which("systemd-run")
+            if binary and not _IS_WINDOWS:
+                unit = f"hermes-probe-scope-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+                result = subprocess.run([
+                    binary, "--user", "--scope", "--quiet", "--unit", unit,
+                    "--collect", "--property", "MemoryAccounting=yes",
+                    "--property", f"MemoryMax={_worker_memory_max_bytes()}",
+                    "--property", "MemorySwapMax=0", "--", "/bin/true",
+                ], capture_output=True, timeout=3, stdin=subprocess.DEVNULL)
+                available = result.returncode == 0
+        except Exception as exc:
+            logger.debug("systemd user-scope probe error: %s", exc)
+        _SYSTEMD_SCOPE_AVAILABLE = available
+        _SYSTEMD_SCOPE_PROBED_AT = time.monotonic()
+        return available
+
+
+def _systemd_run_system_scope_available() -> bool:
+    global _SYSTEMD_SYSTEM_SCOPE_AVAILABLE, _SYSTEMD_SYSTEM_SCOPE_PROBED_AT
+    now = time.monotonic()
+    if _SYSTEMD_SYSTEM_SCOPE_AVAILABLE is True:
+        return _SYSTEMD_SYSTEM_SCOPE_AVAILABLE
+    if (
+        _SYSTEMD_SYSTEM_SCOPE_AVAILABLE is False
+        and now - _SYSTEMD_SYSTEM_SCOPE_PROBED_AT < _SYSTEMD_SCOPE_FAILURE_TTL_SECONDS
+    ):
+        return False
+    available = False
+    try:
+        import shutil
+        sudo, systemd_run = shutil.which("sudo"), shutil.which("systemd-run")
+        if (
+            sudo
+            and systemd_run
+            and _SYSTEM_SCOPE_WRAPPER.is_file()
+            and not _IS_WINDOWS
+        ):
+            suffix = f"probe-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+            command = _build_systemd_scope_argv(
+                ["/bin/true"], suffix, backend="system", environment={}
+            )
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=3,
+                stdin=subprocess.DEVNULL,
+            )
+            available = result.returncode == 0
+    except Exception as exc:
+        logger.debug("systemd system-scope probe error: %s", exc)
+    _SYSTEMD_SYSTEM_SCOPE_AVAILABLE = available
+    _SYSTEMD_SYSTEM_SCOPE_PROBED_AT = time.monotonic()
+    return available
+
+
+def _worker_scope_backend() -> Optional[str]:
+    mode = _worker_cgroup_mode()
+    if mode == "off":
+        return None
+    if mode in {"system", "required"} and _systemd_run_system_scope_available():
+        return "system"
+    if mode in {"auto", "user", "required"} and _systemd_run_user_scope_available():
+        return "user"
+    return None
+
+
+def _is_supervised_gateway_process() -> bool:
+    if os.environ.get("_HERMES_GATEWAY") != "1":
+        return False
+    try:
+        from gateway.restart import is_gateway_supervisor_process
+        from gateway.status import get_running_pid
+        return is_gateway_supervisor_process() and get_running_pid(cleanup_stale=False) == os.getpid()
+    except Exception as exc:
+        logger.debug("Could not verify supervised gateway process identity: %s", exc)
+        return False
+
+
+def _build_systemd_scope_argv(
+    shell_argv: List[str], unit_suffix: str, backend: str = "user",
+    environment: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    import shutil
+    binary = shutil.which("systemd-run")
+    if binary is None:
+        return shell_argv
+    safe_suffix = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(unit_suffix)).strip("-.")
+    safe_suffix = (safe_suffix or uuid.uuid4().hex)[:160]
+    memory_max = _worker_memory_max_bytes()
+    prefix = [binary, "--user"]
+    if backend == "system":
+        sudo = shutil.which("sudo")
+        if sudo is None or not _SYSTEM_SCOPE_WRAPPER.is_file():
+            return shell_argv
+        env_path = _write_worker_environment(environment, safe_suffix)
+        return [
+            sudo,
+            "-n",
+            str(_SYSTEM_SCOPE_WRAPPER),
+            "run",
+            safe_suffix,
+            str(memory_max),
+            str(env_path),
+            "--",
+            *shell_argv,
+        ]
+    argv = [*prefix, "--scope", "--quiet", "--unit",
+            f"hermes-worker-{'system-' if backend == 'system' else ''}{safe_suffix}",
+            "--collect", "--property", "MemoryAccounting=yes",
+            "--property", f"MemoryMax={memory_max}", "--property",
+            f"MemoryHigh={max(_MIN_WORKER_MEMORY_MAX_BYTES, memory_max * 9 // 10)}",
+            "--property", "MemorySwapMax=0"]
+    return [*argv, "--", *shell_argv]
+
+
+def build_gateway_worker_scope_argv(
+    argv: List[str], *, unit_suffix: str,
+    environment: Optional[Dict[str, str]] = None,
+) -> tuple[List[str], Optional[str]]:
+    if _IS_WINDOWS or not _is_supervised_gateway_process():
+        return argv, None
+    mode = _worker_cgroup_mode()
+    if mode == "off":
+        return argv, None
+    backend = _worker_scope_backend()
+    if backend is None:
+        if mode in {"required", "system"}:
+            raise RuntimeError("Worker cgroup isolation is required but no systemd scope backend is available")
+        logger.warning("Gateway workload %s is not isolated in a systemd scope", unit_suffix)
+        return argv, None
+    wrapped = _build_systemd_scope_argv(argv, unit_suffix, backend, environment)
+    safe_suffix = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(unit_suffix)).strip("-.")
+    safe_suffix = (safe_suffix or "worker")[:160]
+    return wrapped, f"hermes-worker-{'system-' if backend == 'system' else ''}{safe_suffix}.scope"
+
+
+def _stop_systemd_unit(unit_name: str) -> bool:
+    import shutil
+    binary = shutil.which("systemctl")
+    if binary is None:
+        return False
+
+
+def _systemd_unit_has_processes(
+    unit_name: str, cgroup_root: Path = Path("/sys/fs/cgroup")
+) -> bool:
+    """Fail closed while determining whether a worker scope is populated."""
+    system_scope = unit_name.startswith("hermes-worker-system-")
+    command = ["systemctl", "--system" if system_scope else "--user", "show"]
+    try:
+        result = subprocess.run(
+            [*command, unit_name, "--property=LoadState", "--property=ControlGroup"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        values = {}
+        for line in result.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                values[key] = value
+        if values.get("LoadState") == "not-found":
+            return False
+        if result.returncode != 0:
+            return True
+        relative = values.get("ControlGroup", "").lstrip("/")
+        if not relative:
+            return False
+        root = cgroup_root / relative
+        for path in [root / "cgroup.procs", *root.glob("**/cgroup.procs")]:
+            if path.read_text(encoding="utf-8").strip():
+                return True
+        return False
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    command = [binary, "--user", "stop", unit_name]
+    if unit_name.startswith("hermes-worker-system-"):
+        sudo = shutil.which("sudo")
+        if sudo is None or not _SYSTEM_SCOPE_WRAPPER.is_file():
+            return False
+        command = [
+            sudo,
+            "-n",
+            str(_SYSTEM_SCOPE_WRAPPER),
+            "stop",
+            unit_name,
+        ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, timeout=15, stdin=subprocess.DEVNULL
+        )
+        if result.returncode == 0:
+            return True
+        stderr = (result.stderr or b"").decode(errors="replace").lower()
+        return any(marker in stderr for marker in ("not loaded", "not found", "does not exist"))
+    except Exception as exc:
+        logger.debug("systemctl stop %s failed: %s", unit_name, exc)
+        return False
+
+
 def format_uptime_short(seconds: int) -> str:
     s = max(0, int(seconds))
     if s < 60:
@@ -108,6 +521,7 @@ class ProcessSession:
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
+    systemd_unit: str = ""                      # independent transient worker scope
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -714,6 +1128,7 @@ class ProcessRegistry:
             started_at=time.time(),
         )
 
+        pty_scope_attempted = False
         if use_pty:
             # Try PTY mode for interactive CLI tools
             try:
@@ -724,12 +1139,37 @@ class ProcessRegistry:
                 user_shell = _find_shell()
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
-                pty_proc = _PtyProcessCls.spawn(
-                    [user_shell, "-lic", f"set +m; {command}"],
-                    cwd=session.cwd,
-                    env=pty_env,
-                    dimensions=(30, 120),
-                )
+                pty_env.setdefault("GIT_PAGER", "cat")
+                pty_env.setdefault("PAGER", "cat")
+                pty_argv = [user_shell, "-lic", f"set +m; {command}"]
+                pty_in_supervised_gateway = not _IS_WINDOWS and _is_supervised_gateway_process()
+                pty_cgroup_mode = _worker_cgroup_mode()
+                pty_scope_backend = _worker_scope_backend() if pty_in_supervised_gateway else None
+                if pty_in_supervised_gateway and pty_cgroup_mode != "off" and pty_scope_backend:
+                    pty_argv = _build_systemd_scope_argv(
+                        pty_argv, session.id, pty_scope_backend, pty_env
+                    )
+                    session.systemd_unit = (
+                        f"hermes-worker-{'system-' if pty_scope_backend == 'system' else ''}{session.id}.scope"
+                    )
+                    pty_scope_attempted = True
+                elif pty_in_supervised_gateway:
+                    if pty_cgroup_mode in {"required", "system"}:
+                        raise RuntimeError(
+                            "Worker cgroup isolation is required but no systemd scope backend is available"
+                        )
+                    logger.warning("PTY worker %s shares the gateway cgroup", session.id)
+                try:
+                    pty_proc = _PtyProcessCls.spawn(
+                        pty_argv,
+                        cwd=session.cwd,
+                        env=pty_env,
+                        dimensions=(30, 120),
+                    )
+                except BaseException:
+                    _discard_scope_environment(pty_argv)
+                    raise
+                _cleanup_scope_environment_when_done(pty_proc, pty_argv)
                 session.pid = pty_proc.pid
                 session.host_start_time = self._safe_host_start_time(session.pid)
                 # Store the pty handle on the session for read/write
@@ -756,6 +1196,12 @@ class ProcessRegistry:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
+                if pty_scope_attempted and session.systemd_unit:
+                    if not _stop_systemd_unit(session.systemd_unit):
+                        raise RuntimeError(
+                            "PTY scope could not be reaped; refusing pipe fallback"
+                        ) from e
+                    session.systemd_unit = ""
 
         # Standard Popen path (non-PTY or PTY fallback)
         # Use the user's login shell for consistency with LocalEnvironment --
@@ -768,19 +1214,45 @@ class ProcessRegistry:
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
-        proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {command}"],
-            text=True,
-            cwd=session.cwd,
-            env=bg_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            **_popen_kwargs,
-        )
+        shell_argv = [user_shell, "-lic", f"set +m; {command}"]
+        in_supervised_gateway = not _IS_WINDOWS and _is_supervised_gateway_process()
+        cgroup_mode = _worker_cgroup_mode()
+        scope_backend = _worker_scope_backend() if in_supervised_gateway else None
+        if in_supervised_gateway and cgroup_mode != "off" and scope_backend:
+            unit_suffix = f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id
+            spawn_argv = _build_systemd_scope_argv(
+                shell_argv, unit_suffix, scope_backend, bg_env
+            )
+            session.systemd_unit = (
+                f"hermes-worker-{'system-' if scope_backend == 'system' else ''}{unit_suffix}.scope"
+            )
+        else:
+            spawn_argv = shell_argv
+            if in_supervised_gateway:
+                if cgroup_mode in {"required", "system"}:
+                    raise RuntimeError(
+                        "Worker cgroup isolation is required but no systemd scope backend is available"
+                    )
+                logger.warning("Local worker %s shares the gateway cgroup", session.id)
+
+        try:
+            proc = subprocess.Popen(
+                spawn_argv,
+                text=True,
+                cwd=session.cwd,
+                env=bg_env,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                **_popen_kwargs,
+            )
+        except BaseException:
+            _discard_scope_environment(spawn_argv)
+            raise
+        _cleanup_scope_environment_when_done(proc, spawn_argv)
 
         session.process = proc
         session.pid = proc.pid
@@ -807,7 +1279,10 @@ class ProcessRegistry:
             # descendants spawned via setsid) before re-raising so they do not
             # leak as untracked background processes.
             try:
-                if not _IS_WINDOWS:
+                if session.systemd_unit:
+                    _stop_systemd_unit(session.systemd_unit)
+                    self._terminate_host_pid(proc.pid, session.host_start_time)
+                elif not _IS_WINDOWS:
                     try:
                         kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
                         os.killpg(os.getpgid(proc.pid), kill_signal)  # windows-footgun: ok - guarded by _IS_WINDOWS above
@@ -1077,6 +1552,8 @@ class ProcessRegistry:
         with the reader thread), the second call is a no-op — no duplicate
         completion notification is enqueued.
         """
+        if session.systemd_unit and not _systemd_unit_has_processes(session.systemd_unit):
+            session.systemd_unit = ""
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
@@ -1518,6 +1995,8 @@ class ProcessRegistry:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
         if session.exited:
+            if session.systemd_unit:
+                _stop_systemd_unit(session.systemd_unit)
             with session._lock:
                 result = {
                     "status": "already_exited",
@@ -1555,6 +2034,8 @@ class ProcessRegistry:
                 # recycled onto an unrelated process, treat our process as
                 # exited and never tree-kill the stranger.
                 if not self._host_pid_is_ours(session.pid, session.host_start_time):
+                    if session.systemd_unit:
+                        _stop_systemd_unit(session.systemd_unit)
                     with session._lock:
                         session.exited = True
                         session.exit_code = None
@@ -1576,6 +2057,8 @@ class ProcessRegistry:
                         "its original runtime handle is no longer available"
                     ),
                 }
+            if session.systemd_unit:
+                _stop_systemd_unit(session.systemd_unit)
             # Capture output before marking consumed, then mark consumed before
             # exposing ``exited`` to watcher tasks. This closes the delayed
             # notification race without discarding the terminal transcript.
@@ -1822,11 +2305,13 @@ class ProcessRegistry:
             return any(not s.exited for s in self._running.values())
 
     def kill_all(self, task_id: str = None) -> int:
-        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+        """Kill running processes and reap populated scopes from exited launchers."""
         with self._lock:
             targets = [
-                s for s in self._running.values()
-                if (task_id is None or s.task_id == task_id) and not s.exited
+                s
+                for s in (*self._running.values(), *self._finished.values())
+                if (task_id is None or s.task_id == task_id)
+                and (not s.exited or bool(s.systemd_unit))
             ]
 
         killed = 0
@@ -1846,9 +2331,14 @@ class ProcessRegistry:
         """Remove oldest finished sessions if over MAX_PROCESSES. Must hold _lock."""
         # First prune expired finished sessions
         now = time.time()
+        for session in self._finished.values():
+            if session.systemd_unit and not _systemd_unit_has_processes(
+                session.systemd_unit
+            ):
+                session.systemd_unit = ""
         expired = [
             sid for sid, s in self._finished.items()
-            if (now - s.started_at) > FINISHED_TTL_SECONDS
+            if not s.systemd_unit and (now - s.started_at) > FINISHED_TTL_SECONDS
         ]
         for sid in expired:
             del self._finished[sid]
@@ -1857,8 +2347,9 @@ class ProcessRegistry:
 
         # If still over limit, remove oldest finished
         total = len(self._running) + len(self._finished)
-        if total >= MAX_PROCESSES and self._finished:
-            oldest_id = min(self._finished, key=lambda sid: self._finished[sid].started_at)
+        prunable = [sid for sid, s in self._finished.items() if not s.systemd_unit]
+        if total >= MAX_PROCESSES and prunable:
+            oldest_id = min(prunable, key=lambda sid: self._finished[sid].started_at)
             del self._finished[oldest_id]
             self._completion_consumed.discard(oldest_id)
             self._poll_observed.discard(oldest_id)
@@ -1881,34 +2372,38 @@ class ProcessRegistry:
         """Write running process metadata to checkpoint file atomically."""
         try:
             with self._lock:
+                sessions = [
+                    *(s for s in self._running.values() if not s.exited),
+                    *(s for s in self._finished.values() if s.systemd_unit),
+                ]
                 entries = []
-                for s in self._running.values():
-                    if not s.exited:
-                        # Lazily backfill the kernel start time for host PIDs so
-                        # recovery after restart can detect PID recycling even
-                        # for sessions spawned before this field existed.
-                        if s.host_start_time is None and s.pid_scope == "host" and s.pid:
-                            s.host_start_time = self._safe_host_start_time(s.pid)
-                        entries.append({
-                            "session_id": s.id,
-                            "command": s.command,
-                            "pid": s.pid,
-                            "pid_scope": s.pid_scope,
-                            "host_start_time": s.host_start_time,
-                            "cwd": s.cwd,
-                            "started_at": s.started_at,
-                            "task_id": s.task_id,
-                            "session_key": s.session_key,
-                            "watcher_platform": s.watcher_platform,
-                            "watcher_chat_id": s.watcher_chat_id,
-                            "watcher_user_id": s.watcher_user_id,
-                            "watcher_user_name": s.watcher_user_name,
-                            "watcher_thread_id": s.watcher_thread_id,
-                            "watcher_message_id": s.watcher_message_id,
-                            "watcher_interval": s.watcher_interval,
-                            "notify_on_complete": s.notify_on_complete,
-                            "watch_patterns": s.watch_patterns,
-                        })
+                for s in sessions:
+                    # Lazily backfill the kernel start time for host PIDs so
+                    # recovery after restart can detect PID recycling even
+                    # for sessions spawned before this field existed.
+                    if s.host_start_time is None and s.pid_scope == "host" and s.pid:
+                        s.host_start_time = self._safe_host_start_time(s.pid)
+                    entries.append({
+                        "session_id": s.id,
+                        "command": s.command,
+                        "pid": s.pid,
+                        "pid_scope": s.pid_scope,
+                        "host_start_time": s.host_start_time,
+                        "systemd_unit": s.systemd_unit,
+                        "cwd": s.cwd,
+                        "started_at": s.started_at,
+                        "task_id": s.task_id,
+                        "session_key": s.session_key,
+                        "watcher_platform": s.watcher_platform,
+                        "watcher_chat_id": s.watcher_chat_id,
+                        "watcher_user_id": s.watcher_user_id,
+                        "watcher_user_name": s.watcher_user_name,
+                        "watcher_thread_id": s.watcher_thread_id,
+                        "watcher_message_id": s.watcher_message_id,
+                        "watcher_interval": s.watcher_interval,
+                        "notify_on_complete": s.notify_on_complete,
+                        "watch_patterns": s.watch_patterns,
+                    })
             
             # Atomic write to avoid corruption on crash
             from utils import atomic_json_write
@@ -1931,6 +2426,7 @@ class ProcessRegistry:
             return 0
 
         recovered = 0
+        unresolved_scope_entries = []
         for entry in entries:
             pid = entry.get("pid")
             if not pid:
@@ -1964,6 +2460,13 @@ class ProcessRegistry:
                         "an unrelated process; refusing to adopt it.",
                         entry.get("session_id", "?"), pid,
                     )
+                systemd_unit = entry.get("systemd_unit", "")
+                if systemd_unit and not _stop_systemd_unit(systemd_unit):
+                    logger.warning(
+                        "Could not reap persisted scope %s for dead wrapper pid %s",
+                        systemd_unit, pid,
+                    )
+                    unresolved_scope_entries.append(entry)
                 continue
 
             session = ProcessSession(
@@ -1974,6 +2477,7 @@ class ProcessRegistry:
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,
+                systemd_unit=entry.get("systemd_unit", ""),
                 cwd=entry.get("cwd"),
                 started_at=entry.get("started_at", time.time()),
                 detached=True,  # Can't read output, but can report status + kill
@@ -2008,12 +2512,45 @@ class ProcessRegistry:
                 })
 
         self._write_checkpoint()
+        if unresolved_scope_entries:
+            try:
+                from utils import atomic_json_write
+                current = []
+                if CHECKPOINT_PATH.exists():
+                    current = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+                atomic_json_write(CHECKPOINT_PATH, [*current, *unresolved_scope_entries])
+            except Exception as exc:
+                logger.warning("Could not retain unresolved worker scopes: %s", exc)
 
         return recovered
 
 
-# Module-level singleton
+# Module-level singleton. A prior hard kill can strand a secret-bearing payload
+# before sudo starts; the filename carries its creator PID so a new gateway can
+# remove only dead-creator leftovers.
+_cleanup_orphaned_worker_environments()
 process_registry = ProcessRegistry()
+
+
+def track_finished_foreground_scope(unit_name: str, pid: int) -> bool:
+    """Checkpoint a daemonized foreground scope for shutdown/crash recovery."""
+    if not unit_name or not _systemd_unit_has_processes(unit_name):
+        return False
+    session = ProcessSession(
+        id=f"scope_{uuid.uuid4().hex[:12]}",
+        command=f"foreground scope {unit_name}",
+        pid=pid,
+        host_start_time=_host_process_start_time(pid),
+        started_at=time.time(),
+        exited=True,
+        exit_code=0,
+        systemd_unit=unit_name,
+    )
+    with process_registry._lock:
+        process_registry._finished[session.id] = session
+    process_registry._write_checkpoint()
+    logger.info("Tracking populated foreground worker scope %s", unit_name)
+    return True
 
 
 def _format_age(seconds: float) -> str:

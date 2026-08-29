@@ -1198,6 +1198,8 @@ DEFAULT_CONFIG = {
 
     "terminal": {
         "backend": "local",
+        "worker_cgroup_mode": "auto",
+        "local_memory_max_mb": None,
         "modal_mode": "auto",
         "cwd": ".",  # Use current directory
         "timeout": 180,
@@ -2993,6 +2995,12 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        "admission": {
+            "max_parallel_agents": 3,
+            "min_host_memory_headroom_mb": 0,
+            "queue_limit": 16,
+            "poll_interval_seconds": 2.0,
+        },
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored

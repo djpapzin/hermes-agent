@@ -2656,6 +2656,14 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+from gateway.admission import gateway_admitted_sync as _gateway_admitted_sync
+
+
+@_gateway_admitted_sync(
+    "cron",
+    id_kwargs=("job",),
+    rejected_result_factory=lambda exc: (False, "", "", str(exc)),
+)
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -4030,6 +4038,9 @@ def tick(
                 finally:
                     with _running_lock:
                         _running_job_ids.discard(j["id"])
+                    from gateway.admission import notify_gateway_admission_changed
+
+                    notify_gateway_admission_changed()
 
             try:
                 return pool.submit(_run_and_release)

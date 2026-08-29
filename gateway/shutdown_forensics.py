@@ -101,7 +101,49 @@ def _proc_summary(pid: int) -> Dict[str, Any]:
     return summary
 
 
-def snapshot_shutdown_context(received_signal: Any = None) -> Dict[str, Any]:
+def _read_key_value_file(path: Path) -> Dict[str, int]:
+    values: Dict[str, int] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            key, raw = line.split(None, 1)
+            if raw.isdigit():
+                values[key] = int(raw)
+    except (OSError, ValueError):
+        pass
+    return values
+
+
+def _cgroup_memory_snapshot() -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    try:
+        relative = next(
+            line.partition("::")[2].lstrip("/")
+            for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
+            if line.startswith("0::")
+        )
+        root = Path("/sys/fs/cgroup") / relative
+        result["path"] = "/" + relative
+        for name in ("memory.current", "memory.high", "memory.max"):
+            try:
+                result[name.replace(".", "_")] = (root / name).read_text(
+                    encoding="utf-8"
+                ).strip()
+            except OSError:
+                pass
+        result["memory_events"] = _read_key_value_file(root / "memory.events")
+    except (OSError, StopIteration):
+        pass
+    return result
+
+
+def snapshot_shutdown_context(
+    received_signal: Any = None,
+    *,
+    shutdown_reason: Optional[str] = None,
+    active_task_ids: Optional[List[str]] = None,
+    queued_task_ids: Optional[List[str]] = None,
+    worker_pids: Optional[List[int]] = None,
+) -> Dict[str, Any]:
     """Fast (<10ms) snapshot of who/what is asking us to shut down.
 
     Captures:
@@ -129,7 +171,26 @@ def snapshot_shutdown_context(received_signal: Any = None) -> Dict[str, Any]:
         "ppid": ppid,
         "parent": _proc_summary(ppid),
         "self": _proc_summary(pid),
+        "shutdown_reason": shutdown_reason or "signal",
+        "active_task_ids": list(active_task_ids or []),
+        "active_agent_count": len(active_task_ids or []),
+        "queued_task_ids": list(queued_task_ids or []),
+        "queued_task_count": len(queued_task_ids or []),
+        "worker_pids": list(worker_pids or []),
     }
+    rss = _read_proc_field(pid, "VmRSS")
+    if rss:
+        ctx["gateway_rss"] = rss
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                ctx["host_mem_available_kb"] = int(line.split()[1])
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    cgroup = _cgroup_memory_snapshot()
+    if cgroup:
+        ctx["cgroup"] = cgroup
 
     # systemd context.  If we were started by a systemd unit, INVOCATION_ID
     # is set in our env.  ppid==1 (init) is also a strong signal that
@@ -298,6 +359,19 @@ def format_context_for_log(ctx: Dict[str, Any]) -> str:
         extras.append("planned_stop_marker_present=yes")
     if ctx.get("tracer_pid"):
         extras.append(f"tracer_pid={ctx['tracer_pid']}")
+    extras.extend(
+        [
+            f"reason={ctx.get('shutdown_reason', '?')}",
+            f"gateway_rss={ctx.get('gateway_rss', '?')}",
+            f"host_mem_available_kb={ctx.get('host_mem_available_kb', '?')}",
+            f"active_agents={ctx.get('active_agent_count', 0)}",
+            f"active_task_ids={ctx.get('active_task_ids', [])}",
+            f"queued_tasks={ctx.get('queued_task_count', 0)}",
+            f"queued_task_ids={ctx.get('queued_task_ids', [])}",
+            f"worker_pids={ctx.get('worker_pids', [])}",
+            f"cgroup_memory_events={(ctx.get('cgroup') or {}).get('memory_events', {})}",
+        ]
+    )
     extras_str = (" " + " ".join(extras)) if extras else ""
     # Parent cmdline is the most useful single signal — log it prominently.
     return (

@@ -30,11 +30,13 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _IdempotencyCache,
     _derive_chat_session_id,
+    _admission_rejected_response,
     _redact_api_error_text,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.admission import AdmissionRejected
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +556,15 @@ class TestAuth:
 
 
 class TestConcurrencyCap:
+    def test_global_admission_rejection_is_retryable_429(self):
+        resp = _admission_rejected_response(
+            AdmissionRejected("Agent queue is full (2/2).")
+        )
+
+        assert resp.status == 429
+        assert resp.headers.get("Retry-After") == "2"
+        assert json.loads(resp.text)["error"]["code"] == "agent_capacity"
+
     def test_resolve_defaults_to_10_when_unset(self):
         with patch("hermes_cli.config.load_config", return_value={}):
             assert APIServerAdapter._resolve_max_concurrent_runs() == 10

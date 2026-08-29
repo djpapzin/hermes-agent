@@ -6,6 +6,8 @@ import asyncio
 import math
 import os
 import socket
+import threading
+import time
 from typing import Optional
 
 
@@ -73,6 +75,7 @@ class SystemdWatchdog:
         self._unhealthy = False
         self._stopping = False
         self._stopping_notified = False
+        self._shutdown_keepalive: Optional[threading.Thread] = None
 
     @property
     def enabled(self) -> bool:
@@ -157,7 +160,13 @@ class SystemdWatchdog:
             return
 
     async def stop(self) -> None:
-        """Stop feeding systemd and emit ``STOPPING=1`` at most once."""
+        """Enter stopping state without letting systemd misclassify a slow drain.
+
+        The normal heartbeat is loop-progress sensitive. During an intentional
+        stop the gateway has its own bounded shutdown watchdog, so a daemon
+        thread keeps the service-manager watchdog fed while adapters and active
+        turns drain. This prevents a planned SIGTERM from becoming SIGABRT.
+        """
         self._stopping = True
         task = self._task
         current = asyncio.current_task()
@@ -172,5 +181,22 @@ class SystemdWatchdog:
                 pass
         self._task = None
         if self.enabled and not self._stopping_notified:
-            notify("STOPPING=1")
+            notify("STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining")
             self._stopping_notified = True
+            interval = max(0.1, (self.interval_seconds or 1.0) / 2.0)
+
+            def _feed_during_shutdown() -> None:
+                # The process-wide shutdown watchdog remains the hard bound.
+                # This cap merely prevents a leaked daemon from running forever
+                # if a caller invokes stop() outside process teardown.
+                deadline = time.monotonic() + 900.0
+                while time.monotonic() < deadline:
+                    time.sleep(interval)
+                    notify("WATCHDOG=1")
+
+            self._shutdown_keepalive = threading.Thread(
+                target=_feed_during_shutdown,
+                name="hermes-systemd-shutdown-watchdog",
+                daemon=True,
+            )
+            self._shutdown_keepalive.start()

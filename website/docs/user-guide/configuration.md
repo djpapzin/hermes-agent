@@ -1712,8 +1712,8 @@ and messaging gateway:
 max_concurrent_sessions: null  # null/0 = unlimited; positive integer = active session cap
 ```
 
-When the cap is reached, Hermes returns a direct limit message for new sessions.
-Existing active sessions keep their normal behavior.
+When the cap is reached, Hermes queues new turns under the resource-aware
+admission settings below. Existing active sessions keep their normal behavior.
 
 The canonical key is top-level `max_concurrent_sessions`. Hermes also accepts
 `gateway.max_concurrent_sessions` as a fallback, but the top-level key wins when
@@ -1723,6 +1723,42 @@ The cap is enforced with a local runtime lease file and is best-effort: Hermes
 fails open if the registry cannot be read or locked so users are not stranded.
 It is intended for a single host/profile runtime, not a shared `$HERMES_HOME`
 mounted across multiple machines.
+
+For a messaging gateway that must remain responsive under parallel agent load:
+
+```yaml
+gateway:
+  admission:
+    max_parallel_agents: 3
+    min_host_memory_headroom_mb: 2048
+    queue_limit: 16
+    poll_interval_seconds: 2
+
+terminal:
+  worker_cgroup_mode: required  # user scope first, then same-UID system scope
+  local_memory_max_mb: 2048
+```
+
+Hermes defaults to three parallel agents, 2048 MiB of preserved headroom, and
+a 16-task queue. Setting `max_parallel_agents: null` explicitly falls back to
+`max_concurrent_sessions`; production gateways should keep a finite explicit
+value.
+At capacity or below the memory-headroom threshold, existing turns continue
+and new gateway work receives a queue-position notice. A released slot wakes
+the oldest queued turn. `queue_limit: 0` disables queueing and returns a clear
+retry response. Memory headroom is admission-only: Hermes never kills a
+healthy older task to start a newer one. On cgroups-v2 Linux, Hermes uses the
+smaller of host `MemAvailable` and the gateway cgroup's `MemoryMax -
+MemoryCurrent`, so a service-local limit cannot be hidden by ample host RAM.
+
+On Linux, `terminal.worker_cgroup_mode: required` refuses to start a local
+background executor unless Hermes can put it in an independent systemd user
+scope. `required` tries a user scope first, then a root-manager scope through
+passwordless `sudo` while explicitly retaining the gateway's UID/GID. Each
+scope receives `MemoryHigh`, `MemoryMax`, and `MemorySwapMax=0`; its crash or OOM does
+not stop the gateway or sibling scopes. Use `auto` where a systemd user manager
+is not available, but treat the emitted fallback warning as an operational
+readiness failure on production gateways.
 
 Control whether shared chats keep one conversation per room or one conversation per participant:
 
