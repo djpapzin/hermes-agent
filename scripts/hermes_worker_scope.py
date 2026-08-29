@@ -241,7 +241,8 @@ def _oom_evidence(argv: list[str]) -> int:
     )
     marker = "A process of this unit has been killed by the OOM killer."
     observed = result.returncode == 0 and any(
-        line.strip() == marker for line in result.stdout.splitlines()
+        line.strip() in {marker, f"{unit}: {marker}"}
+        for line in result.stdout.splitlines()
     )
     print(json.dumps({"unit": unit, "oom_kill": observed}, sort_keys=True))
     return 0

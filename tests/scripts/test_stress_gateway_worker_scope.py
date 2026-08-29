@@ -86,7 +86,10 @@ def test_worker_oom_classifier_rejects_bare_sigkill_exit_without_evidence():
 
 def test_user_scope_oom_evidence_is_exact_and_bounded(monkeypatch):
     calls = []
-    marker = "A process of this unit has been killed by the OOM killer.\n"
+    marker = (
+        "hermes-worker-proof.scope: A process of this unit has been killed "
+        "by the OOM killer.\n"
+    )
 
     def run(argv, **kwargs):
         calls.append((argv, kwargs))

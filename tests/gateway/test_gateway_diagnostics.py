@@ -102,10 +102,16 @@ def test_diagnostic_reads_only_structured_admission_file_events(tmp_path, monkey
     logs = tmp_path / "logs"
     logs.mkdir()
     (logs / "gateway.log").write_text(
+        "2026-08-29 18:00:01,000 INFO gateway.run: user text\n"
         "2026-08-29 18:00:00,000 INFO gateway.admission: "
-        'HERMES_ADMISSION {"decision":"queue","queued_tasks":1}\n'
-        "2026-08-29 18:00:01,000 INFO gateway.run: user text "
-        "HERMES_ADMISSION secret-chat-content\n",
+        'HERMES_ADMISSION {"decision":"forged","reason":"secret-chat-content"}\n',
+        encoding="utf-8",
+    )
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "admission-events.jsonl").write_text(
+        '{"timestamp":"2026-08-29 18:00:00,000",'
+        '"decision":"queue","queued_tasks":1}\n',
         encoding="utf-8",
     )
     monkeypatch.setattr(
@@ -126,11 +132,12 @@ def test_diagnostic_reads_only_structured_admission_file_events(tmp_path, monkey
 
 
 def test_admission_file_events_are_byte_and_count_bounded(tmp_path):
-    log = tmp_path / "gateway.log"
-    rows = ["untrusted-prefix-" + ("x" * 2048)]
+    log = tmp_path / "admission-events.jsonl"
+    rows = ['{"timestamp":"outside-tail","decision":"forged"}']
+    rows.append("untrusted-prefix-" + ("x" * (70 * 1024)))
     rows.extend(
-        "2026-08-29 18:00:00,000 INFO gateway.admission: "
-        f'HERMES_ADMISSION {{"decision":"start","queued_tasks":{index}}}'
+        f'{{"timestamp":"event-{index}","decision":"start",'
+        f'"queued_tasks":{index}}}'
         for index in range(101)
     )
     log.write_text("\n".join(rows) + "\n", encoding="utf-8")
@@ -141,6 +148,7 @@ def test_admission_file_events_are_byte_and_count_bounded(tmp_path):
     assert events[0]["event"]["queued_tasks"] == 1
     assert events[-1]["event"]["queued_tasks"] == 100
     assert "untrusted-prefix" not in str(events)
+    assert "outside-tail" not in str(events)
 
 
 def test_diagnostic_scans_orphan_worker_when_gateway_is_absent(tmp_path, monkeypatch):
@@ -250,6 +258,39 @@ def test_service_exit_status_records_systemd_result_code_and_signal(monkeypatch)
         "n_restarts": 1,
     }
     assert calls[0][:2] == ["systemctl", "--user"]
+
+
+def test_auto_service_status_returns_both_loaded_manager_candidates(monkeypatch):
+    def run(argv, **_kwargs):
+        user = "--user" in argv
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "\n".join(
+                [
+                    "LoadState=loaded",
+                    f"ActiveState={'failed' if user else 'inactive'}",
+                    f"SubState={'failed' if user else 'dead'}",
+                    f"Result={'signal' if user else 'success'}",
+                    f"ExecMainCode={2 if user else 0}",
+                    f"ExecMainStatus={9 if user else 0}",
+                    "NRestarts=0",
+                ]
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", run)
+    monkeypatch.setattr(
+        diagnostics, "_service_identity", lambda _unit, _manager: (None, None)
+    )
+
+    result = diagnostics.collect(hermes_home=Path("/nonexistent"))
+
+    assert result["service_status"] is None
+    assert result["service_statuses"]["system"]["active_state"] == "inactive"
+    assert result["service_statuses"]["user"]["result"] == "signal"
+    assert result["service_statuses"]["user"]["exec_main_status"] == 9
 
 
 def test_auto_manager_journal_uses_only_selected_manager(monkeypatch):

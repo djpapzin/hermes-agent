@@ -8,7 +8,9 @@ import functools
 import inspect
 import json
 import logging
+import os
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,10 +19,46 @@ from typing import Awaitable, Callable, Optional
 logger = logging.getLogger(__name__)
 
 _QUEUE_NOTICE_TIMEOUT_SECONDS = 5.0
+_ADMISSION_EVENTS_MAX_BYTES = 4 * 1024 * 1024
 
 _registry_lock = threading.Lock()
 _gateway_controller: Optional["AgentAdmissionController"] = None
 _gateway_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _admission_events_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "state" / "admission-events.jsonl"
+
+
+def _append_admission_event(payload: dict) -> None:
+    """Persist one controlled JSON record outside mixed human-readable logs."""
+
+    path = _admission_events_path()
+    record = dict(payload)
+    record["timestamp"] = time.time()
+    encoded = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+    if len(encoded) > 8192:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            if path.lstat().st_size >= _ADMISSION_EVENTS_MAX_BYTES:
+                if path.is_symlink():
+                    return
+                os.replace(path, path.with_suffix(".jsonl.1"))
+        except FileNotFoundError:
+            pass
+        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            os.write(descriptor, encoded)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        logger.debug("Could not persist admission event", exc_info=True)
 
 
 def install_gateway_admission(
@@ -339,24 +377,23 @@ class AgentAdmissionController:
 
     def _log(self, decision: str, task_id: str, reason: str = "") -> None:
         snap = self.snapshot()
+        payload = {
+            "decision": decision,
+            "task_id": task_id,
+            "reason": reason,
+            "active_workers": snap.active,
+            "queued_tasks": snap.queued,
+            "max_parallel": snap.max_parallel,
+            "available_memory_mb": snap.available_memory_mb,
+            "host_available_memory_mb": snap.host_available_memory_mb,
+            "cgroup_available_memory_mb": snap.cgroup_available_memory_mb,
+            "min_headroom_mb": snap.min_headroom_mb,
+        }
         logger.info(
             "HERMES_ADMISSION %s",
-            json.dumps(
-                {
-                    "decision": decision,
-                    "task_id": task_id,
-                    "reason": reason,
-                    "active_workers": snap.active,
-                    "queued_tasks": snap.queued,
-                    "max_parallel": snap.max_parallel,
-                    "available_memory_mb": snap.available_memory_mb,
-                    "host_available_memory_mb": snap.host_available_memory_mb,
-                    "cgroup_available_memory_mb": snap.cgroup_available_memory_mb,
-                    "min_headroom_mb": snap.min_headroom_mb,
-                },
-                sort_keys=True,
-            ),
+            json.dumps(payload, sort_keys=True),
         )
+        _append_admission_event(payload)
 
     async def acquire(
         self,

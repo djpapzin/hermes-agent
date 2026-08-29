@@ -201,8 +201,10 @@ def _user_scope_oom_evidence(unit: str, started_at: float) -> bool:
         timeout=8,
     )
     marker = "A process of this unit has been killed by the OOM killer."
+    scope_unit = unit + ".scope"
     return result.returncode == 0 and any(
-        line.strip() == marker for line in result.stdout.splitlines()
+        line.strip() in {marker, f"{scope_unit}: {marker}"}
+        for line in result.stdout.splitlines()
     )
 
 

@@ -21,9 +21,10 @@ OOM counters.
 
 The same output includes at most 100 filtered lifecycle/resource journal
 events from the gateway, health guard, and kernel, plus at most 100 structured
-admission records from a bounded 512 KiB tail of `logs/gateway.log`. Only the
-`gateway.admission` component and its allowlisted resource fields are read; the
-diagnostic deliberately excludes general chat and command logs.
+admission records from a bounded 512 KiB tail of
+`state/admission-events.jsonl`. The gateway writes only controlled admission
+fields to that dedicated stream; the diagnostic allowlists them again and
+never parses mixed human-readable chat or command logs.
 
 Admission uses the tighter of host `MemAvailable` and finite gateway-cgroup
 headroom (`MemoryMax - MemoryCurrent`). Structured admission logs expose both

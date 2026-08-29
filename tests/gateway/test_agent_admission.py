@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+from gateway import admission as admission_module
 from gateway.admission import (
     AdmissionRejected,
     AgentAdmissionController,
@@ -17,6 +18,21 @@ from gateway.admission import (
     install_gateway_admission,
     notify_gateway_admission_changed,
 )
+
+
+def test_structured_admission_journal_is_dedicated_and_bounded(tmp_path, monkeypatch):
+    journal = tmp_path / "state" / "admission-events.jsonl"
+    monkeypatch.setattr(admission_module, "_admission_events_path", lambda: journal)
+    controller = AgentAdmissionController(max_parallel=1, queue_limit=1)
+
+    controller._log("queue", "task-1", "parallel-agent capacity (1/1)")
+
+    row = admission_module.json.loads(journal.read_text(encoding="utf-8"))
+    assert row["decision"] == "queue"
+    assert row["task_id"] == "task-1"
+    assert row["active_workers"] == 0
+    assert row["queued_tasks"] == 0
+    assert isinstance(row["timestamp"], float)
 
 
 def test_cgroup_headroom_uses_memory_max_minus_current(tmp_path):

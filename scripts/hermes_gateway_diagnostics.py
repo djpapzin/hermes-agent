@@ -86,11 +86,10 @@ def _service_pid(unit: str, manager: str = "auto") -> int | None:
     return _service_identity(unit, manager)[0]
 
 
-def _service_exit_status(
+def _service_exit_statuses(
     unit: str, manager: str = "auto"
-) -> dict[str, Any] | None:
-    """Read systemd's durable result and main-process exit classification."""
-
+) -> dict[str, dict[str, Any]]:
+    """Read durable exit classifications for every matching manager scope."""
     managers = ("system", "user") if manager == "auto" else (manager,)
     properties = (
         "LoadState",
@@ -101,6 +100,7 @@ def _service_exit_status(
         "ExecMainStatus",
         "NRestarts",
     )
+    statuses: dict[str, dict[str, Any]] = {}
     for candidate in managers:
         argv = ["systemctl"]
         if candidate == "user":
@@ -137,7 +137,7 @@ def _service_exit_status(
             except (KeyError, TypeError, ValueError):
                 return None
 
-        return {
+        statuses[candidate] = {
             "load_state": values.get("LoadState"),
             "active_state": values.get("ActiveState"),
             "sub_state": values.get("SubState"),
@@ -146,6 +146,17 @@ def _service_exit_status(
             "exec_main_status": _integer("ExecMainStatus"),
             "n_restarts": _integer("NRestarts"),
         }
+    return statuses
+
+
+def _service_exit_status(
+    unit: str, manager: str = "auto"
+) -> dict[str, Any] | None:
+    statuses = _service_exit_statuses(unit, manager)
+    if manager != "auto":
+        return statuses.get(manager)
+    if len(statuses) == 1:
+        return next(iter(statuses.values()))
     return None
 
 
@@ -228,7 +239,7 @@ def _bounded_incident_journal(
 def _bounded_admission_events(
     path: Path, *, max_bytes: int = _ADMISSION_LOG_TAIL_BYTES
 ) -> list[dict[str, Any]]:
-    """Read only structured admission records from a bounded gateway-log tail."""
+    """Read allowlisted records from the dedicated admission JSONL tail."""
 
     try:
         with path.open("rb") as handle:
@@ -242,14 +253,10 @@ def _bounded_admission_events(
     lines = raw.decode("utf-8", errors="replace").splitlines()
     if start:
         lines = lines[1:]
-    component_marker = " gateway.admission: HERMES_ADMISSION "
     events: list[dict[str, Any]] = []
     for line in lines:
-        if component_marker not in line:
-            continue
-        prefix, payload_text = line.split(component_marker, 1)
         try:
-            payload = json.loads(payload_text)
+            payload = json.loads(line)
         except (TypeError, ValueError):
             continue
         if not isinstance(payload, dict):
@@ -261,7 +268,7 @@ def _bounded_admission_events(
         }
         events.append(
             {
-                "timestamp": prefix[:23],
+                "timestamp": str(payload.get("timestamp") or ""),
                 "unit": "gateway.admission",
                 "event": event,
             }
@@ -277,13 +284,22 @@ def collect(
     manager: str = "auto",
 ) -> dict[str, Any]:
     pid, resolved_manager = _service_identity(unit, manager)
+    service_statuses = _service_exit_statuses(
+        unit, resolved_manager or manager
+    )
+    service_status = (
+        service_statuses.get(resolved_manager)
+        if resolved_manager is not None
+        else next(iter(service_statuses.values()))
+        if len(service_statuses) == 1
+        else None
+    )
     result: dict[str, Any] = {
         "unit": unit,
         "service_manager": resolved_manager or manager,
         "gateway_pid": pid,
-        "service_status": _service_exit_status(
-            unit, resolved_manager or manager
-        ),
+        "service_status": service_status,
+        "service_statuses": service_statuses,
         "host_memory_kb": _fields(proc_root / "meminfo"),
     }
     runtime_path = hermes_home / "gateway_state.json"
@@ -378,7 +394,7 @@ def collect(
     result["worker_slices"] = worker_slice_rows
     result["worker_count"] = len(worker_scope_rows)
     result["admission_events"] = _bounded_admission_events(
-        hermes_home / "logs" / "gateway.log"
+        hermes_home / "state" / "admission-events.jsonl"
     )
     return result
 

@@ -67,7 +67,6 @@ def test_wrapper_rejects_option_injection_and_multiple_stop_units(monkeypatch):
 
 def test_wrapper_emits_only_unit_bound_recent_oom_attestation(monkeypatch, capsys):
     monkeypatch.setattr(wrapper, "_validate_caller", lambda: None)
-    marker = "A process of this unit has been killed by the OOM killer.\n"
     calls = []
 
     def run(argv, **kwargs):
@@ -77,6 +76,7 @@ def test_wrapper_emits_only_unit_bound_recent_oom_attestation(monkeypatch, capsy
     monkeypatch.setattr(wrapper.subprocess, "run", run)
     since = int(time.time())
     unit = "hermes-worker-system-proof.scope"
+    marker = f"{unit}: A process of this unit has been killed by the OOM killer.\n"
 
     assert wrapper.main(["evidence", unit, str(since)]) == 0
     assert json.loads(capsys.readouterr().out) == {"oom_kill": True, "unit": unit}
