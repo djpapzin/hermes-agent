@@ -72,6 +72,69 @@ def _service_pid(unit: str, manager: str = "auto") -> int | None:
     return _service_identity(unit, manager)[0]
 
 
+def _service_exit_status(
+    unit: str, manager: str = "auto"
+) -> dict[str, Any] | None:
+    """Read systemd's durable result and main-process exit classification."""
+
+    managers = ("system", "user") if manager == "auto" else (manager,)
+    properties = (
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "Result",
+        "ExecMainCode",
+        "ExecMainStatus",
+        "NRestarts",
+    )
+    for candidate in managers:
+        argv = ["systemctl"]
+        if candidate == "user":
+            argv.append("--user")
+        try:
+            result = subprocess.run(
+                [
+                    *argv,
+                    "show",
+                    unit,
+                    *(f"--property={name}" for name in properties),
+                    "--no-pager",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode != 0:
+            continue
+        values = dict(
+            line.split("=", 1)
+            for line in result.stdout.splitlines()
+            if "=" in line
+        )
+        if values.get("LoadState") in {None, "not-found"}:
+            continue
+
+        def _integer(name: str) -> int | None:
+            try:
+                return int(values[name])
+            except (KeyError, TypeError, ValueError):
+                return None
+
+        return {
+            "load_state": values.get("LoadState"),
+            "active_state": values.get("ActiveState"),
+            "sub_state": values.get("SubState"),
+            "result": values.get("Result"),
+            "exec_main_code": _integer("ExecMainCode"),
+            "exec_main_status": _integer("ExecMainStatus"),
+            "n_restarts": _integer("NRestarts"),
+        }
+    return None
+
+
 def _runtime_status(path: Path) -> dict[str, Any] | None:
     raw = _read(path)
     if raw is None:
@@ -160,6 +223,9 @@ def collect(
         "unit": unit,
         "service_manager": resolved_manager or manager,
         "gateway_pid": pid,
+        "service_status": _service_exit_status(
+            unit, resolved_manager or manager
+        ),
         "host_memory_kb": _fields(proc_root / "meminfo"),
     }
     runtime_path = hermes_home / "gateway_state.json"

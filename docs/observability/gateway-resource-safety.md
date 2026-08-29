@@ -11,7 +11,8 @@ Run this read-only snapshot before changing a service or resource limit:
 python3 scripts/hermes_gateway_diagnostics.py --since-minutes 30
 ```
 
-It reports the gateway PID/RSS, host `MemAvailable`, the gateway cgroup's
+It reports the gateway PID/RSS, systemd `Result`/`ExecMainCode`/
+`ExecMainStatus`, host `MemAvailable`, the gateway cgroup's
 current/high/max values and memory events, independently scoped worker
 PIDs/RSS, and each worker cgroup's current/high/max values and OOM events.
 Shutdown log records include the signal, explicit reason, parent,

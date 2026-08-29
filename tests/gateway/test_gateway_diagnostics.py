@@ -169,6 +169,44 @@ def test_service_pid_auto_detects_user_manager(monkeypatch):
     assert "--user" in calls[1]
 
 
+def test_service_exit_status_records_systemd_result_code_and_signal(monkeypatch):
+    calls = []
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "\n".join(
+                [
+                    "LoadState=loaded",
+                    "ActiveState=failed",
+                    "SubState=failed",
+                    "Result=signal",
+                    "ExecMainCode=2",
+                    "ExecMainStatus=9",
+                    "NRestarts=1",
+                ]
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", run)
+
+    assert diagnostics._service_exit_status(
+        "hermes-gateway.service", "user"
+    ) == {
+        "load_state": "loaded",
+        "active_state": "failed",
+        "sub_state": "failed",
+        "result": "signal",
+        "exec_main_code": 2,
+        "exec_main_status": 9,
+        "n_restarts": 1,
+    }
+    assert calls[0][:2] == ["systemctl", "--user"]
+
+
 def test_auto_manager_journal_uses_only_selected_manager(monkeypatch):
     monkeypatch.setattr(
         diagnostics,
