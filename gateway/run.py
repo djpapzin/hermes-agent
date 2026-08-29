@@ -7461,10 +7461,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._gateway_loop = asyncio.get_running_loop()
         except RuntimeError:
             self._gateway_loop = None
-        if self._gateway_loop is not None:
+        admission = getattr(self, "_agent_admission", None)
+        if self._gateway_loop is not None and admission is not None:
             from gateway.admission import install_gateway_admission
-            self._agent_admission.set_change_callback(self._persist_active_agents)
-            install_gateway_admission(self._agent_admission, self._gateway_loop)
+            admission.set_change_callback(self._persist_active_agents)
+            install_gateway_admission(admission, self._gateway_loop)
         logger.info("Session storage: %s", self.config.sessions_dir)
 
         # Sanity-check that systemd's TimeoutStopSec covers our drain
@@ -9167,7 +9168,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()
-            _background_count = self._active_background_agent_count
+            _background_count = getattr(
+                self, "_active_background_agent_count", lambda: 0
+            )
             _background_at_start = _background_count()
             _drain_started_at = time.monotonic()
             active_agents, timed_out = await self._drain_active_agents(timeout)
@@ -11585,7 +11588,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # same session — corrupting the transcript.
         _admission = getattr(self, "_agent_admission", None)
         _admission_acquired = False
-        if _admission is not None and not self._is_session_running(_quick_key):
+        if (
+            _admission is not None
+            and _quick_key not in getattr(self, "_running_agents", {})
+        ):
             from gateway.admission import AdmissionRejected
             if _quick_key in self._admission_waiting_sessions:
                 return "This session already has a queued task. Use /status to check capacity."
