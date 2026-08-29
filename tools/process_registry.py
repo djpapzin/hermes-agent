@@ -2332,13 +2332,15 @@ class ProcessRegistry:
         # First prune expired finished sessions
         now = time.time()
         for session in self._finished.values():
-            if session.systemd_unit and not _systemd_unit_has_processes(
-                session.systemd_unit
+            systemd_unit = getattr(session, "systemd_unit", "")
+            if systemd_unit and not _systemd_unit_has_processes(
+                systemd_unit
             ):
                 session.systemd_unit = ""
         expired = [
             sid for sid, s in self._finished.items()
-            if not s.systemd_unit and (now - s.started_at) > FINISHED_TTL_SECONDS
+            if not getattr(s, "systemd_unit", "")
+            and (now - s.started_at) > FINISHED_TTL_SECONDS
         ]
         for sid in expired:
             del self._finished[sid]
@@ -2347,7 +2349,11 @@ class ProcessRegistry:
 
         # If still over limit, remove oldest finished
         total = len(self._running) + len(self._finished)
-        prunable = [sid for sid, s in self._finished.items() if not s.systemd_unit]
+        prunable = [
+            sid
+            for sid, s in self._finished.items()
+            if not getattr(s, "systemd_unit", "")
+        ]
         if total >= MAX_PROCESSES and prunable:
             oldest_id = min(prunable, key=lambda sid: self._finished[sid].started_at)
             del self._finished[oldest_id]
