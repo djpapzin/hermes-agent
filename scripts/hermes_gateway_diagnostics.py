@@ -27,6 +27,20 @@ _INCIDENT_MARKERS = (
     "Started Hermes Agent Gateway",
 )
 
+_ADMISSION_EVENT_FIELDS = (
+    "decision",
+    "task_id",
+    "reason",
+    "active_workers",
+    "queued_tasks",
+    "max_parallel",
+    "available_memory_mb",
+    "host_available_memory_mb",
+    "cgroup_available_memory_mb",
+    "min_headroom_mb",
+)
+_ADMISSION_LOG_TAIL_BYTES = 512 * 1024
+
 
 def _read(path: Path) -> str | None:
     try:
@@ -211,6 +225,50 @@ def _bounded_incident_journal(
     return events[-100:]
 
 
+def _bounded_admission_events(
+    path: Path, *, max_bytes: int = _ADMISSION_LOG_TAIL_BYTES
+) -> list[dict[str, Any]]:
+    """Read only structured admission records from a bounded gateway-log tail."""
+
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            start = max(0, size - max(1, max_bytes))
+            handle.seek(start)
+            raw = handle.read(max(1, max_bytes))
+    except OSError:
+        return []
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    if start:
+        lines = lines[1:]
+    component_marker = " gateway.admission: HERMES_ADMISSION "
+    events: list[dict[str, Any]] = []
+    for line in lines:
+        if component_marker not in line:
+            continue
+        prefix, payload_text = line.split(component_marker, 1)
+        try:
+            payload = json.loads(payload_text)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        event = {
+            key: payload[key]
+            for key in _ADMISSION_EVENT_FIELDS
+            if key in payload
+        }
+        events.append(
+            {
+                "timestamp": prefix[:23],
+                "unit": "gateway.admission",
+                "event": event,
+            }
+        )
+    return events[-100:]
+
+
 def collect(
     unit: str = "hermes-gateway.service",
     hermes_home: Path = Path.home() / ".hermes",
@@ -319,6 +377,9 @@ def collect(
     result["worker_cgroups"] = worker_scope_rows[:100]
     result["worker_slices"] = worker_slice_rows
     result["worker_count"] = len(worker_scope_rows)
+    result["admission_events"] = _bounded_admission_events(
+        hermes_home / "logs" / "gateway.log"
+    )
     return result
 
 

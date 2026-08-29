@@ -98,6 +98,33 @@ def test_diagnostic_reads_bounded_admission_runtime_status(tmp_path, monkeypatch
     assert "secret" not in result["runtime_status"]
 
 
+def test_diagnostic_reads_only_structured_admission_file_events(tmp_path, monkeypatch):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "gateway.log").write_text(
+        "2026-08-29 18:00:00,000 INFO gateway.admission: "
+        'HERMES_ADMISSION {"decision":"queue","queued_tasks":1}\n'
+        "2026-08-29 18:00:01,000 INFO gateway.run: user text "
+        "HERMES_ADMISSION secret-chat-content\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "scripts.hermes_gateway_diagnostics._service_identity",
+        lambda _unit, _manager: (None, None),
+    )
+
+    result = collect(hermes_home=tmp_path)
+
+    assert result["admission_events"] == [
+        {
+            "timestamp": "2026-08-29 18:00:00,000",
+            "unit": "gateway.admission",
+            "event": {"decision": "queue", "queued_tasks": 1},
+        }
+    ]
+    assert "secret-chat-content" not in str(result)
+
+
 def test_diagnostic_scans_orphan_worker_when_gateway_is_absent(tmp_path, monkeypatch):
     proc = tmp_path / "proc"
     cgroups = tmp_path / "cgroup"
