@@ -85,8 +85,8 @@ admission and memory evidence before changing the watchdog interval.
   works before selecting `terminal.worker_cgroup_mode: required`.
 - A systemd-supervised Linux gateway fails closed if no worker-scope backend is
   available, including `auto`, `user`, or `off` configurations. This covers
-  terminal, browser, computer-use, and local `execute_code` children. Running
-  model-controlled work inside the control-plane cgroup would defeat both
+  terminal, browser, computer-use, local `execute_code`, and configured stdio
+  MCP children. Running model-controlled work inside the control-plane cgroup would defeat both
   resource isolation and manager-attested diagnostic provenance. Supervision
   is latched to the gateway PID once at startup; later deletion or replacement
   of same-UID runtime PID, lock, or state files cannot disable isolation.

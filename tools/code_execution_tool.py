@@ -1276,6 +1276,8 @@ def execute_code(
     exec_start = time.monotonic()
     server_sock = None
     stop_event = threading.Event()
+    worker_scope_unit = None
+    stop_worker_scope = None
 
     try:
         # Write the auto-generated hermes_tools module.
@@ -1410,6 +1412,7 @@ def execute_code(
                 unit_suffix=f"execute-code-{os.getpid()}-{uuid.uuid4().hex[:12]}",
                 environment=child_env,
             )
+            stop_worker_scope = _stop_systemd_unit
         try:
             proc = subprocess.Popen(
                 child_argv,
@@ -1429,7 +1432,9 @@ def execute_code(
             _cleanup_scope_environment_when_done(proc, child_argv)
 
         def _stop_execute_code_child(*, escalate: bool = False) -> None:
+            nonlocal worker_scope_unit
             if worker_scope_unit and _stop_systemd_unit(worker_scope_unit):
+                worker_scope_unit = None
                 return
             _kill_process_group(proc, escalate=escalate)
 
@@ -1632,6 +1637,12 @@ def execute_code(
         }, ensure_ascii=False)
 
     finally:
+        if worker_scope_unit and stop_worker_scope is not None:
+            if not stop_worker_scope(worker_scope_unit):
+                logger.warning(
+                    "Could not reap execute_code worker scope %s",
+                    worker_scope_unit,
+                )
         # Cleanup temp dir and socket
         if server_sock is not None:
             try:

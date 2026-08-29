@@ -1138,6 +1138,59 @@ class TestMCPServerTask:
 
         asyncio.run(_test())
 
+    def test_stdio_routes_through_worker_scope_and_reaps(self):
+        """Configured stdio MCP children cannot remain in the gateway unit."""
+        from tools.mcp_tool import MCPServerTask
+        import tools.process_registry as process_registry
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session.list_tools = AsyncMock(
+            return_value=SimpleNamespace(tools=[])
+        )
+        p_stdio, p_cs, _, _ = self._mock_stdio_and_session(mock_session)
+        build_scope = MagicMock(
+            return_value=(
+                ["/usr/bin/systemd-run", "--scope", "--", "wrapped-mcp"],
+                "hermes-worker-mcp-test.scope",
+            )
+        )
+        stop_scope = MagicMock(return_value=True)
+        discard_scope = MagicMock()
+
+        async def _test():
+            with patch("tools.mcp_tool.StdioServerParameters") as params, \
+                 p_stdio, p_cs, \
+                 patch.object(
+                     process_registry,
+                     "build_gateway_worker_scope_argv",
+                     build_scope,
+                 ), \
+                 patch.object(
+                     process_registry, "_stop_systemd_unit", stop_scope
+                 ), \
+                 patch.object(
+                     process_registry,
+                     "_discard_scope_environment",
+                     discard_scope,
+                 ):
+                server = MCPServerTask("scoped")
+                await server.start({"command": "npx", "args": ["demo"]})
+                await server.shutdown()
+
+            build_scope.assert_called_once()
+            params.assert_called_once_with(
+                command="/usr/bin/systemd-run",
+                args=["--scope", "--", "wrapped-mcp"],
+                env=build_scope.call_args.kwargs["environment"],
+            )
+            stop_scope.assert_called_once_with("hermes-worker-mcp-test.scope")
+            discard_scope.assert_called_once_with(
+                ["/usr/bin/systemd-run", "--scope", "--", "wrapped-mcp"]
+            )
+
+        asyncio.run(_test())
+
     def test_no_command_raises(self):
         """Missing 'command' in config raises ValueError."""
         from tools.mcp_tool import MCPServerTask
