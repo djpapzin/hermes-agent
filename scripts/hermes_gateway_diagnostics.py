@@ -150,24 +150,23 @@ def collect(
         }
     else:
         result["runtime_status"] = None
-    if not pid:
-        return result
-    status = _fields(proc_root / str(pid) / "status")
-    result["gateway_rss_kb"] = status.get("VmRSS")
-    cgroup_raw = _read(proc_root / str(pid) / "cgroup") or ""
-    relative = next(
-        (line.partition("::")[2].lstrip("/") for line in cgroup_raw.splitlines() if line.startswith("0::")),
-        None,
-    )
-    if relative is not None:
-        root = cgroup_root / relative
-        result["gateway_cgroup"] = "/" + relative
-        result["cgroup_memory"] = {
-            "current": _read(root / "memory.current"),
-            "high": _read(root / "memory.high"),
-            "max": _read(root / "memory.max"),
-            "events": _fields(root / "memory.events"),
-        }
+    if pid:
+        status = _fields(proc_root / str(pid) / "status")
+        result["gateway_rss_kb"] = status.get("VmRSS")
+        cgroup_raw = _read(proc_root / str(pid) / "cgroup") or ""
+        relative = next(
+            (line.partition("::")[2].lstrip("/") for line in cgroup_raw.splitlines() if line.startswith("0::")),
+            None,
+        )
+        if relative is not None:
+            root = cgroup_root / relative
+            result["gateway_cgroup"] = "/" + relative
+            result["cgroup_memory"] = {
+                "current": _read(root / "memory.current"),
+                "high": _read(root / "memory.high"),
+                "max": _read(root / "memory.max"),
+                "events": _fields(root / "memory.events"),
+            }
     worker_rows: list[dict[str, Any]] = []
     worker_cgroups: dict[str, dict[str, Any]] = {}
     for proc_status in sorted(proc_root.glob("[0-9]*/status")):

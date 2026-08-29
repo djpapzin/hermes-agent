@@ -12,6 +12,7 @@ def _snapshot(**overrides):
         "wal_bytes": 0,
         "db_locks": 0,
         "telegram_poll_conflicts": 0,
+        "telegram_enabled": True,
         "telegram_connected": True,
         "state_db_exists": True,
         "active_agents": 2,
@@ -61,3 +62,15 @@ def test_healthy_snapshot_is_recorded_without_false_degradation(tmp_path, monkey
 
     assert main(["--hermes-home", str(home), "--state-file", str(state)]) == 0
     assert json.loads(state.read_text(encoding="utf-8"))["decision"] == "healthy"
+
+
+def test_disabled_telegram_is_not_reported_disconnected():
+    reasons = evaluate(
+        _snapshot(telegram_enabled=False, telegram_connected=False),
+        max_tasks=500,
+        max_memory=8000,
+        max_wal=1000,
+        lock_threshold=10,
+    )
+
+    assert "telegram_polling=disconnected" not in reasons

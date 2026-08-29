@@ -83,3 +83,34 @@ def test_diagnostic_reads_bounded_admission_runtime_status(tmp_path, monkeypatch
     assert result["runtime_status"]["active_agents"] == 2
     assert result["runtime_status"]["admission"]["queued_tasks"] == 1
     assert "secret" not in result["runtime_status"]
+
+
+def test_diagnostic_scans_orphan_worker_when_gateway_is_absent(tmp_path, monkeypatch):
+    proc = tmp_path / "proc"
+    cgroups = tmp_path / "cgroup"
+    worker = "system.slice/hermes-worker-orphan.scope"
+    proc.mkdir()
+    (proc / "meminfo").write_text("MemAvailable: 4096 kB\n", encoding="utf-8")
+    worker_proc = proc / "222"
+    worker_proc.mkdir()
+    (worker_proc / "status").write_text("VmRSS: 2048 kB\n", encoding="utf-8")
+    (worker_proc / "cgroup").write_text(f"0::/{worker}\n", encoding="utf-8")
+    worker_cgroup = cgroups / worker
+    worker_cgroup.mkdir(parents=True)
+    (worker_cgroup / "memory.current").write_text("100", encoding="utf-8")
+    (worker_cgroup / "memory.high").write_text("200", encoding="utf-8")
+    (worker_cgroup / "memory.max").write_text("300", encoding="utf-8")
+    (worker_cgroup / "memory.events").write_text("oom 0\noom_kill 0\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "scripts.hermes_gateway_diagnostics._service_pid", lambda _unit: None
+    )
+
+    result = collect(
+        hermes_home=tmp_path,
+        proc_root=proc,
+        cgroup_root=cgroups,
+    )
+
+    assert result["gateway_pid"] is None
+    assert result["worker_count"] == 1
+    assert result["workers"][0]["pid"] == 222

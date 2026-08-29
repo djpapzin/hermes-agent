@@ -59,3 +59,29 @@ def test_required_mode_refuses_worker_in_gateway_cgroup(monkeypatch, tmp_path):
         with pytest.raises(RuntimeError, match="cgroup isolation is required"):
             registry.spawn_local("echo unsafe", cwd=str(tmp_path))
     spawn.assert_not_called()
+
+
+def test_foreground_system_scope_receives_sanitized_run_environment(
+    monkeypatch, tmp_path
+):
+    import tools.environments.local as local
+    import tools.process_registry as pr
+
+    env = object.__new__(local.LocalEnvironment)
+    env.cwd = str(tmp_path)
+    env.env = {"HERMES_HOME": "/profiles/friend", "CUSTOM_SETTING": "yes"}
+    monkeypatch.setattr(local, "_find_bash", lambda: "/bin/bash")
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setattr(pr, "_worker_cgroup_mode", lambda: "system")
+    monkeypatch.setattr(pr, "_worker_scope_backend", lambda: "system")
+    monkeypatch.setattr(local.os, "getpgid", lambda _pid: 123)
+
+    fake_proc = type("Proc", (), {"pid": 123})()
+    with patch.object(pr, "_build_systemd_scope_argv", return_value=["scoped"]) as build, patch.object(
+        local.subprocess, "Popen", return_value=fake_proc
+    ):
+        env._run_bash("true")
+
+    scoped_env = build.call_args.kwargs["environment"]
+    assert scoped_env["HERMES_HOME"] == "/profiles/friend"
+    assert scoped_env["CUSTOM_SETTING"] == "yes"

@@ -1365,7 +1365,12 @@ class LocalEnvironment(BaseEnvironment):
                         )
                     if backend is not None:
                         suffix = f"fg-{os.getpid()}-{uuid.uuid4().hex[:12]}"
-                        args = _build_systemd_scope_argv(args, suffix, backend=backend)
+                        args = _build_systemd_scope_argv(
+                            args,
+                            suffix,
+                            backend=backend,
+                            environment=run_env,
+                        )
                         systemd_unit = f"hermes-worker-{'system-' if backend == 'system' else ''}{suffix}.scope"
             except RuntimeError:
                 raise

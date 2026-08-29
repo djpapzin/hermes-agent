@@ -16,6 +16,8 @@ from typing import Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+_QUEUE_NOTICE_TIMEOUT_SECONDS = 5.0
+
 _registry_lock = threading.Lock()
 _gateway_controller: Optional["AgentAdmissionController"] = None
 _gateway_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -135,6 +137,7 @@ def gateway_admitted_sync(
     prefix: str,
     *,
     id_kwargs: tuple[str, ...],
+    rejected_result_factory: Optional[Callable[["AdmissionRejected"], object]] = None,
 ):
     """Decorate a scheduler-thread agent entry point with global admission.
 
@@ -159,7 +162,12 @@ def gateway_admitted_sync(
             acquired = asyncio.run_coroutine_threadsafe(
                 controller.acquire(task_id), loop
             )
-            acquired.result()
+            try:
+                acquired.result()
+            except AdmissionRejected as exc:
+                if rejected_result_factory is not None:
+                    return rejected_result_factory(exc)
+                raise
             outcome = "finished"
             try:
                 return func(*args, **kwargs)
@@ -369,7 +377,15 @@ class AgentAdmissionController:
                         # Do not hold the controller lock during network I/O.
                         self._condition.release()
                         try:
-                            await on_queued(notice)
+                            await asyncio.wait_for(
+                                on_queued(notice),
+                                timeout=_QUEUE_NOTICE_TIMEOUT_SECONDS,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "Timed out delivering admission queue notice for %s",
+                                task_id,
+                            )
                         except Exception as exc:
                             logger.warning(
                                 "Could not deliver admission queue notice for %s: %s",

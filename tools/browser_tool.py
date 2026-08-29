@@ -111,16 +111,29 @@ def _scope_browser_workload(
     *,
     environment: Dict[str, str],
     session_name: str,
-) -> List[str]:
+) -> tuple[List[str], Optional[str]]:
     """Place agent-browser and all inherited Chrome children in a worker scope."""
     from tools.process_registry import build_gateway_worker_scope_argv
 
-    scoped, _unit = build_gateway_worker_scope_argv(
+    return build_gateway_worker_scope_argv(
         argv,
         unit_suffix=f"browser-{session_name}-{uuid.uuid4().hex[:8]}",
         environment=environment,
     )
-    return scoped
+
+
+def _stop_scoped_browser_workload(proc: subprocess.Popen) -> None:
+    """Stop a browser's complete transient scope after a timeout."""
+    unit = getattr(proc, "_hermes_systemd_unit", None)
+    if unit:
+        try:
+            from tools.process_registry import _stop_systemd_unit
+
+            _stop_systemd_unit(unit)
+        except Exception as exc:
+            logger.warning("Could not stop timed-out browser scope %s: %s", unit, exc)
+    if proc.poll() is None:
+        proc.kill()
 
 try:
     from tools.website_policy import check_website_access
@@ -1163,7 +1176,7 @@ def _run_chrome_fallback_command(
                 _si = subprocess.STARTUPINFO()
                 _si.dwFlags |= subprocess.STARTF_USESTDHANDLES
                 _popen_extra["startupinfo"] = _si
-            full = _scope_browser_workload(
+            full, browser_scope = _scope_browser_workload(
                 full,
                 environment=browser_env,
                 session_name=tmp_session,
@@ -1173,13 +1186,14 @@ def _run_chrome_fallback_command(
                 stdin=subprocess.DEVNULL, env=browser_env,
                 **_popen_extra,
             )
+            proc._hermes_systemd_unit = browser_scope
         finally:
             os.close(stdout_fd)
             os.close(stderr_fd)
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _stop_scoped_browser_workload(proc)
             proc.wait()
             return {"success": False, "error": f"Chrome fallback '{cmd}' timed out"}
         try:
@@ -2509,7 +2523,7 @@ def _run_browser_command(
                 _si = subprocess.STARTUPINFO()
                 _si.dwFlags |= subprocess.STARTF_USESTDHANDLES
                 _popen_extra["startupinfo"] = _si
-            cmd_parts = _scope_browser_workload(
+            cmd_parts, browser_scope = _scope_browser_workload(
                 cmd_parts,
                 environment=browser_env,
                 session_name=session_info["session_name"],
@@ -2522,6 +2536,7 @@ def _run_browser_command(
                 env=browser_env,
                 **_popen_extra,
             )
+            proc._hermes_systemd_unit = browser_scope
         finally:
             os.close(stdout_fd)
             os.close(stderr_fd)
@@ -2529,7 +2544,7 @@ def _run_browser_command(
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _stop_scoped_browser_workload(proc)
             proc.wait()
             stdout, stderr = _read_command_output_files(stdout_path, stderr_path)
             _unlink_command_output_files(stdout_path, stderr_path)

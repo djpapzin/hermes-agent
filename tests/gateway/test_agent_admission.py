@@ -237,6 +237,51 @@ async def test_background_surface_reports_queue_and_resumes_without_prompt_leak(
         clear_gateway_admission(controller)
 
 
+@pytest.mark.asyncio
+async def test_slow_queue_notice_does_not_block_fifo_progress(monkeypatch):
+    controller = AgentAdmissionController(
+        max_parallel=1, queue_limit=2, poll_interval_seconds=0.01
+    )
+    await controller.acquire("existing")
+    notice_started = asyncio.Event()
+
+    async def hung_notice(_message: str) -> None:
+        notice_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("gateway.admission._QUEUE_NOTICE_TIMEOUT_SECONDS", 0.02)
+    queued = asyncio.create_task(
+        controller.acquire("next", on_queued=hung_notice)
+    )
+    await notice_started.wait()
+    await controller.release("existing")
+
+    await asyncio.wait_for(queued, timeout=0.2)
+    assert controller.snapshot().active_task_ids == ("next",)
+
+
+@pytest.mark.asyncio
+async def test_sync_surface_returns_explicit_rejection_result():
+    controller = AgentAdmissionController(max_parallel=1, queue_limit=0)
+    install_gateway_admission(controller, asyncio.get_running_loop())
+    await controller.acquire("existing")
+
+    @gateway_admitted_sync(
+        "cron",
+        id_kwargs=("job",),
+        rejected_result_factory=lambda exc: (False, str(exc)),
+    )
+    def cron_turn(job: dict):
+        return True, job["id"]
+
+    try:
+        result = await asyncio.to_thread(cron_turn, {"id": "overflow"})
+        assert result[0] is False
+        assert "queue is full" in result[1]
+    finally:
+        clear_gateway_admission(controller)
+
+
 def test_all_gateway_agent_entry_points_declare_global_admission():
     from cron.scheduler import run_job
     from gateway.platforms.api_server import APIServerAdapter

@@ -28,6 +28,7 @@ class GuardSnapshot:
     wal_bytes: int
     db_locks: int
     telegram_poll_conflicts: int
+    telegram_enabled: bool
     telegram_connected: bool
     state_db_exists: bool
     active_agents: int
@@ -50,7 +51,11 @@ def evaluate(snapshot: GuardSnapshot, *, max_tasks: int, max_memory: int, max_wa
         reasons.append(
             f"telegram_poll_conflicts={snapshot.telegram_poll_conflicts}"
         )
-    if snapshot.active_state == "active" and not snapshot.telegram_connected:
+    if (
+        snapshot.active_state == "active"
+        and snapshot.telegram_enabled
+        and not snapshot.telegram_connected
+    ):
         reasons.append("telegram_polling=disconnected")
     if not snapshot.state_db_exists:
         reasons.append("state_db=missing")
@@ -71,6 +76,18 @@ def _runtime_counts(path: Path) -> tuple[int, int]:
         )
     except (OSError, TypeError, ValueError):
         return 0, 0
+
+
+def _telegram_enabled(path: Path) -> bool:
+    try:
+        import yaml
+
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        platforms = payload.get("platforms") if isinstance(payload, dict) else {}
+        telegram = platforms.get("telegram") if isinstance(platforms, dict) else {}
+        return bool(telegram.get("enabled")) if isinstance(telegram, dict) else False
+    except (ImportError, OSError, TypeError, ValueError):
+        return False
 
 
 def collect_snapshot(
@@ -119,6 +136,7 @@ def collect_snapshot(
         telegram_poll_conflicts=journal.count(
             "conflict: terminated by other getupdates request"
         ),
+        telegram_enabled=_telegram_enabled(hermes_home / "config.yaml"),
         telegram_connected=telegram_connected,
         state_db_exists=(hermes_home / "state.db").exists(),
         active_agents=active_agents,

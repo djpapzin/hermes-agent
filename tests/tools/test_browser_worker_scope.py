@@ -2,7 +2,7 @@
 
 from unittest.mock import patch
 
-from tools.browser_tool import _scope_browser_workload
+from tools.browser_tool import _scope_browser_workload, _stop_scoped_browser_workload
 
 
 def test_browser_scope_uses_shared_gateway_worker_boundary():
@@ -11,14 +11,36 @@ def test_browser_scope_uses_shared_gateway_worker_boundary():
         "tools.process_registry.build_gateway_worker_scope_argv",
         return_value=(["systemd-run", "--", "agent-browser", "open"], "scope"),
     ) as build:
-        argv = _scope_browser_workload(
+        argv, unit = _scope_browser_workload(
             ["agent-browser", "open"],
             environment=env,
             session_name="telegram-session",
         )
 
     assert argv == ["systemd-run", "--", "agent-browser", "open"]
+    assert unit == "scope"
     assert build.call_args.kwargs["environment"] is env
     assert build.call_args.kwargs["unit_suffix"].startswith(
         "browser-telegram-session-"
     )
+
+
+def test_timed_out_browser_stops_complete_scope_before_launcher():
+    class Proc:
+        _hermes_systemd_unit = "hermes-worker-system-browser.scope"
+
+        def __init__(self):
+            self.killed = False
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            self.killed = True
+
+    proc = Proc()
+    with patch("tools.process_registry._stop_systemd_unit") as stop:
+        _stop_scoped_browser_workload(proc)
+
+    stop.assert_called_once_with("hermes-worker-system-browser.scope")
+    assert proc.killed is True

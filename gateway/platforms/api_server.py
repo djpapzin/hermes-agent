@@ -82,6 +82,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.admission import AdmissionRejected
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
@@ -687,6 +688,19 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
     }
 
 
+def _admission_rejected_response(exc: AdmissionRejected) -> "web.Response":
+    """Return a retryable, explicit capacity response instead of HTTP 500."""
+    return web.json_response(
+        _openai_error(
+            str(exc),
+            err_type="rate_limit_error",
+            code="agent_capacity",
+        ),
+        status=429,
+        headers={"Retry-After": "2"},
+    )
+
+
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
     "api_agent_request_reservation", default=None
 )
@@ -715,6 +729,8 @@ def _admit_api_agent_request(handler):
         self._pending_agent_requests += 1
         try:
             return await handler(self, request, *args, **kwargs)
+        except AdmissionRejected as exc:
+            return _admission_rejected_response(exc)
         finally:
             if reservation["active"]:
                 reservation["active"] = False
@@ -2600,6 +2616,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     "messages": turn_messages,
                     "usage": usage,
                 }))
+            except AdmissionRejected as exc:
+                await queue.put(
+                    _event_payload(
+                        "error",
+                        {
+                            "message": _redact_api_error_text(exc),
+                            "code": "agent_capacity",
+                            "retryable": True,
+                        },
+                    )
+                )
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
@@ -2892,6 +2919,8 @@ class APIServerAdapter(BasePlatformAdapter):
             fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+            except AdmissionRejected as e:
+                return _admission_rejected_response(e)
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -2901,6 +2930,8 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             try:
                 result, usage = await _compute_completion()
+            except AdmissionRejected as e:
+                return _admission_rejected_response(e)
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -3111,6 +3142,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if agent_error is not None:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
+            capacity_rejected = isinstance(agent_error, AdmissionRejected)
 
             # Decide finish_reason, matching the non-streaming logic: "length"
             # for truncation, "error" for failure, "stop" for normal completion.
@@ -3137,14 +3169,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 if err_msg:
                     finish_chunk["error"] = {
                         "message": err_msg,
-                        "type": type(agent_error).__name__ if agent_error else "agent_error",
+                        "type": "rate_limit_error" if capacity_rejected else (
+                            type(agent_error).__name__ if agent_error else "agent_error"
+                        ),
+                        "code": "agent_capacity" if capacity_rejected else "agent_error",
                     }
                 finish_chunk["hermes"] = {
                     "completed": completed,
                     "partial": is_partial,
                     "failed": is_failed,
                     "error": err_msg,
-                    "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                    "error_code": (
+                        "output_truncated"
+                        if finish_reason == "length"
+                        else "agent_capacity" if capacity_rejected else "agent_error"
+                    ),
+                    "retryable": capacity_rejected,
                 }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
@@ -3290,6 +3330,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         final_response_text = ""
         agent_error: Optional[str] = None
+        agent_error_code: Optional[str] = None
         usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         terminal_snapshot_persisted = False
 
@@ -3606,6 +3647,8 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:  # noqa: BLE001
                 logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
                 agent_error = _redact_api_error_text(e)
+                if isinstance(e, AdmissionRejected):
+                    agent_error_code = "agent_capacity"
 
             # Close the message item if it was opened
             final_response_text = "".join(final_text_parts) or final_response_text
@@ -3674,7 +3717,12 @@ class APIServerAdapter(BasePlatformAdapter):
             if agent_error:
                 failed_env = _envelope("failed")
                 failed_env["output"] = final_items
-                failed_env["error"] = {"message": _redact_api_error_text(agent_error), "type": "server_error"}
+                failed_env["error"] = {
+                    "message": _redact_api_error_text(agent_error),
+                    "type": "rate_limit_error" if agent_error_code else "server_error",
+                    "code": agent_error_code or "agent_error",
+                }
+                failed_env["retryable"] = agent_error_code == "agent_capacity"
                 failed_env["usage"] = {
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
@@ -3993,6 +4041,8 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
+            except AdmissionRejected as e:
+                return _admission_rejected_response(e)
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(
@@ -4002,6 +4052,8 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             try:
                 result, usage = await _compute_response()
+            except AdmissionRejected as e:
+                return _admission_rejected_response(e)
             except Exception as e:
                 logger.error("Error running agent for responses: %s", e, exc_info=True)
                 return web.json_response(

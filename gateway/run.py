@@ -14949,16 +14949,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         resolve from that profile's secret scope. Mirrors the pattern in
         ``_run_agent``.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
-            )
+        try:
+            if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                return await self._run_background_task_inner(
+                    prompt, source, task_id, event_message_id, media_urls, media_types,
+                )
 
-        profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
-            )
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                return await self._run_background_task_inner(
+                    prompt, source, task_id, event_message_id, media_urls, media_types,
+                )
+        except Exception as exc:
+            from gateway.admission import AdmissionRejected
+
+            if not isinstance(exc, AdmissionRejected):
+                raise
+            logger.warning("Background task %s rejected by admission: %s", task_id, exc)
+            adapter = self._adapter_for_source(source)
+            if adapter is not None:
+                await adapter.send(
+                    source.chat_id,
+                    f"❌ Background task {task_id} was not started: {exc}",
+                    metadata=self._thread_metadata_for_source(source, event_message_id),
+                )
+            return None
 
     from gateway.admission import gateway_admitted_async as _gateway_admitted_async
 
