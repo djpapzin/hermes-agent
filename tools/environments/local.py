@@ -1359,7 +1359,9 @@ class LocalEnvironment(BaseEnvironment):
 
             isolation_required = _gateway_worker_isolation_required()
             if isolation_required:
-                backend = _gateway_worker_scope_backend()
+                backend = _gateway_worker_scope_backend(
+                    isolation_required=isolation_required
+                )
                 if backend is None:  # pragma: no cover - identity already verified
                     raise RuntimeError("Supervised gateway worker isolation is unavailable")
                 suffix = f"fg-{os.getpid()}-{uuid.uuid4().hex[:12]}"

@@ -367,9 +367,11 @@ def _is_supervised_gateway_process() -> bool:
         return False
 
 
-def _gateway_worker_scope_backend() -> Optional[str]:
-    """Return the worker scope backend, failing closed inside the gateway."""
-    if not _is_supervised_gateway_process():
+def _gateway_worker_scope_backend(
+    *, isolation_required: bool
+) -> Optional[str]:
+    """Resolve a worker backend without re-reading a cached gateway identity."""
+    if not isolation_required:
         return None
     backend = _worker_scope_backend()
     if backend is None:
@@ -428,9 +430,10 @@ def build_gateway_worker_scope_argv(
     argv: List[str], *, unit_suffix: str,
     environment: Optional[Dict[str, str]] = None,
 ) -> tuple[List[str], Optional[str]]:
-    if not _gateway_worker_isolation_required():
+    isolation_required = _gateway_worker_isolation_required()
+    if not isolation_required:
         return argv, None
-    backend = _gateway_worker_scope_backend()
+    backend = _gateway_worker_scope_backend(isolation_required=isolation_required)
     if backend is None:  # pragma: no cover - guarded by supervised identity above
         raise RuntimeError("Supervised gateway worker isolation is unavailable")
     wrapped = _build_systemd_scope_argv(argv, unit_suffix, backend, environment)
@@ -1160,7 +1163,9 @@ class ProcessRegistry:
                 pty_argv = [user_shell, "-lic", f"set +m; {command}"]
                 pty_in_supervised_gateway = gateway_isolation_required
                 pty_scope_backend = (
-                    _gateway_worker_scope_backend()
+                    _gateway_worker_scope_backend(
+                        isolation_required=gateway_isolation_required
+                    )
                     if pty_in_supervised_gateway
                     else None
                 )
@@ -1232,7 +1237,11 @@ class ProcessRegistry:
         shell_argv = [user_shell, "-lic", f"set +m; {command}"]
         in_supervised_gateway = gateway_isolation_required
         scope_backend = (
-            _gateway_worker_scope_backend() if in_supervised_gateway else None
+            _gateway_worker_scope_backend(
+                isolation_required=gateway_isolation_required
+            )
+            if in_supervised_gateway
+            else None
         )
         if in_supervised_gateway and scope_backend:
             unit_suffix = f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id

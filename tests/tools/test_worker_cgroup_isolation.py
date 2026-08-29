@@ -304,11 +304,9 @@ def test_pty_gateway_retains_initial_isolation_decision_on_preparation_failure(
 
     registry = pr.ProcessRegistry()
     monkeypatch.setattr(pr, "_find_shell", lambda: "/bin/bash")
-    isolation_required = MagicMock(side_effect=[True, False])
-    monkeypatch.setattr(
-        pr, "_gateway_worker_isolation_required", isolation_required
-    )
-    monkeypatch.setattr(pr, "_gateway_worker_scope_backend", lambda: "system")
+    supervised_identity = MagicMock(side_effect=[True, False])
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", supervised_identity)
+    monkeypatch.setattr(pr, "_worker_scope_backend", lambda: "system")
     monkeypatch.setattr(
         pr,
         "_build_systemd_scope_argv",
@@ -320,7 +318,7 @@ def test_pty_gateway_retains_initial_isolation_decision_on_preparation_failure(
             registry.spawn_local("echo unsafe", cwd=str(tmp_path), use_pty=True)
 
     spawn.assert_not_called()
-    isolation_required.assert_called_once_with()
+    supervised_identity.assert_called_once_with()
 
 
 def test_explicit_system_mode_refuses_unbounded_fallback(monkeypatch):
@@ -397,11 +395,9 @@ def test_foreground_gateway_propagates_every_scope_preparation_failure(
     env.cwd = str(tmp_path)
     env.env = {}
     monkeypatch.setattr(local, "_find_bash", lambda: "/bin/bash")
-    isolation_required = MagicMock(side_effect=[True, False])
-    monkeypatch.setattr(
-        pr, "_gateway_worker_isolation_required", isolation_required
-    )
-    monkeypatch.setattr(pr, "_gateway_worker_scope_backend", lambda: "system")
+    supervised_identity = MagicMock(side_effect=[True, False])
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", supervised_identity)
+    monkeypatch.setattr(pr, "_worker_scope_backend", lambda: "system")
     monkeypatch.setattr(
         pr,
         "_build_systemd_scope_argv",
@@ -413,4 +409,4 @@ def test_foreground_gateway_propagates_every_scope_preparation_failure(
             env._run_bash("true")
 
     spawn.assert_not_called()
-    isolation_required.assert_called_once_with()
+    supervised_identity.assert_called_once_with()

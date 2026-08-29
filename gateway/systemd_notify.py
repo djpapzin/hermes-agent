@@ -240,18 +240,49 @@ class SystemdWatchdog:
             self._expired = True
             notify("STATUS=watchdog expired: hard deadline exceeded during shutdown")
         if self.enabled and not self._expired and not self._stopping_notified:
-            notify("STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining")
+            stopping_message = (
+                "STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining"
+            )
+            sent = notify(stopping_message)
+            sent_at = time.monotonic()
+            if sent:
+                self._last_heartbeat_at = sent_at
             self._stopping_notified = True
             interval = max(0.1, (self.interval_seconds or 1.0) / 2.0)
+            initial_delay = (
+                interval
+                if sent
+                else self._retry_delay(now=sent_at, cadence=interval)
+            )
 
             def _feed_during_shutdown() -> None:
                 # The process-wide shutdown watchdog remains the hard bound.
                 # This cap merely prevents a leaked daemon from running forever
                 # if a caller invokes stop() outside process teardown.
                 deadline = time.monotonic() + 900.0
+                delay = initial_delay
                 while time.monotonic() < deadline:
-                    time.sleep(interval)
-                    notify("WATCHDOG=1")
+                    time.sleep(delay)
+                    now = time.monotonic()
+                    last_heartbeat_at = self._last_heartbeat_at
+                    watchdog_interval = self.interval_seconds
+                    if (
+                        last_heartbeat_at is not None
+                        and watchdog_interval is not None
+                        and now - last_heartbeat_at >= watchdog_interval
+                    ):
+                        self._unhealthy = True
+                        self._expired = True
+                        notify(
+                            "STATUS=watchdog expired: hard deadline exceeded "
+                            "during shutdown"
+                        )
+                        return
+                    if notify("WATCHDOG=1"):
+                        self._last_heartbeat_at = now
+                        delay = interval
+                    else:
+                        delay = self._retry_delay(now=now, cadence=interval)
 
             self._shutdown_keepalive = threading.Thread(
                 target=_feed_during_shutdown,

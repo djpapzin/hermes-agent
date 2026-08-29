@@ -71,12 +71,19 @@ def _queue_admission_event(payload: dict) -> None:
     if not _admission_writer_started:
         with _admission_writer_lock:
             if not _admission_writer_started:
-                threading.Thread(
-                    target=_admission_event_writer,
-                    args=(_admission_event_queue,),
-                    name="hermes-admission-events",
-                    daemon=True,
-                ).start()
+                try:
+                    threading.Thread(
+                        target=_admission_event_writer,
+                        args=(_admission_event_queue,),
+                        name="hermes-admission-events",
+                        daemon=True,
+                    ).start()
+                except Exception as exc:
+                    logger.warning(
+                        "Could not start admission evidence writer; dropping event: %s",
+                        exc,
+                    )
+                    return
                 _admission_writer_started = True
     try:
         _admission_event_queue.put_nowait(record)

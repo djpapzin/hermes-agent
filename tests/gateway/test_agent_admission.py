@@ -88,6 +88,35 @@ def test_admission_timestamp_is_captured_before_queueing(monkeypatch):
     }
 
 
+@pytest.mark.asyncio
+async def test_admission_writer_start_failure_does_not_strand_slot(monkeypatch):
+    event_queue = queue.Queue(maxsize=1)
+
+    class UnstartableThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("cannot start new thread")
+
+    monkeypatch.setattr(admission_module, "_admission_event_queue", event_queue)
+    monkeypatch.setattr(admission_module, "_admission_writer_started", False)
+    monkeypatch.setattr(admission_module.threading, "Thread", UnstartableThread)
+
+    controller = AgentAdmissionController(
+        max_parallel=1,
+        queue_limit=1,
+        memory_reader=lambda: 4096,
+    )
+    await controller.acquire("task-1")
+    assert controller.snapshot().active == 1
+    await controller.release("task-1")
+
+    assert event_queue.empty()
+    assert admission_module._admission_writer_started is False
+    assert controller.snapshot().active == 0
+
+
 def test_cgroup_headroom_uses_memory_max_minus_current(tmp_path):
     cgroup_file = tmp_path / "cgroup"
     cgroup_file.write_text("0::/system.slice/hermes.service\n", encoding="utf-8")

@@ -247,6 +247,43 @@ async def test_shutdown_rechecks_expired_heartbeat_before_stopping_notify(monkey
 
 
 @pytest.mark.asyncio
+async def test_failed_stopping_notify_retries_inside_remaining_deadline(monkeypatch):
+    calls: list[str] = []
+    captured_target = None
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    class CapturingThread:
+        def __init__(self, *, target, **_kwargs):
+            nonlocal captured_target
+            captured_target = target
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(
+        notify_mod, "notify", lambda message: calls.append(message) or False
+    )
+    monkeypatch.setattr(notify_mod.threading, "Thread", CapturingThread)
+    watchdog = notify_mod.SystemdWatchdog()
+    watchdog._last_heartbeat_at = notify_mod.time.monotonic() - 0.95
+
+    await watchdog.stop()
+
+    assert calls == ["STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining"]
+    assert captured_target is not None
+    closure = dict(
+        zip(
+            captured_target.__code__.co_freevars,
+            (cell.cell_contents for cell in captured_target.__closure__),
+        )
+    )
+    assert 0 < closure["initial_delay"] < 0.05
+
+
+@pytest.mark.asyncio
 async def test_watchdog_sends_ready_heartbeat_and_stopping(monkeypatch):
     calls: list[str] = []
     monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
