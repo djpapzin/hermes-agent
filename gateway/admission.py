@@ -59,6 +59,13 @@ def _installed_gateway_admission() -> tuple[
         return _gateway_controller, _gateway_loop
 
 
+def notify_gateway_admission_changed() -> None:
+    """Refresh gateway status after a surface releases its own bookkeeping."""
+    controller, _loop = _installed_gateway_admission()
+    if controller is not None:
+        controller._notify_change()
+
+
 def _decorated_task_id(
     prefix: str,
     id_kwargs: tuple[str, ...],

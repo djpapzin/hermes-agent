@@ -2125,11 +2125,13 @@ class ProcessRegistry:
             return any(not s.exited for s in self._running.values())
 
     def kill_all(self, task_id: str = None) -> int:
-        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+        """Kill running processes and reap populated scopes from exited launchers."""
         with self._lock:
             targets = [
-                s for s in self._running.values()
-                if (task_id is None or s.task_id == task_id) and not s.exited
+                s
+                for s in (*self._running.values(), *self._finished.values())
+                if (task_id is None or s.task_id == task_id)
+                and (not s.exited or bool(s.systemd_unit))
             ]
 
         killed = 0

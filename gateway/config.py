@@ -872,7 +872,7 @@ class GatewayConfig:
     max_concurrent_sessions: Optional[int] = None  # Positive int caps simultaneous active chat sessions
     max_concurrent_session_wait_seconds: Optional[int] = None  # Wait for capacity before returning a busy response
     max_parallel_agents: Optional[int] = 3
-    min_host_memory_headroom_mb: int = 2048
+    min_host_memory_headroom_mb: int = 0
     agent_queue_limit: int = 16
     admission_poll_interval_seconds: float = 2.0
 
@@ -1134,10 +1134,10 @@ class GatewayConfig:
         )
         try:
             min_host_memory_headroom_mb = max(
-                0, int(admission.get("min_host_memory_headroom_mb", 2048) or 0)
+                0, int(admission.get("min_host_memory_headroom_mb", 0) or 0)
             )
         except (TypeError, ValueError):
-            min_host_memory_headroom_mb = 2048
+            min_host_memory_headroom_mb = 0
         try:
             agent_queue_limit = max(0, int(admission.get("queue_limit", 16)))
         except (TypeError, ValueError):

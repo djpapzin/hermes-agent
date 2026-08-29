@@ -4489,6 +4489,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return 0
 
+    def _active_admission_handoff_count(self) -> int:
+        """Count admitted chat turns not yet registered in ``_running_agents``."""
+        try:
+            admission = getattr(self, "_agent_admission", None)
+            if admission is None:
+                return 0
+            running = getattr(self, "_running_agents", {})
+            return sum(
+                1
+                for task_id in admission.snapshot().active_task_ids
+                if not task_id.startswith(("api:", "cron:", "background:"))
+                and task_id not in running
+            )
+        except Exception:
+            return 0
+
     def _active_work_count(self) -> int:
         """All agent work the gateway must expose and drain as one total."""
         return (
@@ -4496,6 +4512,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + self._active_background_agent_count()
+            + self._active_admission_handoff_count()
         )
 
     def _active_cron_job_count(self) -> int:
@@ -5702,6 +5719,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         while time.monotonic() < deadline:
             await asyncio.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+            if getattr(self, "_draining", False) or (
+                getattr(self, "_shutdown_event", None) is not None
+                and self._shutdown_event.is_set()
+            ):
+                return None, (
+                    "Gateway is draining existing work; this queued request "
+                    "was not started. Please resend after it reconnects."
+                )
             lease, limit_message = self._claim_active_session_slot(session_key, source)
             if limit_message is None:
                 logger.info("Dequeued active session %s after capacity became available", session_key)
@@ -6261,22 +6286,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_cron_count = self._active_cron_job_count()
         last_api_count = self._active_api_run_count()
         last_background_count = self._active_background_agent_count()
+        last_handoff_count = self._active_admission_handoff_count()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
             nonlocal last_active_count, last_cron_count, last_api_count
-            nonlocal last_background_count, last_status_at
+            nonlocal last_background_count, last_handoff_count, last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
             cron_count = self._active_cron_job_count()
             api_count = self._active_api_run_count()
             background_count = self._active_background_agent_count()
+            handoff_count = self._active_admission_handoff_count()
             if (
                 force
                 or active_count != last_active_count
                 or cron_count != last_cron_count
                 or api_count != last_api_count
                 or background_count != last_background_count
+                or handoff_count != last_handoff_count
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
@@ -6284,6 +6312,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 last_cron_count = cron_count
                 last_api_count = api_count
                 last_background_count = background_count
+                last_handoff_count = handoff_count
                 last_status_at = now
 
         # Cron jobs run on the scheduler's own thread pool, outside
@@ -6297,6 +6326,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and last_cron_count == 0
             and last_api_count == 0
             and last_background_count == 0
+            and last_handoff_count == 0
         ):
             _maybe_update_status(force=True)
             return snapshot, False
@@ -6312,6 +6342,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 or self._active_cron_job_count()
                 or self._active_api_run_count()
                 or self._active_background_agent_count()
+                or self._active_admission_handoff_count()
             )
             and asyncio.get_running_loop().time() < deadline
         ):
@@ -6322,6 +6353,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or bool(self._active_cron_job_count())
             or bool(self._active_api_run_count())
             or bool(self._active_background_agent_count())
+            or bool(self._active_admission_handoff_count())
         )
         _maybe_update_status(force=True)
         return snapshot, timed_out
@@ -11620,6 +11652,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _quick_key,
             )
             return _limit_message
+        if getattr(self, "_draining", False) or (
+            getattr(self, "_shutdown_event", None) is not None
+            and self._shutdown_event.is_set()
+        ):
+            if _active_session_lease is not None:
+                try:
+                    _active_session_lease.release()
+                except Exception:
+                    logger.debug(
+                        "Failed to release active session slot during shutdown",
+                        exc_info=True,
+                    )
+            if _admission_acquired:
+                await _admission.release(_quick_key, outcome="shutdown_handoff")
+                self._persist_active_agents()
+            return (
+                "Gateway is draining existing work; this queued request was "
+                "not started. Please resend after it reconnects."
+            )
         if _active_session_lease is not None:
             if not hasattr(self, "_active_session_leases"):
                 self._active_session_leases = {}

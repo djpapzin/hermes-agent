@@ -319,7 +319,7 @@ class TestGatewayConfigRoundtrip:
     def test_admission_defaults_are_bounded(self):
         config = GatewayConfig.from_dict({})
         assert config.max_parallel_agents == 3
-        assert config.min_host_memory_headroom_mb == 2048
+        assert config.min_host_memory_headroom_mb == 0
         assert config.agent_queue_limit == 16
 
     def test_admission_config_roundtrip(self):

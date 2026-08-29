@@ -735,6 +735,9 @@ def _admit_api_agent_request(handler):
             if reservation["active"]:
                 reservation["active"] = False
                 self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+                from gateway.admission import notify_gateway_admission_changed
+
+                notify_gateway_admission_changed()
             _api_agent_request_reservation.reset(token)
 
     return _wrapped
@@ -745,6 +748,9 @@ def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
     if reservation["active"]:
         reservation["active"] = False
         adapter._pending_agent_requests = max(0, adapter._pending_agent_requests - 1)
+        from gateway.admission import notify_gateway_admission_changed
+
+        notify_gateway_admission_changed()
 
 
 @contextmanager
@@ -4760,6 +4766,9 @@ class APIServerAdapter(BasePlatformAdapter):
             return await loop.run_in_executor(None, _run)
         finally:
             self._inflight_agent_runs -= 1
+            from gateway.admission import notify_gateway_admission_changed
+
+            notify_gateway_admission_changed()
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming

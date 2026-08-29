@@ -307,6 +307,25 @@ async def test_drain_active_agents_throttles_status_updates():
 
 
 @pytest.mark.asyncio
+async def test_drain_waits_for_admitted_chat_before_running_agent_registration():
+    runner, _adapter = make_restart_runner()
+    runner._update_runtime_status = MagicMock()
+    runner._agent_admission._memory_reader = lambda: 8192
+    task_id = "agent:main:telegram:dm:handoff"
+    await runner._agent_admission.acquire(task_id)
+
+    drain = asyncio.create_task(runner._drain_active_agents(1.0))
+    await asyncio.sleep(0.05)
+
+    assert runner._active_admission_handoff_count() == 1
+    assert not drain.done()
+
+    await runner._agent_admission.release(task_id)
+    _snapshot, timed_out = await drain
+    assert timed_out is False
+
+
+@pytest.mark.asyncio
 async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on_timeout(monkeypatch):
     """On drain timeout, tool subprocesses must be killed BEFORE adapter
     disconnect so systemd's TimeoutStopSec doesn't SIGKILL the cgroup with

@@ -4038,6 +4038,9 @@ def tick(
                 finally:
                     with _running_lock:
                         _running_job_ids.discard(j["id"])
+                    from gateway.admission import notify_gateway_admission_changed
+
+                    notify_gateway_admission_changed()
 
             try:
                 return pool.submit(_run_and_release)
