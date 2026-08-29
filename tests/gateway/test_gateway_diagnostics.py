@@ -152,66 +152,86 @@ def test_admission_file_events_are_byte_and_count_bounded(tmp_path):
     assert "outside-tail" not in str(events)
 
 
-def test_diagnostic_reads_dedicated_allowlisted_shutdown_events(
-    tmp_path, monkeypatch
-):
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    (logs / "gateway.log").write_text(
-        'Shutdown context: {"signal":"forged","secret":"chat-content"}\n',
-        encoding="utf-8",
-    )
-    state = tmp_path / "state"
-    state.mkdir()
-    (state / "gateway-shutdown-events.jsonl").write_text(
-        '{"event":"gateway_shutdown","ts":123,"signal":"SIGTERM",'
-        '"shutdown_reason":"planned_stop","active_task_ids":["task-1"],'
-        '"parent":{"pid":1,"name":"systemd","secret":"nested-secret"},'
-        '"cgroup":{"path":"/gateway","memory_events":{"oom":0,'
-        '"secret":"nested-cgroup-secret"}},"secret":"must-not-copy"}\n',
-        encoding="utf-8",
-    )
+def test_diagnostic_reads_manager_attested_allowlisted_shutdown_event(monkeypatch):
+    payload = {
+        "event": "gateway_shutdown",
+        "pid": 123,
+        "ts": 123,
+        "signal": "SIGTERM",
+        "shutdown_reason": "planned_stop",
+        "active_task_ids": ["task-1"],
+        "parent": {"pid": 1, "name": "systemd", "secret": "nested-secret"},
+        "cgroup": {
+            "path": "/gateway",
+            "memory_events": {"oom": 0, "secret": "nested-cgroup-secret"},
+        },
+        "secret": "must-not-copy",
+    }
+    row = {
+        "__REALTIME_TIMESTAMP": "456",
+        "_PID": "123",
+        "_TRANSPORT": "journal",
+        "_SYSTEMD_UNIT": "hermes-gateway.service",
+        "SYSLOG_IDENTIFIER": "hermes-shutdown-forensics",
+        "HERMES_EVENT": "gateway_shutdown",
+        "MESSAGE": "HERMES_SHUTDOWN " + json.dumps(payload),
+    }
     monkeypatch.setattr(
-        "scripts.hermes_gateway_diagnostics._service_identity",
-        lambda _unit, _manager: (None, None),
+        diagnostics.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 0, json.dumps(row) + "\n", ""
+        ),
     )
 
-    result = collect(hermes_home=tmp_path)
+    events = diagnostics._bounded_shutdown_journal(
+        "hermes-gateway.service", 30, "system"
+    )
 
-    assert result["shutdown_events"] == [
+    assert events == [
         {
-            "event": "gateway_shutdown",
-            "ts": 123,
-            "signal": "SIGTERM",
-            "shutdown_reason": "planned_stop",
-            "parent": {"pid": 1, "name": "systemd"},
-            "active_task_ids": ["task-1"],
-            "cgroup": {"path": "/gateway", "memory_events": {"oom": 0}},
+            "timestamp_realtime_usec": "456",
+            "unit": "hermes-gateway.service",
+            "event": {
+                "event": "gateway_shutdown",
+                "pid": 123,
+                "ts": 123,
+                "signal": "SIGTERM",
+                "shutdown_reason": "planned_stop",
+                "parent": {"pid": 1, "name": "systemd"},
+                "active_task_ids": ["task-1"],
+                "cgroup": {"path": "/gateway", "memory_events": {"oom": 0}},
+            },
         }
     ]
-    assert "chat-content" not in str(result)
-    assert "must-not-copy" not in str(result)
-    assert "nested-secret" not in str(result)
-    assert "nested-cgroup-secret" not in str(result)
+    assert "must-not-copy" not in str(events)
+    assert "nested-secret" not in str(events)
+    assert "nested-cgroup-secret" not in str(events)
 
 
-def test_shutdown_file_events_are_byte_and_count_bounded(tmp_path):
-    log = tmp_path / "gateway-shutdown-events.jsonl"
-    rows = ['{"event":"gateway_shutdown","signal":"outside-tail"}']
-    rows.append("untrusted-prefix-" + ("x" * (70 * 1024)))
-    rows.extend(
-        f'{{"event":"gateway_shutdown","ts":{index},"signal":"SIGTERM"}}'
-        for index in range(101)
+def test_shutdown_journal_rejects_same_uid_worker_scope_forgery(monkeypatch):
+    payload = {"event": "gateway_shutdown", "pid": 999, "signal": "forged"}
+    forged = {
+        "__REALTIME_TIMESTAMP": "456",
+        "_PID": "999",
+        "_UID": "996",
+        "_TRANSPORT": "journal",
+        "_SYSTEMD_UNIT": "hermes-worker-forged.scope",
+        "SYSLOG_IDENTIFIER": "hermes-shutdown-forensics",
+        "HERMES_EVENT": "gateway_shutdown",
+        "MESSAGE": "HERMES_SHUTDOWN " + json.dumps(payload),
+    }
+    monkeypatch.setattr(
+        diagnostics.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 0, json.dumps(forged) + "\n", ""
+        ),
     )
-    log.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
-    events = diagnostics._bounded_shutdown_events(log, max_bytes=64 * 1024)
-
-    assert len(events) == 100
-    assert events[0]["ts"] == 1
-    assert events[-1]["ts"] == 100
-    assert "untrusted-prefix" not in str(events)
-    assert "outside-tail" not in str(events)
+    assert diagnostics._bounded_shutdown_journal(
+        "hermes-gateway.service", 30, "system"
+    ) == []
 
 
 def test_diagnostic_scans_orphan_worker_when_gateway_is_absent(tmp_path, monkeypatch):
@@ -261,11 +281,16 @@ def test_diagnostic_defaults_to_active_profile_home(tmp_path, monkeypatch, capsy
         "_bounded_incident_journal",
         lambda _unit, _since, manager: journal_managers.append(manager) or [],
     )
+    monkeypatch.setattr(
+        diagnostics,
+        "_bounded_shutdown_journal",
+        lambda _unit, _since, manager: journal_managers.append(manager) or [],
+    )
     monkeypatch.setattr("sys.argv", ["hermes_gateway_diagnostics.py"])
 
     assert diagnostics.main() == 0
     assert seen == [(tmp_path, "auto")]
-    assert journal_managers == ["user"]
+    assert journal_managers == ["user", "user"]
     capsys.readouterr()
 
 

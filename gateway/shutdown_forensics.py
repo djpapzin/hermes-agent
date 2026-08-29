@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import os
 import signal
-import stat
+import socket
 import subprocess
 import sys
 import time
@@ -28,9 +28,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-_SHUTDOWN_EVENT_MAX_BYTES = 512 * 1024
 _SHUTDOWN_EVENT_MAX_RECORD_BYTES = 16 * 1024
-_SHUTDOWN_EVENT_FILENAME = "gateway-shutdown-events.jsonl"
+_JOURNAL_SOCKET = "/run/systemd/journal/socket"
+_SHUTDOWN_MESSAGE_PREFIX = "HERMES_SHUTDOWN "
 
 
 _SIGNAL_NAME_BY_NUM: Dict[int, str] = {}
@@ -347,42 +347,64 @@ def _shutdown_event_record(ctx: Dict[str, Any]) -> Dict[str, Any]:
     return event
 
 
-def persist_shutdown_context(ctx: Dict[str, Any], hermes_home: Path) -> bool:
-    """Best-effort append of one bounded, allowlisted shutdown record.
-
-    This is deliberately a single small local write: no subprocess, fsync, or
-    mixed gateway log parsing occurs on the signal-handler path. The current
-    file is rotated before it exceeds the fixed storage bound.
-    """
-    try:
-        state_dir = Path(hermes_home) / "state"
-        state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        path = state_dir / _SHUTDOWN_EVENT_FILENAME
-        previous = state_dir / f"{_SHUTDOWN_EVENT_FILENAME}.previous"
-        record = json.dumps(
-            _shutdown_event_record(ctx),
+def _encoded_shutdown_event(ctx: Dict[str, Any]) -> bytes:
+    """Serialize an allowlisted event, shrinking lists to the fixed cap."""
+    event = _shutdown_event_record(ctx)
+    list_fields = ("active_task_ids", "queued_task_ids", "worker_pids")
+    original_lengths = {
+        key: (
+            len(ctx.get(key))
+            if isinstance(ctx.get(key), (list, tuple))
+            else len(event.get(key) or [])
+        )
+        for key in list_fields
+    }
+    while True:
+        for key in list_fields:
+            omitted = original_lengths[key] - len(event.get(key) or [])
+            event[f"{key}_omitted"] = omitted
+        payload = json.dumps(
+            event,
             separators=(",", ":"),
             sort_keys=True,
-        ).encode("utf-8") + b"\n"
-        if len(record) > min(
-            _SHUTDOWN_EVENT_MAX_RECORD_BYTES, _SHUTDOWN_EVENT_MAX_BYTES
-        ):
-            return False
-        if path.exists():
-            file_stat = path.stat(follow_symlinks=False)
-            if not stat.S_ISREG(file_stat.st_mode):
-                return False
-            if file_stat.st_size + len(record) > _SHUTDOWN_EVENT_MAX_BYTES:
-                os.replace(path, previous)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            return os.write(fd, record) == len(record)
-        finally:
-            os.close(fd)
-    except (OSError, TypeError, ValueError):
+        ).encode("utf-8")
+        if len(payload) <= _SHUTDOWN_EVENT_MAX_RECORD_BYTES:
+            return payload
+        longest = max(
+            list_fields,
+            key=lambda key: len(event.get(key) or []),
+        )
+        values = event.get(longest)
+        if not values:
+            # All variable-length lists are empty and every text field is
+            # already bounded, so this is a defensive last resort only.
+            return b'{"event":"gateway_shutdown","record_truncated":true}'
+        values.pop()
+
+
+def emit_shutdown_context(ctx: Dict[str, Any]) -> bool:
+    """Emit one authenticated native-journal event without blocking the loop.
+
+    journald attaches trusted PID/cgroup/unit metadata to the datagram. The
+    diagnostic requires that metadata and payload PID to agree, separating the
+    gateway from same-UID workers in independent systemd scopes.
+    """
+    try:
+        payload = _encoded_shutdown_event(ctx)
+        message = b"\n".join(
+            (
+                b"MESSAGE=" + _SHUTDOWN_MESSAGE_PREFIX.encode("ascii") + payload,
+                b"PRIORITY=4",
+                b"SYSLOG_IDENTIFIER=hermes-shutdown-forensics",
+                b"HERMES_EVENT=gateway_shutdown",
+            )
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sender:
+            sender.setblocking(False)
+            sender.connect(_JOURNAL_SOCKET)
+            sender.send(message)
+        return True
+    except (OSError, TypeError, ValueError, UnicodeError):
         return False
 
 

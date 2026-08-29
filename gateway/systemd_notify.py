@@ -184,9 +184,22 @@ class SystemdWatchdog:
             while not self._stopping:
                 await asyncio.sleep(max(0.0, scheduled_at - loop.time()))
                 now = loop.time()
-                self.record_tick(scheduled_at=scheduled_at, now=now)
+                sent = self.record_tick(scheduled_at=scheduled_at, now=now)
                 if self._expired:
                     return
+                if not sent:
+                    last_success = self._last_heartbeat_at
+                    remaining = (
+                        interval - (now - last_success)
+                        if last_success is not None
+                        else cadence
+                    )
+                    retry_delay = max(
+                        0.01,
+                        min(cadence / 4.0, max(0.01, remaining / 2.0)),
+                    )
+                    scheduled_at = now + retry_delay
+                    continue
                 scheduled_at += cadence
                 if scheduled_at < now:
                     scheduled_at = now + cadence
@@ -214,7 +227,7 @@ class SystemdWatchdog:
             except Exception:
                 pass
         self._task = None
-        if self.enabled and not self._stopping_notified:
+        if self.enabled and not self._expired and not self._stopping_notified:
             notify("STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining")
             self._stopping_notified = True
             interval = max(0.1, (self.interval_seconds or 1.0) / 2.0)

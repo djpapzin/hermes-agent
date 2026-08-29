@@ -23045,7 +23045,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         try:
             from gateway.shutdown_forensics import (
                 format_context_for_log,
-                persist_shutdown_context,
+                emit_shutdown_context,
                 snapshot_shutdown_context,
                 spawn_async_diagnostic,
             )
@@ -23110,10 +23110,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # is one line, key=value, parent_cmdline last (often long).
         if _shutdown_ctx is not None:
             try:
-                if not persist_shutdown_context(_shutdown_ctx, _hermes_home):
+                if not emit_shutdown_context(_shutdown_ctx):
                     logger.warning("Structured shutdown context was not persisted")
             except Exception as _e:
-                logger.debug("persist_shutdown_context failed: %s", _e)
+                logger.debug("emit_shutdown_context failed: %s", _e)
             try:
                 logger.warning(
                     "Shutdown context: %s", format_context_for_log(_shutdown_ctx)

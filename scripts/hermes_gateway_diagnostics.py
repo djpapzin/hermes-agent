@@ -40,7 +40,7 @@ _ADMISSION_EVENT_FIELDS = (
     "min_headroom_mb",
 )
 _ADMISSION_LOG_TAIL_BYTES = 512 * 1024
-_SHUTDOWN_LOG_TAIL_BYTES = 512 * 1024
+_SHUTDOWN_MESSAGE_PREFIX = "HERMES_SHUTDOWN "
 
 _SHUTDOWN_SCALAR_FIELDS = (
     "event",
@@ -334,74 +334,133 @@ def _bounded_admission_events(
     return events[-100:]
 
 
-def _bounded_shutdown_events(
-    path: Path, *, max_bytes: int = _SHUTDOWN_LOG_TAIL_BYTES
-) -> list[dict[str, Any]]:
-    """Read allowlisted records from the dedicated shutdown JSONL tail."""
-    try:
-        with path.open("rb") as handle:
-            handle.seek(0, 2)
-            size = handle.tell()
-            start = max(0, size - max(1, max_bytes))
-            handle.seek(start)
-            raw = handle.read(max(1, max_bytes))
-    except OSError:
-        return []
-    lines = raw.decode("utf-8", errors="replace").splitlines()
-    if start:
-        lines = lines[1:]
-    events: list[dict[str, Any]] = []
-    for line in lines:
-        try:
-            payload = json.loads(line)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(payload, dict) or payload.get("event") != "gateway_shutdown":
-            continue
-        event = {
-            key: payload[key]
-            for key in _SHUTDOWN_SCALAR_FIELDS
-            if key in payload
+def _safe_shutdown_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Recursively allowlist a previously authenticated shutdown payload."""
+    event = {
+        key: payload[key]
+        for key in _SHUTDOWN_SCALAR_FIELDS
+        if key in payload
+    }
+    for key in (
+        "active_task_ids",
+        "queued_task_ids",
+        "worker_pids",
+        "active_task_ids_omitted",
+        "queued_task_ids_omitted",
+        "worker_pids_omitted",
+    ):
+        value = payload.get(key)
+        if key.endswith("_omitted") and isinstance(value, int):
+            event[key] = value
+        elif key == "worker_pids" and isinstance(value, list):
+            event[key] = [item for item in value[:100] if isinstance(item, int)]
+        elif isinstance(value, list):
+            event[key] = [str(item)[:160] for item in value[:100]]
+    parent = payload.get("parent")
+    if isinstance(parent, dict):
+        event["parent"] = {
+            key: parent[key]
+            for key in ("pid", "ppid", "name", "state", "uid")
+            if key in parent
         }
-        for key in ("active_task_ids", "queued_task_ids"):
-            values = payload.get(key)
-            if isinstance(values, list):
-                event[key] = [str(value)[:160] for value in values[:100]]
-        worker_pids = payload.get("worker_pids")
-        if isinstance(worker_pids, list):
-            event["worker_pids"] = [
-                value for value in worker_pids[:100] if isinstance(value, int)
-            ]
-        parent = payload.get("parent")
-        if isinstance(parent, dict):
-            event["parent"] = {
-                key: parent[key]
-                for key in ("pid", "ppid", "name", "state", "uid")
-                if key in parent
+    cgroup = payload.get("cgroup")
+    if isinstance(cgroup, dict):
+        safe_cgroup = {
+            key: cgroup[key]
+            for key in ("path", "memory_current", "memory_high", "memory_max")
+            if key in cgroup
+        }
+        memory_events = cgroup.get("memory_events")
+        if isinstance(memory_events, dict):
+            safe_cgroup["memory_events"] = {
+                key: memory_events[key]
+                for key in (
+                    "low",
+                    "high",
+                    "max",
+                    "oom",
+                    "oom_kill",
+                    "oom_group_kill",
+                )
+                if key in memory_events
             }
-        cgroup = payload.get("cgroup")
-        if isinstance(cgroup, dict):
-            safe_cgroup = {
-                key: cgroup[key]
-                for key in ("path", "memory_current", "memory_high", "memory_max")
-                if key in cgroup
-            }
-            memory_events = cgroup.get("memory_events")
-            if isinstance(memory_events, dict):
-                safe_cgroup["memory_events"] = {
-                    key: memory_events[key]
-                    for key in (
-                        "low",
-                        "high",
-                        "max",
-                        "oom",
-                        "oom_kill",
-                        "oom_group_kill",
-                    )
-                    if key in memory_events
+        event["cgroup"] = safe_cgroup
+    return event
+
+
+def _bounded_shutdown_journal(
+    unit: str, since_minutes: int, manager: str = "auto"
+) -> list[dict[str, Any]]:
+    """Return manager-attested native-journal shutdown records."""
+    commands: list[tuple[list[str], str]] = []
+    if manager in {"auto", "system"}:
+        commands.append((["journalctl", "--unit", unit], "system"))
+    if manager in {"auto", "user"}:
+        commands.append((["journalctl", "--user-unit", unit], "user"))
+    events: list[dict[str, Any]] = []
+    for base, source in commands:
+        try:
+            result = subprocess.run(
+                [
+                    *base,
+                    "--since",
+                    f"{max(1, since_minutes)} minutes ago",
+                    "-n",
+                    "300",
+                    "-o",
+                    "json",
+                    "--no-pager",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        for line in result.stdout.splitlines():
+            try:
+                row = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            message = str(row.get("MESSAGE") or "")
+            if not message.startswith(_SHUTDOWN_MESSAGE_PREFIX):
+                continue
+            trusted_unit = (
+                row.get("_SYSTEMD_UNIT") == unit
+                if source == "system"
+                else row.get("_SYSTEMD_USER_UNIT") == unit
+            )
+            if not (
+                trusted_unit
+                and row.get("_TRANSPORT") == "journal"
+                and row.get("SYSLOG_IDENTIFIER") == "hermes-shutdown-forensics"
+                and row.get("HERMES_EVENT") == "gateway_shutdown"
+            ):
+                continue
+            try:
+                payload = json.loads(message[len(_SHUTDOWN_MESSAGE_PREFIX):])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict) or payload.get("event") != "gateway_shutdown":
+                continue
+            row_pid = str(row.get("_PID") or "")
+            if not row_pid.isdigit() or payload.get("pid") != int(row_pid):
+                continue
+            events.append(
+                {
+                    "timestamp_realtime_usec": str(
+                        row.get("__REALTIME_TIMESTAMP") or ""
+                    ),
+                    "unit": unit,
+                    "event": _safe_shutdown_payload(payload),
                 }
-            event["cgroup"] = safe_cgroup
-        events.append(event)
+            )
+    events.sort(
+        key=lambda event: int(event["timestamp_realtime_usec"])
+        if event["timestamp_realtime_usec"].isdigit()
+        else -1
+    )
     return events[-100:]
 
 
@@ -525,9 +584,6 @@ def collect(
     result["admission_events"] = _bounded_admission_events(
         hermes_home / "state" / "admission-events.jsonl"
     )
-    result["shutdown_events"] = _bounded_shutdown_events(
-        hermes_home / "state" / "gateway-shutdown-events.jsonl"
-    )
     return result
 
 
@@ -540,6 +596,9 @@ def main() -> int:
     args = parser.parse_args()
     result = collect(args.unit, args.hermes_home, manager=args.manager)
     result["incident_events"] = _bounded_incident_journal(
+        args.unit, args.since_minutes, result.get("service_manager", args.manager)
+    )
+    result["shutdown_events"] = _bounded_shutdown_journal(
         args.unit, args.since_minutes, result.get("service_manager", args.manager)
     )
     print(json.dumps(result, indent=2, sort_keys=True))

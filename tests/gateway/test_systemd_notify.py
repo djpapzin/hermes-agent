@@ -172,17 +172,40 @@ async def test_watchdog_sampler_retries_after_transient_notify_failure(monkeypat
 
     def send(message: str) -> bool:
         calls.append(message)
-        return len(calls) != 1
+        # READY succeeds, the first periodic heartbeat fails, and the retry
+        # succeeds before the manager's deadline.
+        return len(calls) != 2
 
     monkeypatch.setattr(notify_mod, "notify", send)
     watchdog = notify_mod.SystemdWatchdog(lag_tolerance_seconds=1.0)
 
     assert watchdog.start() is True
-    await asyncio.sleep(0.13)
+    assert watchdog.ready() is True
+    await asyncio.sleep(0.09)
     await watchdog.stop()
 
     heartbeat_calls = [call for call in calls if call.startswith("WATCHDOG=1")]
     assert len(heartbeat_calls) >= 2
+    assert not any(call.startswith("STATUS=watchdog expired") for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_expired_watchdog_shutdown_does_not_rearm_manager(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    monkeypatch.setattr(
+        notify_mod, "notify", lambda message: calls.append(message) or True
+    )
+    watchdog = notify_mod.SystemdWatchdog()
+    watchdog._expired = True
+
+    await watchdog.stop()
+
+    assert calls == []
 
 
 @pytest.mark.asyncio
