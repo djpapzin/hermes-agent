@@ -178,11 +178,18 @@ def _cleanup_scope_environment_when_done(process: Any, argv: List[str]) -> None:
                 return
             time.sleep(0.05)
 
-    threading.Thread(
-        target=cleanup,
-        daemon=True,
-        name="hermes-worker-env-cleanup",
-    ).start()
+    try:
+        threading.Thread(
+            target=cleanup,
+            daemon=True,
+            name="hermes-worker-env-cleanup",
+        ).start()
+    except Exception as exc:
+        logger.warning(
+            "Could not start worker environment cleanup watcher; "
+            "startup remains tracked: %s",
+            exc,
+        )
 
 
 def _cleanup_orphaned_worker_environments() -> None:
@@ -357,9 +364,11 @@ def _worker_scope_backend() -> Optional[str]:
 
 def _is_supervised_gateway_process() -> bool:
     try:
-        from gateway.runtime_identity import is_gateway_control_plane_process
+        from gateway.runtime_identity import (
+            is_systemd_gateway_control_plane_process,
+        )
 
-        return is_gateway_control_plane_process()
+        return is_systemd_gateway_control_plane_process()
     except Exception as exc:
         logger.debug("Could not read gateway control-plane identity: %s", exc)
         return False

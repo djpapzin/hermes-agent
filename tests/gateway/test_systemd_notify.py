@@ -297,18 +297,18 @@ def test_failed_stopping_notify_retries_full_stopping_payload(monkeypatch):
         lambda message: calls.append(message) or next(outcomes),
     )
     watchdog = notify_mod.SystemdWatchdog()
-    watchdog._last_heartbeat_at = 10.0
+    watchdog._last_heartbeat_at = notify_mod.time.monotonic()
 
     confirmed, _ = watchdog._send_shutdown_heartbeat(
-        stopping_confirmed=False, now=10.5, cadence=0.5
+        stopping_confirmed=False, cadence=0.5
     )
     assert confirmed is False
     confirmed, _ = watchdog._send_shutdown_heartbeat(
-        stopping_confirmed=confirmed, now=10.6, cadence=0.5
+        stopping_confirmed=confirmed, cadence=0.5
     )
     assert confirmed is True
     watchdog._send_shutdown_heartbeat(
-        stopping_confirmed=confirmed, now=10.7, cadence=0.5
+        stopping_confirmed=confirmed, cadence=0.5
     )
 
     assert calls[:2] == [
@@ -316,6 +316,31 @@ def test_failed_stopping_notify_retries_full_stopping_payload(monkeypatch):
         "STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining",
     ]
     assert calls[2] == "WATCHDOG=1"
+
+
+def test_shutdown_send_helper_refuses_expired_watchdog_rearm(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    monkeypatch.setattr(
+        notify_mod, "notify", lambda message: calls.append(message) or True
+    )
+    watchdog = notify_mod.SystemdWatchdog()
+    watchdog._last_heartbeat_at = notify_mod.time.monotonic() - 1.0
+
+    watchdog._send_shutdown_heartbeat(
+        stopping_confirmed=False,
+        cadence=0.5,
+    )
+
+    assert watchdog._expired is True
+    assert calls == [
+        "STATUS=watchdog expired: hard deadline exceeded during shutdown"
+    ]
+    assert not any("WATCHDOG=1" in call for call in calls)
 
 
 @pytest.mark.asyncio

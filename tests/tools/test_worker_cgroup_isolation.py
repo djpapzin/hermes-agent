@@ -145,6 +145,33 @@ def test_failed_launcher_removes_private_environment_payload(monkeypatch, tmp_pa
     assert not payload.exists()
 
 
+def test_cleanup_thread_start_failure_is_best_effort(monkeypatch, tmp_path):
+    import tools.process_registry as pr
+
+    wrapper = tmp_path / "hermes-worker-scope"
+    wrapper.touch()
+    payload = tmp_path / "payload.json"
+    payload.write_text('{"TOKEN": "secret"}', encoding="utf-8")
+    monkeypatch.setattr(pr, "_SYSTEM_SCOPE_WRAPPER", wrapper)
+    argv = [
+        "/usr/bin/sudo", "-n", str(wrapper), "run", "scope", "67108864",
+        str(payload), "--", "/bin/true",
+    ]
+
+    class UnstartableThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("cannot start new thread")
+
+    monkeypatch.setattr(pr.threading, "Thread", UnstartableThread)
+
+    pr._cleanup_scope_environment_when_done(object(), argv)
+
+    assert payload.exists()
+
+
 def test_gateway_startup_removes_dead_creator_payload(monkeypatch, tmp_path):
     import tools.process_registry as pr
 

@@ -189,10 +189,21 @@ class SystemdWatchdog:
         self,
         *,
         stopping_confirmed: bool,
-        now: float,
         cadence: float,
     ) -> tuple[bool, float]:
         """Send STOPPING until confirmed, then heartbeat within the deadline."""
+        now = time.monotonic()
+        last_heartbeat_at = self._last_heartbeat_at
+        watchdog_interval = self.interval_seconds
+        if (
+            last_heartbeat_at is not None
+            and watchdog_interval is not None
+            and now - last_heartbeat_at >= watchdog_interval
+        ):
+            self._unhealthy = True
+            self._expired = True
+            notify("STATUS=watchdog expired: hard deadline exceeded during shutdown")
+            return stopping_confirmed, 0.0
         message = (
             "WATCHDOG=1"
             if stopping_confirmed
@@ -266,9 +277,10 @@ class SystemdWatchdog:
             interval = max(0.1, (self.interval_seconds or 1.0) / 2.0)
             stopping_confirmed, initial_delay = self._send_shutdown_heartbeat(
                 stopping_confirmed=False,
-                now=time.monotonic(),
                 cadence=interval,
             )
+            if self._expired:
+                return
 
             def _feed_during_shutdown() -> None:
                 # The process-wide shutdown watchdog remains the hard bound.
@@ -296,9 +308,10 @@ class SystemdWatchdog:
                         return
                     confirmed, delay = self._send_shutdown_heartbeat(
                         stopping_confirmed=confirmed,
-                        now=now,
                         cadence=interval,
                     )
+                    if self._expired:
+                        return
 
             try:
                 self._shutdown_keepalive = threading.Thread(
