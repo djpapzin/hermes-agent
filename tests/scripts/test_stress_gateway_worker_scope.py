@@ -3,7 +3,11 @@ from pathlib import Path
 import pytest
 
 from scripts import stress_gateway_worker_scope as worker_scope
-from scripts.stress_gateway_worker_scope import build_scope_command, validate_bounds
+from scripts.stress_gateway_worker_scope import (
+    build_scope_command,
+    validate_bounds,
+    worker_oom_observed,
+)
 
 
 def test_system_scope_command_has_tight_memory_boundary_and_unprivileged_uid():
@@ -55,3 +59,20 @@ def test_documented_system_proof_bounds_reach_real_parser(monkeypatch):
     ]) == 0
     assert seen["memory_max_mb"] == 64
     assert seen["allocation_mb"] == 96
+
+
+@pytest.mark.parametrize("returncode", [-9, 137, 247])
+def test_worker_oom_classifier_accepts_direct_and_systemd_exit_codes(returncode):
+    assert worker_oom_observed(
+        returncode=returncode,
+        unit="hermes-worker-proof",
+        kernel_rows=[],
+    )
+
+
+def test_worker_oom_classifier_rejects_unrelated_failure():
+    assert not worker_oom_observed(
+        returncode=42,
+        unit="hermes-worker-proof",
+        kernel_rows=["another-worker.scope: oom-kill"],
+    )

@@ -16,6 +16,9 @@ from pathlib import Path
 
 
 _SYSTEM_SCOPE_WRAPPER = Path("/usr/local/sbin/hermes-worker-scope")
+# systemd-run --wait maps a unit killed by its memory cgroup to EXIT_MEMORY.
+# See systemd's documented process exit status table (EXIT_MEMORY = 247).
+_SYSTEMD_EXIT_MEMORY = 247
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,23 @@ def service_state(unit: str) -> ServiceState:
     )
 
 
+def worker_oom_observed(
+    *, returncode: int, unit: str, kernel_rows: list[str]
+) -> bool:
+    """Classify the bounded probe's OOM outcome across launch backends.
+
+    A directly executed process reports SIGKILL as ``-9`` (or shell-normalized
+    ``137``), while ``systemd-run --wait`` reports ``EXIT_MEMORY`` (247) after
+    the scope's cgroup OOM killer terminates the process. Kernel journal access
+    remains best-effort because the unprivileged runtime intentionally cannot
+    read it on every host.
+    """
+
+    return returncode in {-9, 137, _SYSTEMD_EXIT_MEMORY} or any(
+        unit in line and "oom" in line.lower() for line in kernel_rows
+    )
+
+
 def run_proof(
     *,
     backend: str,
@@ -208,15 +228,17 @@ def run_proof(
         for line in kernel.stdout.splitlines()
         if unit in line or ("oom" in line.lower() and "hermes-worker" in line)
     ][-20:]
-    worker_oom_observed = result.returncode in {137, -9} or any(
-        unit in line and "oom" in line.lower() for line in kernel_rows
+    oom_observed = worker_oom_observed(
+        returncode=result.returncode,
+        unit=unit,
+        kernel_rows=kernel_rows,
     )
     gateway_survived = (
         after.active_state == "active"
         and after.main_pid == before.main_pid
         and after.restarts == before.restarts
     )
-    if not worker_oom_observed:
+    if not oom_observed:
         _stop_scope(backend, unit)
     return {
         "unit": unit + ".scope",
@@ -224,7 +246,7 @@ def run_proof(
         "memory_max_mb": memory_max_mb,
         "allocation_mb": allocation_mb,
         "worker_returncode": result.returncode,
-        "worker_oom_observed": worker_oom_observed,
+        "worker_oom_observed": oom_observed,
         "gateway_before": asdict(before),
         "gateway_after": asdict(after),
         "gateway_survived": gateway_survived,
