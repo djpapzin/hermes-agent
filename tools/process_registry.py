@@ -91,13 +91,28 @@ _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
 _SYSTEM_SCOPE_WRAPPER = Path("/usr/local/sbin/hermes-worker-scope")
 
 
+def _host_process_start_time(pid: int) -> Optional[int]:
+    try:
+        return int(Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[21])
+    except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
+        try:
+            import psutil
+
+            return int(round(psutil.Process(pid).create_time() * 100))
+        except Exception:
+            return None
+
+
 def _write_worker_environment(
     environment: Optional[Dict[str, str]], unit_suffix: str
 ) -> Path:
     """Write a private, one-shot environment payload for the root wrapper."""
     env_dir = get_hermes_home() / "state" / "worker-env"
     env_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = env_dir / f"{os.getpid()}-{unit_suffix}-{uuid.uuid4().hex}.json"
+    creator_pid = os.getpid()
+    creator_start = _host_process_start_time(creator_pid)
+    identity = str(creator_start) if creator_start is not None else "unknown"
+    path = env_dir / f"{creator_pid}-{identity}-{unit_suffix}-{uuid.uuid4().hex}.json"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags | nofollow, 0o600)
@@ -180,9 +195,14 @@ def _cleanup_orphaned_worker_environments() -> None:
         return
     for path in candidates:
         try:
-            creator_pid = int(path.name.split("-", 1)[0])
+            parts = path.name.split("-", 2)
+            creator_pid = int(parts[0])
+            creator_start = int(parts[1]) if len(parts) > 2 and parts[1].isdigit() else None
             if psutil.pid_exists(creator_pid):
-                continue
+                if creator_start is None:
+                    continue
+                if _host_process_start_time(creator_pid) == creator_start:
+                    continue
             try:
                 path.unlink()
             except OSError:
@@ -409,6 +429,41 @@ def _stop_systemd_unit(unit_name: str) -> bool:
     binary = shutil.which("systemctl")
     if binary is None:
         return False
+
+
+def _systemd_unit_has_processes(
+    unit_name: str, cgroup_root: Path = Path("/sys/fs/cgroup")
+) -> bool:
+    """Fail closed while determining whether a worker scope is populated."""
+    system_scope = unit_name.startswith("hermes-worker-system-")
+    command = ["systemctl", "--system" if system_scope else "--user", "show"]
+    try:
+        result = subprocess.run(
+            [*command, unit_name, "--property=LoadState", "--property=ControlGroup"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        values = {}
+        for line in result.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                values[key] = value
+        if values.get("LoadState") == "not-found":
+            return False
+        if result.returncode != 0:
+            return True
+        relative = values.get("ControlGroup", "").lstrip("/")
+        if not relative:
+            return False
+        root = cgroup_root / relative
+        for path in [root / "cgroup.procs", *root.glob("**/cgroup.procs")]:
+            if path.read_text(encoding="utf-8").strip():
+                return True
+        return False
+    except (OSError, subprocess.TimeoutExpired):
+        return True
     command = [binary, "--user", "stop", unit_name]
     if unit_name.startswith("hermes-worker-system-"):
         sudo = shutil.which("sudo")
@@ -1497,6 +1552,8 @@ class ProcessRegistry:
         with the reader thread), the second call is a no-op — no duplicate
         completion notification is enqueued.
         """
+        if session.systemd_unit and not _systemd_unit_has_processes(session.systemd_unit):
+            session.systemd_unit = ""
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
@@ -2274,6 +2331,11 @@ class ProcessRegistry:
         """Remove oldest finished sessions if over MAX_PROCESSES. Must hold _lock."""
         # First prune expired finished sessions
         now = time.time()
+        for session in self._finished.values():
+            if session.systemd_unit and not _systemd_unit_has_processes(
+                session.systemd_unit
+            ):
+                session.systemd_unit = ""
         expired = [
             sid for sid, s in self._finished.items()
             if not s.systemd_unit and (now - s.started_at) > FINISHED_TTL_SECONDS
@@ -2468,6 +2530,27 @@ class ProcessRegistry:
 # remove only dead-creator leftovers.
 _cleanup_orphaned_worker_environments()
 process_registry = ProcessRegistry()
+
+
+def track_finished_foreground_scope(unit_name: str, pid: int) -> bool:
+    """Checkpoint a daemonized foreground scope for shutdown/crash recovery."""
+    if not unit_name or not _systemd_unit_has_processes(unit_name):
+        return False
+    session = ProcessSession(
+        id=f"scope_{uuid.uuid4().hex[:12]}",
+        command=f"foreground scope {unit_name}",
+        pid=pid,
+        host_start_time=_host_process_start_time(pid),
+        started_at=time.time(),
+        exited=True,
+        exit_code=0,
+        systemd_unit=unit_name,
+    )
+    with process_registry._lock:
+        process_registry._finished[session.id] = session
+    process_registry._write_checkpoint()
+    logger.info("Tracking populated foreground worker scope %s", unit_name)
+    return True
 
 
 def _format_age(seconds: float) -> str:

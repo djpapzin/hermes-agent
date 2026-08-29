@@ -2,7 +2,11 @@
 
 from unittest.mock import patch
 
-from tools.browser_tool import _scope_browser_workload, _stop_scoped_browser_workload
+from tools.browser_tool import (
+    _remember_browser_daemon_scope,
+    _scope_browser_workload,
+    _stop_scoped_browser_workload,
+)
 
 
 def test_browser_scope_uses_shared_gateway_worker_boundary():
@@ -63,3 +67,15 @@ def test_timed_out_browser_also_stops_daemon_origin_scope():
         "hermes-worker-system-command.scope",
         "hermes-worker-system-daemon.scope",
     ]
+
+
+def test_browser_daemon_origin_scope_refreshes_after_idle_exit():
+    session = {"daemon_systemd_unit": "hermes-worker-system-old.scope"}
+    with patch(
+        "tools.process_registry._systemd_unit_has_processes", return_value=False
+    ):
+        _remember_browser_daemon_scope(
+            session, "hermes-worker-system-restarted.scope"
+        )
+
+    assert session["daemon_systemd_unit"] == "hermes-worker-system-restarted.scope"

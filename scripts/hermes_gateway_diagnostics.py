@@ -45,7 +45,7 @@ def _fields(path: Path) -> dict[str, int]:
     return result
 
 
-def _service_pid(unit: str, manager: str = "auto") -> int | None:
+def _service_identity(unit: str, manager: str = "auto") -> tuple[int | None, str | None]:
     managers = ("system", "user") if manager == "auto" else (manager,)
     for candidate in managers:
         argv = ["systemctl"]
@@ -61,10 +61,15 @@ def _service_pid(unit: str, manager: str = "auto") -> int | None:
             )
             raw = result.stdout.strip()
             if result.returncode == 0 and raw.isdigit() and raw != "0":
-                return int(raw)
+                return int(raw), candidate
         except (OSError, ValueError, subprocess.TimeoutExpired):
             continue
-    return None
+    return None, None
+
+
+def _service_pid(unit: str, manager: str = "auto") -> int | None:
+    """Compatibility wrapper for callers that need only the selected PID."""
+    return _service_identity(unit, manager)[0]
 
 
 def _runtime_status(path: Path) -> dict[str, Any] | None:
@@ -150,10 +155,10 @@ def collect(
     cgroup_root: Path = Path("/sys/fs/cgroup"),
     manager: str = "auto",
 ) -> dict[str, Any]:
-    pid = _service_pid(unit) if manager == "auto" else _service_pid(unit, manager)
+    pid, resolved_manager = _service_identity(unit, manager)
     result: dict[str, Any] = {
         "unit": unit,
-        "service_manager": manager,
+        "service_manager": resolved_manager or manager,
         "gateway_pid": pid,
         "host_memory_kb": _fields(proc_root / "meminfo"),
     }
@@ -260,7 +265,7 @@ def main() -> int:
     args = parser.parse_args()
     result = collect(args.unit, args.hermes_home, manager=args.manager)
     result["incident_events"] = _bounded_incident_journal(
-        args.unit, args.since_minutes, args.manager
+        args.unit, args.since_minutes, result.get("service_manager", args.manager)
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0

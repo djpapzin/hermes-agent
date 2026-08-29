@@ -79,8 +79,10 @@ def _run(*args: str) -> subprocess.CompletedProcess[str]:
 def _runtime_snapshot(path: Path) -> tuple[int, int, bool | None]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        admission = payload.get("admission") if isinstance(payload, dict) else {}
-        platforms = payload.get("platforms") if isinstance(payload, dict) else {}
+        if not isinstance(payload, dict):
+            return 0, 0, None
+        admission = payload.get("admission")
+        platforms = payload.get("platforms")
         telegram = platforms.get("telegram") if isinstance(platforms, dict) else None
         telegram_connected = (
             telegram.get("state") == "connected"

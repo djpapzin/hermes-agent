@@ -927,7 +927,8 @@ class TestCheckpoint:
             assert data[0]["session_id"] == s.id
 
     def test_finished_scope_remains_checkpointed_and_unpruned(self, registry, tmp_path):
-        with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
+        with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"), \
+             patch("tools.process_registry._systemd_unit_has_processes", return_value=True):
             s = _make_session()
             s.exited = True
             s.systemd_unit = "hermes-worker-system-daemon.scope"
@@ -940,6 +941,20 @@ class TestCheckpoint:
             data = json.loads((tmp_path / "procs.json").read_text())
             assert data[0]["systemd_unit"] == s.systemd_unit
             assert s.id in registry._finished
+
+    def test_empty_finished_scope_is_cleared_then_pruned(self, registry):
+        s = _make_session()
+        s.exited = True
+        s.systemd_unit = "hermes-worker-system-empty.scope"
+        s.started_at = 0
+        registry._finished[s.id] = s
+
+        with patch(
+            "tools.process_registry._systemd_unit_has_processes", return_value=False
+        ):
+            registry._prune_if_needed()
+
+        assert s.id not in registry._finished
 
     def test_recover_no_file(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "missing.json"):

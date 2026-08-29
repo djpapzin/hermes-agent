@@ -170,3 +170,6 @@ def test_runtime_platform_state_recognizes_proxied_telegram_connection(tmp_path)
     )
 
     assert _runtime_snapshot(state) == (1, 2, True)
+
+    state.write_text("[]", encoding="utf-8")
+    assert _runtime_snapshot(state) == (0, 0, None)

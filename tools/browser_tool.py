@@ -141,6 +141,25 @@ def _stop_scoped_browser_workload(
         proc.kill()
 
 
+def _remember_browser_daemon_scope(
+    session_info: Dict[str, Any], browser_scope: Optional[str]
+) -> None:
+    if not browser_scope:
+        return
+    with _cleanup_lock:
+        prior_unit = session_info.get("daemon_systemd_unit")
+    if prior_unit:
+        from tools.process_registry import _systemd_unit_has_processes
+
+        replace_origin = not _systemd_unit_has_processes(prior_unit)
+    else:
+        replace_origin = True
+    if replace_origin:
+        with _cleanup_lock:
+            if session_info.get("daemon_systemd_unit") == prior_unit:
+                session_info["daemon_systemd_unit"] = browser_scope
+
+
 def _track_scope_environment(proc: subprocess.Popen, argv: List[str]) -> None:
     from tools.process_registry import _cleanup_scope_environment_when_done
 
@@ -2569,8 +2588,7 @@ def _run_browser_command(
                 # daemon and Chrome descendants inside this scope. Later CLI
                 # invocations get separate short-lived scopes, so retain the
                 # origin scope for timeout and session cleanup.
-                with _cleanup_lock:
-                    session_info.setdefault("daemon_systemd_unit", browser_scope)
+                _remember_browser_daemon_scope(session_info, browser_scope)
         finally:
             os.close(stdout_fd)
             os.close(stderr_fd)

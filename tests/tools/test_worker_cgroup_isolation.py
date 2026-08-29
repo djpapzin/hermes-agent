@@ -2,7 +2,7 @@
 
 import json
 import threading
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import psutil
 import pytest
@@ -149,6 +149,90 @@ def test_gateway_startup_removes_dead_creator_payload(monkeypatch, tmp_path):
     pr._cleanup_orphaned_worker_environments()
 
     assert not payload.exists()
+
+
+def test_gateway_startup_removes_recycled_creator_payload(monkeypatch, tmp_path):
+    import tools.process_registry as pr
+
+    root = tmp_path / "state" / "worker-env"
+    root.mkdir(parents=True)
+    payload = root / "4321-100-scope-secret.json"
+    payload.write_text('{"TOKEN": "secret"}', encoding="utf-8")
+    monkeypatch.setattr(pr, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(psutil, "pid_exists", lambda _pid: True)
+    monkeypatch.setattr(pr, "_host_process_start_time", lambda _pid: 200)
+
+    pr._cleanup_orphaned_worker_environments()
+
+    assert not payload.exists()
+
+
+def test_foreground_scope_tracker_persists_only_populated_scope(monkeypatch):
+    import tools.process_registry as pr
+
+    registry = pr.ProcessRegistry()
+    monkeypatch.setattr(pr, "process_registry", registry)
+    monkeypatch.setattr(pr, "_systemd_unit_has_processes", lambda _unit: True)
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+    assert pr.track_finished_foreground_scope(
+        "hermes-worker-system-fg.scope", 4321
+    ) is True
+    assert next(iter(registry._finished.values())).systemd_unit.endswith("fg.scope")
+
+    monkeypatch.setattr(pr, "_systemd_unit_has_processes", lambda _unit: False)
+    assert pr.track_finished_foreground_scope(
+        "hermes-worker-system-empty.scope", 4322
+    ) is False
+
+
+def test_worker_scope_population_reads_cgroup_membership(monkeypatch, tmp_path):
+    import tools.process_registry as pr
+
+    relative = "hermes-workers.slice/hermes-worker-system-test.scope"
+    cgroup = tmp_path / relative
+    cgroup.mkdir(parents=True)
+    (cgroup / "cgroup.procs").write_text("4321\n", encoding="utf-8")
+    monkeypatch.setattr(
+        pr.subprocess,
+        "run",
+        lambda *_args, **_kwargs: type(
+            "Result",
+            (),
+            {
+                "returncode": 0,
+                "stdout": f"LoadState=loaded\nControlGroup=/{relative}\n",
+            },
+        )(),
+    )
+
+    assert pr._systemd_unit_has_processes(
+        "hermes-worker-system-test.scope", tmp_path
+    ) is True
+    (cgroup / "cgroup.procs").write_text("", encoding="utf-8")
+    assert pr._systemd_unit_has_processes(
+        "hermes-worker-system-test.scope", tmp_path
+    ) is False
+
+
+def test_local_foreground_completion_registers_daemonized_scope():
+    from tools.environments.base import BaseEnvironment
+    from tools.environments.local import LocalEnvironment
+
+    env = object.__new__(LocalEnvironment)
+    proc = MagicMock(pid=4321)
+    proc._hermes_systemd_unit = "hermes-worker-system-fg.scope"
+    with patch.object(
+        BaseEnvironment,
+        "_wait_for_process",
+        return_value={"output": "ok", "exit_code": 0},
+    ), patch(
+        "tools.process_registry.track_finished_foreground_scope"
+    ) as track:
+        result = env._wait_for_process(proc, timeout=10, bounded_capture=True)
+
+    assert result["exit_code"] == 0
+    track.assert_called_once_with(proc._hermes_systemd_unit, 4321)
 
 
 def test_system_scope_negative_probe_retries_after_ttl(monkeypatch, tmp_path):

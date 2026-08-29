@@ -61,7 +61,8 @@ def test_diagnostic_groups_worker_cgroup_memory_and_oom_events(tmp_path, monkeyp
     )
 
     monkeypatch.setattr(
-        "scripts.hermes_gateway_diagnostics._service_pid", lambda _unit: 100
+        "scripts.hermes_gateway_diagnostics._service_identity",
+        lambda _unit, _manager: (100, "system"),
     )
     result = collect(
         hermes_home=tmp_path,
@@ -86,7 +87,8 @@ def test_diagnostic_reads_bounded_admission_runtime_status(tmp_path, monkeypatch
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        "scripts.hermes_gateway_diagnostics._service_pid", lambda _unit: None
+        "scripts.hermes_gateway_diagnostics._service_identity",
+        lambda _unit, _manager: (None, None),
     )
 
     result = collect(hermes_home=tmp_path)
@@ -113,7 +115,8 @@ def test_diagnostic_scans_orphan_worker_when_gateway_is_absent(tmp_path, monkeyp
     (worker_cgroup / "memory.max").write_text("300", encoding="utf-8")
     (worker_cgroup / "memory.events").write_text("oom 0\noom_kill 0\n", encoding="utf-8")
     monkeypatch.setattr(
-        "scripts.hermes_gateway_diagnostics._service_pid", lambda _unit: None
+        "scripts.hermes_gateway_diagnostics._service_identity",
+        lambda _unit, _manager: (None, None),
     )
 
     result = collect(
@@ -129,17 +132,24 @@ def test_diagnostic_scans_orphan_worker_when_gateway_is_absent(tmp_path, monkeyp
 
 def test_diagnostic_defaults_to_active_profile_home(tmp_path, monkeypatch, capsys):
     seen = []
+    journal_managers = []
     monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(
         diagnostics,
         "collect",
-        lambda _unit, home, manager="auto": seen.append((home, manager)) or {},
+        lambda _unit, home, manager="auto": seen.append((home, manager))
+        or {"service_manager": "user"},
     )
-    monkeypatch.setattr(diagnostics, "_bounded_incident_journal", lambda *_args: [])
+    monkeypatch.setattr(
+        diagnostics,
+        "_bounded_incident_journal",
+        lambda _unit, _since, manager: journal_managers.append(manager) or [],
+    )
     monkeypatch.setattr("sys.argv", ["hermes_gateway_diagnostics.py"])
 
     assert diagnostics.main() == 0
     assert seen == [(tmp_path, "auto")]
+    assert journal_managers == ["user"]
     capsys.readouterr()
 
 
@@ -157,3 +167,13 @@ def test_service_pid_auto_detects_user_manager(monkeypatch):
     assert diagnostics._service_pid("hermes-gateway.service") == 4321
     assert calls[0][0] == "systemctl" and "--user" not in calls[0]
     assert "--user" in calls[1]
+
+
+def test_auto_manager_journal_uses_only_selected_manager(monkeypatch):
+    monkeypatch.setattr(
+        diagnostics,
+        "_service_identity",
+        lambda _unit, _manager: (4321, "user"),
+    )
+    result = diagnostics.collect(hermes_home=Path("/nonexistent"))
+    assert result["service_manager"] == "user"

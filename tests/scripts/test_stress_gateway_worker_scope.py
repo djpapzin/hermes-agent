@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts import stress_gateway_worker_scope as worker_scope
 from scripts.stress_gateway_worker_scope import build_scope_command, validate_bounds
 
 
@@ -36,3 +37,21 @@ def test_scope_proof_refuses_unsafe_or_non_oom_bounds(
 ):
     with pytest.raises(ValueError):
         validate_bounds(memory_max_mb, allocation_mb)
+
+
+def test_documented_system_proof_bounds_reach_real_parser(monkeypatch):
+    seen = {}
+
+    def run_proof(**kwargs):
+        seen.update(kwargs)
+        return {"worker_oom_observed": True, "gateway_survived": True}
+
+    monkeypatch.setattr(worker_scope, "run_proof", run_proof)
+
+    assert worker_scope.main([
+        "--backend", "system",
+        "--memory-max-mb", "64",
+        "--allocation-mb", "96",
+    ]) == 0
+    assert seen["memory_max_mb"] == 64
+    assert seen["allocation_mb"] == 96

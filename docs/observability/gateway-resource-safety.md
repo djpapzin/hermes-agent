@@ -122,11 +122,11 @@ the gateway is active and host `MemAvailable` is comfortably above 1 GiB:
 ```bash
 sudo -u hermes-runtime /usr/bin/python3 \
   scripts/stress_gateway_worker_scope.py \
-  --backend system --memory-max-mb 16 --allocation-mb 64
+  --backend system --memory-max-mb 64 --allocation-mb 96
 ```
 
-The script refuses a worker limit below 16 or above 64 MiB, or an allocation
-above 128 MiB. It stops only its unique disposable scope if the proof times out
+The script refuses a worker limit below 64 or above 96 MiB, or an allocation
+that does not exceed the worker limit or is above 128 MiB. It stops only its unique disposable scope if the proof times out
 or the child unexpectedly survives.
 Pass requires an OOM/SIGKILL only in the disposable worker scope and an
 unchanged active gateway PID and restart count. It never stops, restarts, or

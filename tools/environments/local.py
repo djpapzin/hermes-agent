@@ -1536,6 +1536,33 @@ class LocalEnvironment(BaseEnvironment):
                         systemd_unit,
                     )
 
+    def _wait_for_process(
+        self,
+        proc,
+        timeout: int = 120,
+        *,
+        bounded_capture: bool = False,
+    ) -> dict:
+        result = super()._wait_for_process(
+            proc,
+            timeout=timeout,
+            bounded_capture=bounded_capture,
+        )
+        if not _IS_WINDOWS:
+            systemd_unit = getattr(proc, "_hermes_systemd_unit", "")
+            if systemd_unit:
+                try:
+                    from tools.process_registry import track_finished_foreground_scope
+
+                    track_finished_foreground_scope(systemd_unit, proc.pid)
+                except Exception:
+                    logger.warning(
+                        "Could not track foreground worker scope %s",
+                        systemd_unit,
+                        exc_info=True,
+                    )
+        return result
+
     def _update_cwd(self, result: dict):
         """Update cwd from the stdout marker emitted by the wrapped command.
 
