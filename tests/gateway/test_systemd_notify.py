@@ -92,7 +92,7 @@ def test_watchdog_interval_is_disabled_for_missing_invalid_or_nonpositive_values
     assert watchdog_interval_seconds() is None
 
 
-def test_watchdog_latches_when_loop_progress_is_late(monkeypatch):
+def test_watchdog_late_tick_still_proves_liveness_and_can_recover(monkeypatch):
     calls: list[str] = []
     monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
     monkeypatch.setenv("WATCHDOG_USEC", "1000000")
@@ -106,10 +106,17 @@ def test_watchdog_latches_when_loop_progress_is_late(monkeypatch):
 
     assert watchdog.record_tick(scheduled_at=10.0, now=10.05) is True
     assert calls == ["WATCHDOG=1"]
-    assert watchdog.record_tick(scheduled_at=10.0, now=10.2) is False
+
+    # A delayed callback proves that the event loop is making progress again.
+    # Do not permanently stop heartbeats and guarantee a later systemd abort;
+    # systemd's WatchdogSec remains the hard bound for a genuinely wedged loop.
+    assert watchdog.record_tick(scheduled_at=10.0, now=10.2) is True
     assert watchdog.unhealthy is True
-    assert calls[-1].startswith("STATUS=watchdog unhealthy")
-    assert watchdog.record_tick(scheduled_at=10.0, now=10.3) is False
+    assert calls[-1].startswith("WATCHDOG=1\nSTATUS=watchdog delayed")
+
+    assert watchdog.record_tick(scheduled_at=10.3, now=10.35) is True
+    assert watchdog.unhealthy is False
+    assert calls[-1] == "WATCHDOG=1\nSTATUS=Hermes Gateway running"
 
 
 @pytest.mark.asyncio

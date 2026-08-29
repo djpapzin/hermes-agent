@@ -126,18 +126,27 @@ class SystemdWatchdog:
         return notify(f"READY=1\nSTATUS={safe_status}")
 
     def record_tick(self, *, scheduled_at: float, now: float) -> bool:
-        """Feed systemd only when the event loop woke within its lag budget."""
-        if not self.enabled or self._stopping or self._unhealthy:
+        """Feed systemd whenever the event loop demonstrates forward progress.
+
+        ``WatchdogSec`` is the authoritative hard deadline.  A callback that
+        runs late still proves that the loop recovered before that deadline;
+        withholding this heartbeat would turn one transient delay into a
+        guaranteed service abort even after the gateway became responsive.
+        """
+        if not self.enabled or self._stopping:
             return False
         try:
             lag = float(now) - float(scheduled_at)
         except (TypeError, ValueError):
             lag = float("inf")
-        if not math.isfinite(lag) or lag > self._lag_tolerance():
-            self._unhealthy = True
-            notify("STATUS=watchdog unhealthy: event loop progress is late")
-            return False
-        notify("WATCHDOG=1")
+        was_unhealthy = self._unhealthy
+        self._unhealthy = not math.isfinite(lag) or lag > self._lag_tolerance()
+        if self._unhealthy:
+            notify("WATCHDOG=1\nSTATUS=watchdog delayed: event loop recovered")
+        elif was_unhealthy:
+            notify("WATCHDOG=1\nSTATUS=Hermes Gateway running")
+        else:
+            notify("WATCHDOG=1")
         return True
 
     async def _run(self) -> None:
@@ -148,11 +157,10 @@ class SystemdWatchdog:
         loop = asyncio.get_running_loop()
         scheduled_at = loop.time() + cadence
         try:
-            while not self._stopping and not self._unhealthy:
+            while not self._stopping:
                 await asyncio.sleep(max(0.0, scheduled_at - loop.time()))
                 now = loop.time()
-                if not self.record_tick(scheduled_at=scheduled_at, now=now):
-                    return
+                self.record_tick(scheduled_at=scheduled_at, now=now)
                 scheduled_at += cadence
                 if scheduled_at < now:
                     scheduled_at = now + cadence

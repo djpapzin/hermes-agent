@@ -47,6 +47,20 @@ Do not label an incident OOM unless kernel or cgroup `memory.events` evidence
 supports it. A service-manager SIGTERM, watchdog abort, updater, deployment,
 or external health guard is a different failure path.
 
+### Systemd watchdog semantics
+
+The gateway heartbeat reports every observed event-loop tick to systemd. A
+late callback is recorded as `watchdog delayed: event loop recovered`, but it
+must not permanently latch the heartbeat off: the callback itself proves that
+the loop resumed. `WatchdogSec` remains the authoritative hard deadline and
+will still abort a loop that makes no progress at all.
+
+This distinction matters under parallel load. A transient delay shorter than
+`WatchdogSec` must recover in place; otherwise one late tick becomes a
+guaranteed later gateway abort that interrupts healthy, unrelated sessions.
+Correlate `Failed with result 'watchdog'` and `status=6/ABRT` with the bounded
+admission and memory evidence before changing the watchdog interval.
+
 ## Supervisor policy
 
 - SQLite `database is locked`, task count, aggregate memory, or low host
