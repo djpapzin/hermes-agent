@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import socket
 import threading
 import time
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 def _notify_address(raw: str) -> str:
@@ -182,6 +185,25 @@ class SystemdWatchdog:
         remaining = interval - (now - last_success)
         return max(0.0, min(cadence / 4.0, remaining / 2.0))
 
+    def _send_shutdown_heartbeat(
+        self,
+        *,
+        stopping_confirmed: bool,
+        now: float,
+        cadence: float,
+    ) -> tuple[bool, float]:
+        """Send STOPPING until confirmed, then heartbeat within the deadline."""
+        message = (
+            "WATCHDOG=1"
+            if stopping_confirmed
+            else "STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining"
+        )
+        sent = notify(message)
+        if sent:
+            self._last_heartbeat_at = now
+            return True, cadence
+        return stopping_confirmed, self._retry_delay(now=now, cadence=cadence)
+
     async def _run(self) -> None:
         interval = self.interval_seconds
         if interval is None:
@@ -240,19 +262,12 @@ class SystemdWatchdog:
             self._expired = True
             notify("STATUS=watchdog expired: hard deadline exceeded during shutdown")
         if self.enabled and not self._expired and not self._stopping_notified:
-            stopping_message = (
-                "STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining"
-            )
-            sent = notify(stopping_message)
-            sent_at = time.monotonic()
-            if sent:
-                self._last_heartbeat_at = sent_at
             self._stopping_notified = True
             interval = max(0.1, (self.interval_seconds or 1.0) / 2.0)
-            initial_delay = (
-                interval
-                if sent
-                else self._retry_delay(now=sent_at, cadence=interval)
+            stopping_confirmed, initial_delay = self._send_shutdown_heartbeat(
+                stopping_confirmed=False,
+                now=time.monotonic(),
+                cadence=interval,
             )
 
             def _feed_during_shutdown() -> None:
@@ -261,6 +276,7 @@ class SystemdWatchdog:
                 # if a caller invokes stop() outside process teardown.
                 deadline = time.monotonic() + 900.0
                 delay = initial_delay
+                confirmed = stopping_confirmed
                 while time.monotonic() < deadline:
                     time.sleep(delay)
                     now = time.monotonic()
@@ -278,15 +294,23 @@ class SystemdWatchdog:
                             "during shutdown"
                         )
                         return
-                    if notify("WATCHDOG=1"):
-                        self._last_heartbeat_at = now
-                        delay = interval
-                    else:
-                        delay = self._retry_delay(now=now, cadence=interval)
+                    confirmed, delay = self._send_shutdown_heartbeat(
+                        stopping_confirmed=confirmed,
+                        now=now,
+                        cadence=interval,
+                    )
 
-            self._shutdown_keepalive = threading.Thread(
-                target=_feed_during_shutdown,
-                name="hermes-systemd-shutdown-watchdog",
-                daemon=True,
-            )
-            self._shutdown_keepalive.start()
+            try:
+                self._shutdown_keepalive = threading.Thread(
+                    target=_feed_during_shutdown,
+                    name="hermes-systemd-shutdown-watchdog",
+                    daemon=True,
+                )
+                self._shutdown_keepalive.start()
+            except Exception as exc:
+                self._shutdown_keepalive = None
+                logger.warning(
+                    "Could not start systemd shutdown keepalive; "
+                    "continuing bounded teardown: %s",
+                    exc,
+                )

@@ -30,6 +30,9 @@ event and identifier matches before their bounded result cap. The gateway
 writes only controlled fields to these channels; the diagnostic requires the
 trusted unit and PID metadata to match each payload, allowlists fields again,
 and never parses same-UID files or mixed human-readable chat/command logs.
+Gateway lifecycle queries likewise apply systemd-manager provenance matches
+before their 300-row input cap, so replacement-process stdout cannot evict the
+older exit/watchdog evidence before Python validates it.
 
 Admission uses the tighter of host `MemAvailable` and finite gateway-cgroup
 headroom (`MemoryMax - MemoryCurrent`). Structured admission logs expose both
@@ -83,8 +86,11 @@ admission and memory evidence before changing the watchdog interval.
 - A supervised Linux gateway fails closed if no worker-scope backend is available,
   including `auto`, `user`, or `off` configurations. Running model-controlled
   work inside the control-plane cgroup would defeat both resource isolation and
-  manager-attested diagnostic provenance. CLI processes outside the supervised
-  gateway and non-Linux supervisors retain their existing behavior.
+  manager-attested diagnostic provenance. Supervision is latched to the gateway
+  PID once at startup; later deletion or replacement of same-UID runtime PID,
+  lock, or state files cannot disable isolation. Forked/execed children do not
+  inherit that process identity. CLI processes outside the supervised gateway
+  and non-Linux supervisors retain their existing behavior.
 
 ### Replace restart-on-pressure health guards
 

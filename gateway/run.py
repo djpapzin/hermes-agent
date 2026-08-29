@@ -1407,6 +1407,10 @@ def _clear_planned_restart_notification() -> None:
 # knows not to clobber TERMINAL_CWD if lazily imported.
 os.environ["_HERMES_GATEWAY"] = "1"
 
+from gateway.runtime_identity import mark_gateway_control_plane_process
+
+mark_gateway_control_plane_process()
+
 _ensure_ssl_certs()
 
 # Add parent directory to path

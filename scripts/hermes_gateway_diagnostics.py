@@ -205,9 +205,39 @@ def _bounded_incident_journal(
     """Return only lifecycle/resource evidence, never general chat logs."""
     commands: list[tuple[list[str], str]] = []
     if manager in {"auto", "system"}:
-        commands.append((["journalctl", "--unit", unit], "gateway-system"))
+        commands.append(
+            (
+                [
+                    "journalctl",
+                    "--unit",
+                    unit,
+                    "_PID=1",
+                    "_UID=0",
+                    "_COMM=systemd",
+                    "SYSLOG_IDENTIFIER=systemd",
+                    "_TRANSPORT=journal",
+                    "_SYSTEMD_UNIT=init.scope",
+                    f"UNIT={unit}",
+                ],
+                "gateway-system",
+            )
+        )
     if manager in {"auto", "user"}:
-        commands.append((["journalctl", "--user-unit", unit], "gateway-user"))
+        commands.append(
+            (
+                [
+                    "journalctl",
+                    "--user-unit",
+                    unit,
+                    "_COMM=systemd",
+                    "SYSLOG_IDENTIFIER=systemd",
+                    "_TRANSPORT=journal",
+                    "_SYSTEMD_USER_UNIT=init.scope",
+                    f"USER_UNIT={unit}",
+                ],
+                "gateway-user",
+            )
+        )
     commands.extend(
         [
             (["journalctl", "--unit", "hermes-health-guard.service"], "health"),

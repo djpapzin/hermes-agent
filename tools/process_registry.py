@@ -356,14 +356,12 @@ def _worker_scope_backend() -> Optional[str]:
 
 
 def _is_supervised_gateway_process() -> bool:
-    if os.environ.get("_HERMES_GATEWAY") != "1":
-        return False
     try:
-        from gateway.restart import is_gateway_supervisor_process
-        from gateway.status import get_running_pid
-        return is_gateway_supervisor_process() and get_running_pid(cleanup_stale=False) == os.getpid()
+        from gateway.runtime_identity import is_gateway_control_plane_process
+
+        return is_gateway_control_plane_process()
     except Exception as exc:
-        logger.debug("Could not verify supervised gateway process identity: %s", exc)
+        logger.debug("Could not read gateway control-plane identity: %s", exc)
         return False
 
 

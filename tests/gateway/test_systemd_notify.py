@@ -283,6 +283,69 @@ async def test_failed_stopping_notify_retries_inside_remaining_deadline(monkeypa
     assert 0 < closure["initial_delay"] < 0.05
 
 
+def test_failed_stopping_notify_retries_full_stopping_payload(monkeypatch):
+    calls: list[str] = []
+    outcomes = iter((False, True, True))
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    monkeypatch.setattr(
+        notify_mod,
+        "notify",
+        lambda message: calls.append(message) or next(outcomes),
+    )
+    watchdog = notify_mod.SystemdWatchdog()
+    watchdog._last_heartbeat_at = 10.0
+
+    confirmed, _ = watchdog._send_shutdown_heartbeat(
+        stopping_confirmed=False, now=10.5, cadence=0.5
+    )
+    assert confirmed is False
+    confirmed, _ = watchdog._send_shutdown_heartbeat(
+        stopping_confirmed=confirmed, now=10.6, cadence=0.5
+    )
+    assert confirmed is True
+    watchdog._send_shutdown_heartbeat(
+        stopping_confirmed=confirmed, now=10.7, cadence=0.5
+    )
+
+    assert calls[:2] == [
+        "STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining",
+        "STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining",
+    ]
+    assert calls[2] == "WATCHDOG=1"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_keepalive_thread_start_failure_does_not_abort_stop(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    class UnstartableThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("cannot start new thread")
+
+    monkeypatch.setattr(
+        notify_mod, "notify", lambda message: calls.append(message) or True
+    )
+    monkeypatch.setattr(notify_mod.threading, "Thread", UnstartableThread)
+    watchdog = notify_mod.SystemdWatchdog()
+    watchdog._last_heartbeat_at = notify_mod.time.monotonic()
+
+    await watchdog.stop()
+
+    assert calls == ["STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining"]
+    assert watchdog._shutdown_keepalive is None
+
+
 @pytest.mark.asyncio
 async def test_watchdog_sends_ready_heartbeat_and_stopping(monkeypatch):
     calls: list[str] = []

@@ -411,12 +411,14 @@ def test_auto_service_status_returns_both_loaded_manager_candidates(monkeypatch)
 
 
 def test_incident_journal_preserves_exit_code_after_restart(monkeypatch):
+    calls = []
     exit_message = (
         "hermes-gateway.service: Main process exited, "
         "code=killed, status=9/KILL"
     )
 
     def run(argv, **_kwargs):
+        calls.append(argv)
         row = {
             "__REALTIME_TIMESTAMP": "123",
             "_PID": "1",
@@ -439,6 +441,17 @@ def test_incident_journal_preserves_exit_code_after_restart(monkeypatch):
     )
 
     assert any(event["message"] == exit_message for event in events)
+    cap_index = calls[0].index("-n")
+    for trusted_match in (
+        "_PID=1",
+        "_UID=0",
+        "_COMM=systemd",
+        "SYSLOG_IDENTIFIER=systemd",
+        "_TRANSPORT=journal",
+        "_SYSTEMD_UNIT=init.scope",
+        "UNIT=hermes-gateway.service",
+    ):
+        assert calls[0].index(trusted_match) < cap_index
 
 
 def test_user_incident_journal_uses_user_unit_and_manager_owned_rows(monkeypatch):
@@ -468,6 +481,15 @@ def test_user_incident_journal_uses_user_unit_and_manager_owned_rows(monkeypatch
         "--user-unit",
         "hermes-gateway.service",
     ]
+    cap_index = calls[0].index("-n")
+    for trusted_match in (
+        "_COMM=systemd",
+        "SYSLOG_IDENTIFIER=systemd",
+        "_TRANSPORT=journal",
+        "_SYSTEMD_USER_UNIT=init.scope",
+        "USER_UNIT=hermes-gateway.service",
+    ):
+        assert calls[0].index(trusted_match) < cap_index
     assert len(events) == 1
 
 
