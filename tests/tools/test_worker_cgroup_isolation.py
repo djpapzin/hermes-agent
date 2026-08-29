@@ -322,6 +322,19 @@ def test_supervised_gateway_never_falls_back_to_unscoped_worker(
         pr.build_gateway_worker_scope_argv(["/bin/true"], unit_suffix="test")
 
 
+def test_launchd_gateway_keeps_non_linux_local_worker_compatibility(monkeypatch):
+    import tools.process_registry as pr
+
+    monkeypatch.setattr(pr, "_IS_LINUX", False)
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+
+    argv = ["/bin/true"]
+    assert pr.build_gateway_worker_scope_argv(argv, unit_suffix="test") == (
+        argv,
+        None,
+    )
+
+
 def test_foreground_system_scope_receives_sanitized_run_environment(
     monkeypatch, tmp_path
 ):
@@ -346,3 +359,28 @@ def test_foreground_system_scope_receives_sanitized_run_environment(
     scoped_env = build.call_args.kwargs["environment"]
     assert scoped_env["HERMES_HOME"] == "/profiles/friend"
     assert scoped_env["CUSTOM_SETTING"] == "yes"
+
+
+def test_foreground_gateway_propagates_every_scope_preparation_failure(
+    monkeypatch, tmp_path
+):
+    import tools.environments.local as local
+    import tools.process_registry as pr
+
+    env = object.__new__(local.LocalEnvironment)
+    env.cwd = str(tmp_path)
+    env.env = {}
+    monkeypatch.setattr(local, "_find_bash", lambda: "/bin/bash")
+    monkeypatch.setattr(pr, "_gateway_worker_isolation_required", lambda: True)
+    monkeypatch.setattr(pr, "_gateway_worker_scope_backend", lambda: "system")
+    monkeypatch.setattr(
+        pr,
+        "_build_systemd_scope_argv",
+        MagicMock(side_effect=OSError("read-only worker environment")),
+    )
+
+    with patch.object(local.subprocess, "Popen") as spawn:
+        with pytest.raises(OSError, match="read-only worker environment"):
+            env._run_bash("true")
+
+    spawn.assert_not_called()

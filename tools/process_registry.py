@@ -43,6 +43,7 @@ import uuid
 from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
+_IS_LINUX = platform.system() == "Linux"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
@@ -379,6 +380,11 @@ def _gateway_worker_scope_backend() -> Optional[str]:
     return backend
 
 
+def _gateway_worker_isolation_required() -> bool:
+    """Return whether this Linux gateway must isolate model-controlled work."""
+    return _IS_LINUX and _is_supervised_gateway_process()
+
+
 def _build_systemd_scope_argv(
     shell_argv: List[str], unit_suffix: str, backend: str = "user",
     environment: Optional[Dict[str, str]] = None,
@@ -422,7 +428,7 @@ def build_gateway_worker_scope_argv(
     argv: List[str], *, unit_suffix: str,
     environment: Optional[Dict[str, str]] = None,
 ) -> tuple[List[str], Optional[str]]:
-    if _IS_WINDOWS or not _is_supervised_gateway_process():
+    if not _gateway_worker_isolation_required():
         return argv, None
     backend = _gateway_worker_scope_backend()
     if backend is None:  # pragma: no cover - guarded by supervised identity above
@@ -1151,7 +1157,7 @@ class ProcessRegistry:
                 pty_env.setdefault("GIT_PAGER", "cat")
                 pty_env.setdefault("PAGER", "cat")
                 pty_argv = [user_shell, "-lic", f"set +m; {command}"]
-                pty_in_supervised_gateway = not _IS_WINDOWS and _is_supervised_gateway_process()
+                pty_in_supervised_gateway = _gateway_worker_isolation_required()
                 pty_scope_backend = (
                     _gateway_worker_scope_backend()
                     if pty_in_supervised_gateway
@@ -1221,7 +1227,7 @@ class ProcessRegistry:
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
         shell_argv = [user_shell, "-lic", f"set +m; {command}"]
-        in_supervised_gateway = not _IS_WINDOWS and _is_supervised_gateway_process()
+        in_supervised_gateway = _gateway_worker_isolation_required()
         scope_backend = (
             _gateway_worker_scope_backend() if in_supervised_gateway else None
         )

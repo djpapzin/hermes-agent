@@ -1758,7 +1758,9 @@ fallback behavior only outside a supervised gateway. `required` tries a user
 scope first, then a root-manager scope through passwordless `sudo` while
 explicitly retaining the gateway's UID/GID. Each scope receives `MemoryHigh`,
 `MemoryMax`, and `MemorySwapMax=0`; its crash or OOM does not stop the gateway
-or sibling scopes. Verify a scope backend before starting a production gateway.
+or sibling scopes. Non-Linux supervisors, including macOS launchd, are not
+subject to this systemd-specific requirement. Verify a scope backend before
+starting a production Linux gateway.
 
 Control whether shared chats keep one conversation per room or one conversation per participant:
 

@@ -1354,11 +1354,11 @@ class LocalEnvironment(BaseEnvironment):
                     _build_systemd_scope_argv,
                     _cleanup_scope_environment_when_done,
                     _discard_scope_environment,
+                    _gateway_worker_isolation_required,
                     _gateway_worker_scope_backend,
-                    _is_supervised_gateway_process,
                 )
 
-                if _is_supervised_gateway_process():
+                if _gateway_worker_isolation_required():
                     backend = _gateway_worker_scope_backend()
                     if backend is None:  # pragma: no cover - identity already verified
                         raise RuntimeError("Supervised gateway worker isolation is unavailable")
@@ -1370,9 +1370,9 @@ class LocalEnvironment(BaseEnvironment):
                         environment=run_env,
                     )
                     systemd_unit = f"hermes-worker-{'system-' if backend == 'system' else ''}{suffix}.scope"
-            except RuntimeError:
-                raise
             except Exception as exc:
+                if _gateway_worker_isolation_required():
+                    raise
                 logger.warning("Could not prepare foreground worker cgroup: %s", exc)
 
         # Recover when the cwd has been deleted out from under us — usually by

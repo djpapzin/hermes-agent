@@ -80,11 +80,11 @@ admission and memory evidence before changing the watchdog interval.
 - For production Linux gateways, verify either `systemd-run --user --scope` or
   the same-UID `sudo -n systemd-run --system --scope --uid=<runtime-user>` path
   works before selecting `terminal.worker_cgroup_mode: required`.
-- A supervised gateway fails closed if no worker-scope backend is available,
+- A supervised Linux gateway fails closed if no worker-scope backend is available,
   including `auto`, `user`, or `off` configurations. Running model-controlled
   work inside the control-plane cgroup would defeat both resource isolation and
   manager-attested diagnostic provenance. CLI processes outside the supervised
-  gateway retain their existing fallback behavior.
+  gateway and non-Linux supervisors retain their existing behavior.
 
 ### Replace restart-on-pressure health guards
 
