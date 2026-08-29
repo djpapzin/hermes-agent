@@ -371,7 +371,10 @@ def test_foreground_gateway_propagates_every_scope_preparation_failure(
     env.cwd = str(tmp_path)
     env.env = {}
     monkeypatch.setattr(local, "_find_bash", lambda: "/bin/bash")
-    monkeypatch.setattr(pr, "_gateway_worker_isolation_required", lambda: True)
+    isolation_required = MagicMock(side_effect=[True, False])
+    monkeypatch.setattr(
+        pr, "_gateway_worker_isolation_required", isolation_required
+    )
     monkeypatch.setattr(pr, "_gateway_worker_scope_backend", lambda: "system")
     monkeypatch.setattr(
         pr,
@@ -384,3 +387,4 @@ def test_foreground_gateway_propagates_every_scope_preparation_failure(
             env._run_bash("true")
 
     spawn.assert_not_called()
+    isolation_required.assert_called_once_with()
