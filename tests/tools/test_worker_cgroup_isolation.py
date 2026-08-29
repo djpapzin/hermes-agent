@@ -297,6 +297,32 @@ def test_required_mode_refuses_worker_in_gateway_cgroup(monkeypatch, tmp_path):
     spawn.assert_not_called()
 
 
+def test_pty_gateway_retains_initial_isolation_decision_on_preparation_failure(
+    monkeypatch, tmp_path
+):
+    import tools.process_registry as pr
+
+    registry = pr.ProcessRegistry()
+    monkeypatch.setattr(pr, "_find_shell", lambda: "/bin/bash")
+    isolation_required = MagicMock(side_effect=[True, False])
+    monkeypatch.setattr(
+        pr, "_gateway_worker_isolation_required", isolation_required
+    )
+    monkeypatch.setattr(pr, "_gateway_worker_scope_backend", lambda: "system")
+    monkeypatch.setattr(
+        pr,
+        "_build_systemd_scope_argv",
+        MagicMock(side_effect=OSError("read-only worker environment")),
+    )
+
+    with patch("subprocess.Popen") as spawn:
+        with pytest.raises(OSError, match="read-only worker environment"):
+            registry.spawn_local("echo unsafe", cwd=str(tmp_path), use_pty=True)
+
+    spawn.assert_not_called()
+    isolation_required.assert_called_once_with()
+
+
 def test_explicit_system_mode_refuses_unbounded_fallback(monkeypatch):
     import tools.process_registry as pr
 

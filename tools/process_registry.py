@@ -1143,6 +1143,7 @@ class ProcessRegistry:
             started_at=time.time(),
         )
 
+        gateway_isolation_required = _gateway_worker_isolation_required()
         pty_scope_attempted = False
         if use_pty:
             # Try PTY mode for interactive CLI tools
@@ -1157,7 +1158,7 @@ class ProcessRegistry:
                 pty_env.setdefault("GIT_PAGER", "cat")
                 pty_env.setdefault("PAGER", "cat")
                 pty_argv = [user_shell, "-lic", f"set +m; {command}"]
-                pty_in_supervised_gateway = _gateway_worker_isolation_required()
+                pty_in_supervised_gateway = gateway_isolation_required
                 pty_scope_backend = (
                     _gateway_worker_scope_backend()
                     if pty_in_supervised_gateway
@@ -1207,6 +1208,8 @@ class ProcessRegistry:
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
+                if gateway_isolation_required and not pty_scope_attempted:
+                    raise
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
                 if pty_scope_attempted and session.systemd_unit:
                     if not _stop_systemd_unit(session.systemd_unit):
@@ -1227,7 +1230,7 @@ class ProcessRegistry:
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
         shell_argv = [user_shell, "-lic", f"set +m; {command}"]
-        in_supervised_gateway = _gateway_worker_isolation_required()
+        in_supervised_gateway = gateway_isolation_required
         scope_backend = (
             _gateway_worker_scope_backend() if in_supervised_gateway else None
         )
