@@ -9,6 +9,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -209,6 +210,43 @@ def _stop(argv: list[str]) -> int:
     ).returncode
 
 
+def _oom_evidence(argv: list[str]) -> int:
+    """Emit a bounded OOM attestation for one recent worker scope."""
+
+    if len(argv) != 3:
+        raise ValueError("evidence requires UNIT SINCE_EPOCH")
+    unit = _validate_unit(argv[1])
+    try:
+        since = int(argv[2])
+    except ValueError as exc:
+        raise ValueError("evidence timestamp is not an integer") from exc
+    now = int(time.time())
+    if since < now - 300 or since > now + 5:
+        raise ValueError("evidence timestamp is outside the recent proof window")
+    result = subprocess.run(
+        [
+            "/usr/bin/journalctl",
+            "--unit",
+            unit,
+            "--since",
+            f"@{since}",
+            "--no-pager",
+            "--output=cat",
+            "--lines=100",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    marker = "A process of this unit has been killed by the OOM killer."
+    observed = result.returncode == 0 and any(
+        line.strip() == marker for line in result.stdout.splitlines()
+    )
+    print(json.dumps({"unit": unit, "oom_kill": observed}, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     try:
@@ -221,8 +259,10 @@ def main(argv: list[str] | None = None) -> int:
             return _run(args)
         if args[0] == "stop":
             return _stop(args)
-        raise ValueError("expected run or stop")
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        if args[0] == "evidence":
+            return _oom_evidence(args)
+        raise ValueError("expected run, stop, or evidence")
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
         return _fail(str(exc))
 
 

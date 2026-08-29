@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
 from types import SimpleNamespace
+import json
+import time
 
 from scripts import hermes_worker_scope as wrapper
 
@@ -61,6 +63,42 @@ def test_wrapper_rejects_option_injection_and_multiple_stop_units(monkeypatch):
     assert wrapper.main(["stop", "hermes-worker-system-one.scope", "ssh.service"]) == 2
     assert wrapper.main(["stop", "ssh.service"]) == 2
     assert calls == []
+
+
+def test_wrapper_emits_only_unit_bound_recent_oom_attestation(monkeypatch, capsys):
+    monkeypatch.setattr(wrapper, "_validate_caller", lambda: None)
+    marker = "A process of this unit has been killed by the OOM killer.\n"
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(returncode=0, stdout=marker)
+
+    monkeypatch.setattr(wrapper.subprocess, "run", run)
+    since = int(time.time())
+    unit = "hermes-worker-system-proof.scope"
+
+    assert wrapper.main(["evidence", unit, str(since)]) == 0
+    assert json.loads(capsys.readouterr().out) == {"oom_kill": True, "unit": unit}
+    assert calls[0][0][0:3] == ["/usr/bin/journalctl", "--unit", unit]
+
+
+def test_wrapper_rejects_stale_or_non_worker_evidence_queries(monkeypatch):
+    monkeypatch.setattr(wrapper, "_validate_caller", lambda: None)
+    called = []
+    monkeypatch.setattr(
+        wrapper.subprocess,
+        "run",
+        lambda *args, **kwargs: called.append((args, kwargs)),
+    )
+
+    assert wrapper.main(["evidence", "ssh.service", str(int(time.time()))]) == 2
+    assert wrapper.main([
+        "evidence",
+        "hermes-worker-system-proof.scope",
+        str(int(time.time()) - 301),
+    ]) == 2
+    assert called == []
 
 
 def test_wrapper_rejects_missing_aggregate_slice(tmp_path, monkeypatch):

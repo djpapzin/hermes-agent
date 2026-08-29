@@ -61,18 +61,24 @@ def test_documented_system_proof_bounds_reach_real_parser(monkeypatch):
     assert seen["allocation_mb"] == 96
 
 
-@pytest.mark.parametrize("returncode", [-9, 137, 247])
-def test_worker_oom_classifier_accepts_direct_and_systemd_exit_codes(returncode):
+def test_worker_oom_classifier_accepts_wrapper_attestation():
     assert worker_oom_observed(
-        returncode=returncode,
         unit="hermes-worker-proof",
         kernel_rows=[],
+        wrapper_attested=True,
     )
 
 
 def test_worker_oom_classifier_rejects_unrelated_failure():
     assert not worker_oom_observed(
-        returncode=42,
         unit="hermes-worker-proof",
         kernel_rows=["another-worker.scope: oom-kill"],
+    )
+
+
+def test_worker_oom_classifier_rejects_bare_sigkill_exit_without_evidence():
+    assert not worker_oom_observed(
+        unit="hermes-worker-proof",
+        kernel_rows=[],
+        wrapper_attested=False,
     )
