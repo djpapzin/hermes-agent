@@ -18,11 +18,17 @@ def test_wrapper_builds_fixed_bounded_worker_slice(tmp_path, monkeypatch):
     monkeypatch.setattr(wrapper, "WORKER_UID", CURRENT_UID)
     monkeypatch.setattr(wrapper, "WORKER_GID", CURRENT_GID)
     calls = []
+
     def run(argv, **_kwargs):
         if argv[0] == "/usr/bin/systemctl":
             return SimpleNamespace(
                 returncode=0,
-                stdout=f"LoadState=loaded\nMemoryMax={10 * 1024 * 1024 * 1024}\n",
+                stdout=(
+                    "LoadState=loaded\n"
+                    f"MemoryMax={10 * 1024 * 1024 * 1024}\n"
+                    f"MemoryHigh={8 * 1024 * 1024 * 1024}\n"
+                    "MemorySwapMax=0\n"
+                ),
             )
         calls.append(argv)
         return SimpleNamespace(returncode=0)
@@ -70,7 +76,10 @@ def test_wrapper_rejects_missing_aggregate_slice(tmp_path, monkeypatch):
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=0,
-            stdout="LoadState=not-found\nMemoryMax=infinity\n",
+            stdout=(
+                "LoadState=not-found\nMemoryMax=infinity\n"
+                "MemoryHigh=infinity\nMemorySwapMax=infinity\n"
+            ),
         ),
     )
 

@@ -394,7 +394,7 @@ def build_gateway_worker_scope_argv(
         return argv, None
     backend = _worker_scope_backend()
     if backend is None:
-        if mode == "required":
+        if mode in {"required", "system"}:
             raise RuntimeError("Worker cgroup isolation is required but no systemd scope backend is available")
         logger.warning("Gateway workload %s is not isolated in a systemd scope", unit_suffix)
         return argv, None
@@ -1099,7 +1099,7 @@ class ProcessRegistry:
                     )
                     pty_scope_attempted = True
                 elif pty_in_supervised_gateway:
-                    if pty_cgroup_mode == "required":
+                    if pty_cgroup_mode in {"required", "system"}:
                         raise RuntimeError(
                             "Worker cgroup isolation is required but no systemd scope backend is available"
                         )
@@ -1174,7 +1174,7 @@ class ProcessRegistry:
         else:
             spawn_argv = shell_argv
             if in_supervised_gateway:
-                if cgroup_mode == "required":
+                if cgroup_mode in {"required", "system"}:
                     raise RuntimeError(
                         "Worker cgroup isolation is required but no systemd scope backend is available"
                     )

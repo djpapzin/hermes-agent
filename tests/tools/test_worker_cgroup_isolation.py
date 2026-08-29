@@ -204,6 +204,17 @@ def test_required_mode_refuses_worker_in_gateway_cgroup(monkeypatch, tmp_path):
     spawn.assert_not_called()
 
 
+def test_explicit_system_mode_refuses_unbounded_fallback(monkeypatch):
+    import tools.process_registry as pr
+
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setattr(pr, "_worker_cgroup_mode", lambda: "system")
+    monkeypatch.setattr(pr, "_worker_scope_backend", lambda: None)
+
+    with pytest.raises(RuntimeError, match="cgroup isolation is required"):
+        pr.build_gateway_worker_scope_argv(["/bin/true"], unit_suffix="test")
+
+
 def test_foreground_system_scope_receives_sanitized_run_environment(
     monkeypatch, tmp_path
 ):

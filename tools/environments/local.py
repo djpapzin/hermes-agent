@@ -1361,7 +1361,7 @@ class LocalEnvironment(BaseEnvironment):
 
                 if _is_supervised_gateway_process() and _worker_cgroup_mode() != "off":
                     backend = _worker_scope_backend()
-                    if backend is None and _worker_cgroup_mode() == "required":
+                    if backend is None and _worker_cgroup_mode() in {"required", "system"}:
                         raise RuntimeError(
                             "Worker cgroup isolation is required but no systemd scope backend is available"
                         )

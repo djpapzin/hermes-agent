@@ -104,6 +104,8 @@ def _validate_worker_slice() -> None:
             WORKER_SLICE,
             "--property=LoadState",
             "--property=MemoryMax",
+            "--property=MemoryHigh",
+            "--property=MemorySwapMax",
         ],
         check=False,
         capture_output=True,
@@ -115,11 +117,16 @@ def _validate_worker_slice() -> None:
         if separator:
             values[key] = value
     memory_max = values.get("MemoryMax", "")
+    memory_high = values.get("MemoryHigh", "")
+    swap_max = values.get("MemorySwapMax", "")
     if (
         result.returncode != 0
         or values.get("LoadState") != "loaded"
         or not memory_max.isdigit()
         or int(memory_max) > MAX_AGGREGATE_MEMORY_BYTES
+        or not memory_high.isdigit()
+        or int(memory_high) > int(memory_max)
+        or swap_max != "0"
     ):
         raise ValueError("aggregate Hermes worker slice is absent or unbounded")
 
