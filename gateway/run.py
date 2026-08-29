@@ -11639,10 +11639,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return str(exc)
             finally:
                 self._admission_waiting_sessions.discard(_quick_key)
-        _active_session_lease, _limit_message = await self._claim_active_session_slot_with_wait(
-            _quick_key,
-            source,
-        )
+        if _admission_acquired:
+            from gateway.admission import await_admitted_handoff
+
+            _active_session_lease, _limit_message = await await_admitted_handoff(
+                self._claim_active_session_slot_with_wait(_quick_key, source),
+                controller=_admission,
+                task_id=_quick_key,
+                on_release=self._persist_active_agents,
+            )
+        else:
+            _active_session_lease, _limit_message = await self._claim_active_session_slot_with_wait(
+                _quick_key,
+                source,
+            )
         if _limit_message is not None:
             if _admission_acquired:
                 await _admission.release(_quick_key, outcome="lease_rejected")

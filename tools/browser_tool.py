@@ -135,6 +135,18 @@ def _stop_scoped_browser_workload(proc: subprocess.Popen) -> None:
     if proc.poll() is None:
         proc.kill()
 
+
+def _track_scope_environment(proc: subprocess.Popen, argv: List[str]) -> None:
+    from tools.process_registry import _cleanup_scope_environment_when_done
+
+    _cleanup_scope_environment_when_done(proc, argv)
+
+
+def _discard_scope_environment(argv: List[str]) -> None:
+    from tools.process_registry import _discard_scope_environment as discard
+
+    discard(argv)
+
 try:
     from tools.website_policy import check_website_access
 except Exception:
@@ -1181,11 +1193,16 @@ def _run_chrome_fallback_command(
                 environment=browser_env,
                 session_name=tmp_session,
             )
-            proc = subprocess.Popen(
-                full, stdout=stdout_fd, stderr=stderr_fd,
-                stdin=subprocess.DEVNULL, env=browser_env,
-                **_popen_extra,
-            )
+            try:
+                proc = subprocess.Popen(
+                    full, stdout=stdout_fd, stderr=stderr_fd,
+                    stdin=subprocess.DEVNULL, env=browser_env,
+                    **_popen_extra,
+                )
+            except BaseException:
+                _discard_scope_environment(full)
+                raise
+            _track_scope_environment(proc, full)
             proc._hermes_systemd_unit = browser_scope
         finally:
             os.close(stdout_fd)
@@ -2528,14 +2545,19 @@ def _run_browser_command(
                 environment=browser_env,
                 session_name=session_info["session_name"],
             )
-            proc = subprocess.Popen(
-                cmd_parts,
-                stdout=stdout_fd,
-                stderr=stderr_fd,
-                stdin=subprocess.DEVNULL,
-                env=browser_env,
-                **_popen_extra,
-            )
+            try:
+                proc = subprocess.Popen(
+                    cmd_parts,
+                    stdout=stdout_fd,
+                    stderr=stderr_fd,
+                    stdin=subprocess.DEVNULL,
+                    env=browser_env,
+                    **_popen_extra,
+                )
+            except BaseException:
+                _discard_scope_environment(cmd_parts)
+                raise
+            _track_scope_environment(proc, cmd_parts)
             proc._hermes_systemd_unit = browser_scope
         finally:
             os.close(stdout_fd)

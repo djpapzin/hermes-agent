@@ -66,6 +66,25 @@ def notify_gateway_admission_changed() -> None:
         controller._notify_change()
 
 
+async def await_admitted_handoff(
+    awaitable: Awaitable,
+    *,
+    controller: "AgentAdmissionController",
+    task_id: str,
+    on_release: Optional[Callable[[], None]] = None,
+):
+    """Await pre-agent handoff while guaranteeing slot release on interruption."""
+    try:
+        return await awaitable
+    except BaseException:
+        await asyncio.shield(
+            controller.release(task_id, outcome="lease_wait_interrupted")
+        )
+        if on_release is not None:
+            on_release()
+        raise
+
+
 def _decorated_task_id(
     prefix: str,
     id_kwargs: tuple[str, ...],

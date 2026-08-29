@@ -2997,7 +2997,7 @@ DEFAULT_CONFIG = {
     "gateway": {
         "admission": {
             "max_parallel_agents": 3,
-            "min_host_memory_headroom_mb": 2048,
+            "min_host_memory_headroom_mb": 0,
             "queue_limit": 16,
             "poll_interval_seconds": 2.0,
         },

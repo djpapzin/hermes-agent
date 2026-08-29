@@ -9,6 +9,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from hermes_constants import get_hermes_home
+
 
 _INCIDENT_MARKERS = (
     "HERMES_ADMISSION",
@@ -196,6 +198,7 @@ def collect(
             row["rss_kb"] += int(rss_kb or 0)
 
     worker_scope_rows: list[dict[str, Any]] = []
+    worker_slice_paths: set[str] = set()
     for relative, row in sorted(worker_cgroups.items()):
         root = cgroup_root / relative
         row.update(
@@ -208,9 +211,26 @@ def collect(
         )
         row["pids"] = sorted(row["pids"])
         worker_scope_rows.append(row)
+        parts = Path(relative).parts
+        if "hermes-workers.slice" in parts:
+            index = parts.index("hermes-workers.slice")
+            worker_slice_paths.add(str(Path(*parts[: index + 1])))
+    worker_slice_rows: list[dict[str, Any]] = []
+    for relative in sorted(worker_slice_paths):
+        root = cgroup_root / relative
+        worker_slice_rows.append(
+            {
+                "cgroup": "/" + relative,
+                "memory_current": _read(root / "memory.current"),
+                "memory_high": _read(root / "memory.high"),
+                "memory_max": _read(root / "memory.max"),
+                "memory_events": _fields(root / "memory.events"),
+            }
+        )
     result["workers"] = worker_rows[:100]
     result["worker_process_count"] = len(worker_rows)
     result["worker_cgroups"] = worker_scope_rows[:100]
+    result["worker_slices"] = worker_slice_rows
     result["worker_count"] = len(worker_scope_rows)
     return result
 
@@ -218,7 +238,7 @@ def collect(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--unit", default="hermes-gateway.service")
-    parser.add_argument("--hermes-home", type=Path, default=Path.home() / ".hermes")
+    parser.add_argument("--hermes-home", type=Path, default=get_hermes_home())
     parser.add_argument("--since-minutes", type=int, default=30)
     args = parser.parse_args()
     result = collect(args.unit, args.hermes_home)

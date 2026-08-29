@@ -12,6 +12,10 @@ import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass
+from pathlib import Path
+
+
+_SYSTEM_SCOPE_WRAPPER = Path("/usr/local/sbin/hermes-worker-scope")
 
 
 @dataclass(frozen=True)
@@ -30,8 +34,8 @@ def _current_posix_ids() -> tuple[int, int]:
 
 
 def validate_bounds(memory_max_mb: int, allocation_mb: int) -> None:
-    if not 16 <= memory_max_mb <= 64:
-        raise ValueError("memory-max-mb must be between 16 and 64")
+    if not 64 <= memory_max_mb <= 96:
+        raise ValueError("memory-max-mb must be between 64 and 96")
     if not memory_max_mb < allocation_mb <= 128:
         raise ValueError(
             "allocation-mb must exceed memory-max-mb and be at most 128"
@@ -46,13 +50,34 @@ def build_scope_command(
     allocation_mb: int,
     uid: int,
     gid: int,
+    environment_path: Path | None = None,
 ) -> list[str]:
     validate_bounds(memory_max_mb, allocation_mb)
     systemd_run = shutil.which("systemd-run") or "/usr/bin/systemd-run"
     prefix = [systemd_run, "--user"]
     if backend == "system":
+        if environment_path is None:
+            raise ValueError("system proof requires a private environment payload")
         sudo = shutil.which("sudo") or "/usr/bin/sudo"
-        prefix = [sudo, "-n", systemd_run, "--system"]
+        memory_max = memory_max_mb * 1024 * 1024
+        code = (
+            "import time; "
+            f"payload=bytearray({allocation_mb}*1024*1024); "
+            "time.sleep(0.25); print(len(payload))"
+        )
+        return [
+            sudo,
+            "-n",
+            str(_SYSTEM_SCOPE_WRAPPER),
+            "run",
+            unit,
+            str(memory_max),
+            str(environment_path),
+            "--",
+            sys.executable,
+            "-c",
+            code,
+        ]
     elif backend != "user":
         raise ValueError("backend must be user or system")
 
@@ -124,15 +149,22 @@ def run_proof(
     if before.active_state != "active" or before.main_pid <= 0:
         raise RuntimeError(f"refusing proof: {gateway_unit} is not active")
 
-    unit = f"hermes-worker-boundary-proof-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    suffix = f"boundary-proof-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    unit = f"hermes-worker-system-{suffix}" if backend == "system" else f"hermes-worker-{suffix}"
     uid, gid = _current_posix_ids()
+    environment_path = None
+    if backend == "system":
+        from tools.process_registry import _write_worker_environment
+
+        environment_path = _write_worker_environment(dict(os.environ), suffix)
     command = build_scope_command(
         backend=backend,
-        unit=unit,
+        unit=suffix if backend == "system" else unit,
         memory_max_mb=memory_max_mb,
         allocation_mb=allocation_mb,
         uid=uid,
         gid=gid,
+        environment_path=environment_path,
     )
     started_at = time.time()
     try:
@@ -148,6 +180,11 @@ def run_proof(
         raise RuntimeError(
             f"worker scope {unit}.scope exceeded the 15-second proof timeout"
         ) from exc
+    finally:
+        if backend == "system":
+            from tools.process_registry import _discard_scope_environment
+
+            _discard_scope_environment(command)
     after = service_state(gateway_unit)
     kernel_command = [
         "journalctl",
@@ -157,9 +194,8 @@ def run_proof(
         "--no-pager",
         "--output=cat",
     ]
-    if backend == "system":
-        sudo = shutil.which("sudo") or "/usr/bin/sudo"
-        kernel_command = [sudo, "-n", *kernel_command]
+    # Kernel journal access is best-effort. The runtime sudo policy
+    # intentionally does not grant arbitrary journalctl access.
     kernel = subprocess.run(
         kernel_command,
         check=False,
@@ -202,7 +238,13 @@ def _stop_scope(backend: str, unit: str) -> None:
     command = ["systemctl", "--user", "stop", scope]
     if backend == "system":
         sudo = shutil.which("sudo") or "/usr/bin/sudo"
-        command = [sudo, "-n", "systemctl", "stop", scope]
+        command = [
+            sudo,
+            "-n",
+            str(_SYSTEM_SCOPE_WRAPPER),
+            "stop",
+            scope,
+        ]
     subprocess.run(
         command,
         check=False,
@@ -215,8 +257,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("user", "system"), default="user")
     parser.add_argument("--gateway-unit", default="hermes-gateway.service")
-    parser.add_argument("--memory-max-mb", type=int, default=16)
-    parser.add_argument("--allocation-mb", type=int, default=64)
+    parser.add_argument("--memory-max-mb", type=int, default=64)
+    parser.add_argument("--allocation-mb", type=int, default=96)
     args = parser.parse_args(argv)
     try:
         record = run_proof(

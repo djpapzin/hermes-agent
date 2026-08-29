@@ -1,6 +1,13 @@
 import json
+import subprocess
 
-from scripts.hermes_health_guard import GuardSnapshot, evaluate, main
+from scripts.hermes_health_guard import (
+    GuardSnapshot,
+    _run,
+    _telegram_enabled,
+    evaluate,
+    main,
+)
 
 
 def _snapshot(**overrides):
@@ -74,3 +81,51 @@ def test_disabled_telegram_is_not_reported_disconnected():
     )
 
     assert "telegram_polling=disconnected" not in reasons
+
+
+def test_probe_failure_is_an_explicit_alert():
+    reasons = evaluate(
+        _snapshot(probe_errors=("systemctl:MainPID", "journalctl")),
+        max_tasks=500,
+        max_memory=8000,
+        max_wal=1000,
+        lock_threshold=10,
+    )
+
+    assert reasons[:2] == [
+        "probe_unavailable=systemctl:MainPID",
+        "probe_unavailable=journalctl",
+    ]
+
+
+def test_subprocess_timeout_becomes_unavailable_result(monkeypatch):
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired("systemctl", 5)
+        ),
+    )
+
+    result = _run("systemctl", "show", "hermes-gateway.service")
+
+    assert result.returncode == 124
+
+
+def test_telegram_enablement_resolves_nested_config_and_secret_file(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "gateway:\n  platforms:\n    telegram:\n      enabled: true\n",
+        encoding="utf-8",
+    )
+    assert _telegram_enabled(config) is True
+
+    config.write_text("{}\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("TELEGRAM_BOT_TOKEN=secret\n", encoding="utf-8")
+    assert _telegram_enabled(config) is True
+
+    config.write_text(
+        "platforms:\n  telegram:\n    enabled: false\n",
+        encoding="utf-8",
+    )
+    assert _telegram_enabled(config) is False

@@ -84,6 +84,7 @@ _SYSTEMD_SCOPE_PROBE_LOCK = threading.Lock()
 _SYSTEMD_SCOPE_PROBED_AT = 0.0
 _SYSTEMD_SCOPE_FAILURE_TTL_SECONDS = 60.0
 _SYSTEMD_SYSTEM_SCOPE_AVAILABLE: Optional[bool] = None
+_SYSTEMD_SYSTEM_SCOPE_PROBED_AT = 0.0
 _MIN_WORKER_MEMORY_MAX_BYTES = 64 * 1024 * 1024
 _DEFAULT_WORKER_MEMORY_MAX_BYTES = 1024 * 1024 * 1024
 _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
@@ -96,7 +97,7 @@ def _write_worker_environment(
     """Write a private, one-shot environment payload for the root wrapper."""
     env_dir = get_hermes_home() / "state" / "worker-env"
     env_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = env_dir / f"{unit_suffix}-{uuid.uuid4().hex}.json"
+    path = env_dir / f"{os.getpid()}-{unit_suffix}-{uuid.uuid4().hex}.json"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags | nofollow, 0o600)
@@ -114,6 +115,80 @@ def _write_worker_environment(
         if fd >= 0:
             os.close(fd)
     return path
+
+
+def _scope_environment_path(argv: List[str]) -> Optional[Path]:
+    """Return the private system-scope payload referenced by wrapper argv."""
+    try:
+        wrapper_index = argv.index(str(_SYSTEM_SCOPE_WRAPPER))
+        if argv[wrapper_index + 1] != "run" or argv[wrapper_index + 5] != "--":
+            return None
+        return Path(argv[wrapper_index + 4])
+    except (IndexError, ValueError):
+        return None
+
+
+def _discard_scope_environment(argv: List[str]) -> None:
+    path = _scope_environment_path(argv)
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("Could not remove worker environment payload %s: %s", path, exc)
+
+
+def _cleanup_scope_environment_when_done(process: Any, argv: List[str]) -> None:
+    """Remove a payload if sudo/wrapper exits before consuming it."""
+    path = _scope_environment_path(argv)
+    if path is None:
+        return
+
+    def cleanup() -> None:
+        deadline = time.monotonic() + 60
+        while path.exists() and time.monotonic() < deadline:
+            try:
+                poll = getattr(process, "poll", None)
+                if callable(poll) and poll() is not None:
+                    _discard_scope_environment(argv)
+                    return
+                isalive = getattr(process, "isalive", None)
+                if callable(isalive) and not isalive():
+                    _discard_scope_environment(argv)
+                    return
+            except Exception:
+                return
+            time.sleep(0.05)
+
+    threading.Thread(
+        target=cleanup,
+        daemon=True,
+        name="hermes-worker-env-cleanup",
+    ).start()
+
+
+def _cleanup_orphaned_worker_environments() -> None:
+    """Delete crash leftovers whose creating gateway PID no longer exists."""
+    import psutil
+
+    root = get_hermes_home() / "state" / "worker-env"
+    try:
+        candidates = list(root.glob("*.json"))
+    except OSError:
+        return
+    for path in candidates:
+        try:
+            creator_pid = int(path.name.split("-", 1)[0])
+            if psutil.pid_exists(creator_pid):
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        except (OSError, TypeError, ValueError):
+            continue
 
 
 def _worker_memory_max_bytes() -> int:
@@ -211,9 +286,15 @@ def _systemd_run_user_scope_available() -> bool:
 
 
 def _systemd_run_system_scope_available() -> bool:
-    global _SYSTEMD_SYSTEM_SCOPE_AVAILABLE
-    if _SYSTEMD_SYSTEM_SCOPE_AVAILABLE is not None:
+    global _SYSTEMD_SYSTEM_SCOPE_AVAILABLE, _SYSTEMD_SYSTEM_SCOPE_PROBED_AT
+    now = time.monotonic()
+    if _SYSTEMD_SYSTEM_SCOPE_AVAILABLE is True:
         return _SYSTEMD_SYSTEM_SCOPE_AVAILABLE
+    if (
+        _SYSTEMD_SYSTEM_SCOPE_AVAILABLE is False
+        and now - _SYSTEMD_SYSTEM_SCOPE_PROBED_AT < _SYSTEMD_SCOPE_FAILURE_TTL_SECONDS
+    ):
+        return False
     available = False
     try:
         import shutil
@@ -238,6 +319,7 @@ def _systemd_run_system_scope_available() -> bool:
     except Exception as exc:
         logger.debug("systemd system-scope probe error: %s", exc)
     _SYSTEMD_SYSTEM_SCOPE_AVAILABLE = available
+    _SYSTEMD_SYSTEM_SCOPE_PROBED_AT = time.monotonic()
     return available
 
 
@@ -245,10 +327,10 @@ def _worker_scope_backend() -> Optional[str]:
     mode = _worker_cgroup_mode()
     if mode == "off":
         return None
-    if mode in {"auto", "user", "required"} and _systemd_run_user_scope_available():
-        return "user"
     if mode in {"system", "required"} and _systemd_run_system_scope_available():
         return "system"
+    if mode in {"auto", "user", "required"} and _systemd_run_user_scope_available():
+        return "user"
     return None
 
 
@@ -1022,12 +1104,17 @@ class ProcessRegistry:
                             "Worker cgroup isolation is required but no systemd scope backend is available"
                         )
                     logger.warning("PTY worker %s shares the gateway cgroup", session.id)
-                pty_proc = _PtyProcessCls.spawn(
-                    pty_argv,
-                    cwd=session.cwd,
-                    env=pty_env,
-                    dimensions=(30, 120),
-                )
+                try:
+                    pty_proc = _PtyProcessCls.spawn(
+                        pty_argv,
+                        cwd=session.cwd,
+                        env=pty_env,
+                        dimensions=(30, 120),
+                    )
+                except BaseException:
+                    _discard_scope_environment(pty_argv)
+                    raise
+                _cleanup_scope_environment_when_done(pty_proc, pty_argv)
                 session.pid = pty_proc.pid
                 session.host_start_time = self._safe_host_start_time(session.pid)
                 # Store the pty handle on the session for read/write
@@ -1093,19 +1180,24 @@ class ProcessRegistry:
                     )
                 logger.warning("Local worker %s shares the gateway cgroup", session.id)
 
-        proc = subprocess.Popen(
-            spawn_argv,
-            text=True,
-            cwd=session.cwd,
-            env=bg_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            **_popen_kwargs,
-        )
+        try:
+            proc = subprocess.Popen(
+                spawn_argv,
+                text=True,
+                cwd=session.cwd,
+                env=bg_env,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                **_popen_kwargs,
+            )
+        except BaseException:
+            _discard_scope_environment(spawn_argv)
+            raise
+        _cleanup_scope_environment_when_done(proc, spawn_argv)
 
         session.process = proc
         session.pid = proc.pid
@@ -2367,7 +2459,10 @@ class ProcessRegistry:
         return recovered
 
 
-# Module-level singleton
+# Module-level singleton. A prior hard kill can strand a secret-bearing payload
+# before sudo starts; the filename carries its creator PID so a new gateway can
+# remove only dead-creator leftovers.
+_cleanup_orphaned_worker_environments()
 process_registry = ProcessRegistry()
 
 

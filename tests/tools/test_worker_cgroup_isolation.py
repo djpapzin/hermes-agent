@@ -1,8 +1,10 @@
 """Behavior-level worker cgroup isolation tests for the VM downstream."""
 
 import json
+import threading
 from unittest.mock import patch
 
+import psutil
 import pytest
 
 
@@ -107,6 +109,84 @@ def test_system_scope_serializes_environment_outside_sudo_arguments(
     assert str(env_path) in argv
     assert "DISPLAY" not in " ".join(argv)
     assert "/tmp/s" not in " ".join(argv)
+
+
+def test_failed_launcher_removes_private_environment_payload(monkeypatch, tmp_path):
+    import tools.process_registry as pr
+
+    wrapper = tmp_path / "hermes-worker-scope"
+    wrapper.touch()
+    payload = tmp_path / "payload.json"
+    payload.write_text('{"TOKEN": "secret"}', encoding="utf-8")
+    monkeypatch.setattr(pr, "_SYSTEM_SCOPE_WRAPPER", wrapper)
+    argv = [
+        "/usr/bin/sudo", "-n", str(wrapper), "run", "scope", "67108864",
+        str(payload), "--", "/bin/true",
+    ]
+
+    class FailedProcess:
+        def poll(self):
+            return 1
+
+    pr._cleanup_scope_environment_when_done(FailedProcess(), argv)
+    for thread in threading.enumerate():
+        if thread.name == "hermes-worker-env-cleanup":
+            thread.join(timeout=1)
+
+    assert not payload.exists()
+
+
+def test_gateway_startup_removes_dead_creator_payload(monkeypatch, tmp_path):
+    import tools.process_registry as pr
+
+    root = tmp_path / "state" / "worker-env"
+    root.mkdir(parents=True)
+    payload = root / "999999-scope-secret.json"
+    payload.write_text('{"TOKEN": "secret"}', encoding="utf-8")
+    monkeypatch.setattr(pr, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(psutil, "pid_exists", lambda _pid: False)
+
+    pr._cleanup_orphaned_worker_environments()
+
+    assert not payload.exists()
+
+
+def test_system_scope_negative_probe_retries_after_ttl(monkeypatch, tmp_path):
+    import tools.process_registry as pr
+
+    wrapper = tmp_path / "hermes-worker-scope"
+    wrapper.touch()
+    monkeypatch.setattr(pr, "_SYSTEM_SCOPE_WRAPPER", wrapper)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: {"systemd-run": "/usr/bin/systemd-run", "sudo": "/usr/bin/sudo"}.get(name),
+    )
+    monkeypatch.setattr(pr, "_build_systemd_scope_argv", lambda *_args, **_kwargs: ["probe"])
+    now = [100.0]
+    monkeypatch.setattr(pr.time, "monotonic", lambda: now[0])
+    results = iter([1, 0])
+    monkeypatch.setattr(
+        pr.subprocess,
+        "run",
+        lambda *_args, **_kwargs: type("Result", (), {"returncode": next(results)})(),
+    )
+    pr._SYSTEMD_SYSTEM_SCOPE_AVAILABLE = None
+    pr._SYSTEMD_SYSTEM_SCOPE_PROBED_AT = 0.0
+
+    assert pr._systemd_run_system_scope_available() is False
+    assert pr._systemd_run_system_scope_available() is False
+    now[0] += pr._SYSTEMD_SCOPE_FAILURE_TTL_SECONDS + 1
+    assert pr._systemd_run_system_scope_available() is True
+
+
+def test_required_mode_prefers_aggregate_system_scope(monkeypatch):
+    import tools.process_registry as pr
+
+    monkeypatch.setattr(pr, "_worker_cgroup_mode", lambda: "required")
+    monkeypatch.setattr(pr, "_systemd_run_system_scope_available", lambda: True)
+    monkeypatch.setattr(pr, "_systemd_run_user_scope_available", lambda: True)
+
+    assert pr._worker_scope_backend() == "system"
 
 
 def test_required_mode_refuses_worker_in_gateway_cgroup(monkeypatch, tmp_path):

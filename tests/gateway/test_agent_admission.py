@@ -9,6 +9,7 @@ import pytest
 from gateway.admission import (
     AdmissionRejected,
     AgentAdmissionController,
+    await_admitted_handoff,
     cgroup_available_memory_mb,
     clear_gateway_admission,
     gateway_admitted_async,
@@ -37,6 +38,29 @@ def test_unbounded_cgroup_defers_to_host_headroom(tmp_path):
     (cgroup_dir / "memory.current").write_text("123", encoding="utf-8")
 
     assert cgroup_available_memory_mb(cgroup_file, tmp_path / "root") is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_pre_agent_handoff_releases_admission_slot():
+    controller = AgentAdmissionController(max_parallel=1, queue_limit=1)
+    await controller.acquire("cancelled")
+    waiting = asyncio.Event()
+
+    async def handoff():
+        waiting.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(
+        await_admitted_handoff(
+            handoff(), controller=controller, task_id="cancelled"
+        )
+    )
+    await waiting.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert controller.snapshot().active == 0
 
 
 @pytest.mark.asyncio

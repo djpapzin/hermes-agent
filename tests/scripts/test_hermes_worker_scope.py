@@ -1,0 +1,112 @@
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
+from scripts import hermes_worker_scope as wrapper
+
+CURRENT_UID = int(getattr(os, "getuid", lambda: 996)())
+CURRENT_GID = int(getattr(os, "getgid", lambda: 996)())
+
+
+def test_wrapper_builds_fixed_bounded_worker_slice(tmp_path, monkeypatch):
+    env_root = tmp_path / "input"
+    env_root.mkdir(mode=0o700)
+    payload = env_root / "payload.json"
+    payload.write_text('{"DISPLAY": ":99"}', encoding="utf-8")
+    payload.chmod(0o600)
+    monkeypatch.setattr(wrapper, "ENV_ROOT", env_root)
+    monkeypatch.setattr(wrapper, "WORKER_UID", CURRENT_UID)
+    monkeypatch.setattr(wrapper, "WORKER_GID", CURRENT_GID)
+    calls = []
+    def run(argv, **_kwargs):
+        if argv[0] == "/usr/bin/systemctl":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"LoadState=loaded\nMemoryMax={10 * 1024 * 1024 * 1024}\n",
+            )
+        calls.append(argv)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(wrapper.subprocess, "run", run)
+
+    assert wrapper._run(
+        ["run", "safe-unit", str(64 * 1024 * 1024), str(payload), "--", "/bin/true"]
+    ) == 0
+
+    argv = calls[0]
+    assert argv[argv.index("--uid") + 1] == str(CURRENT_UID)
+    assert argv[argv.index("--gid") + 1] == str(CURRENT_GID)
+    assert argv[argv.index("--slice") + 1] == "hermes-workers.slice"
+    assert "MemoryMax=67108864" in argv
+    assert argv[-4:] == ["exec", str(payload), "--", "/bin/true"]
+    assert ":99" not in " ".join(argv)
+    assert not payload.exists()
+
+
+def test_wrapper_rejects_option_injection_and_multiple_stop_units(monkeypatch):
+    monkeypatch.setattr(wrapper, "_validate_caller", lambda: None)
+    calls = []
+    monkeypatch.setattr(
+        wrapper.subprocess,
+        "run",
+        lambda argv, check=False: calls.append(argv) or SimpleNamespace(returncode=0),
+    )
+
+    assert wrapper.main(["stop", "hermes-worker-system-one.scope", "ssh.service"]) == 2
+    assert wrapper.main(["stop", "ssh.service"]) == 2
+    assert calls == []
+
+
+def test_wrapper_rejects_missing_aggregate_slice(tmp_path, monkeypatch):
+    env_root = tmp_path / "input"
+    env_root.mkdir(mode=0o700)
+    payload = env_root / "payload.json"
+    payload.write_text("{}", encoding="utf-8")
+    payload.chmod(0o600)
+    monkeypatch.setattr(wrapper, "ENV_ROOT", env_root)
+    monkeypatch.setattr(wrapper, "WORKER_UID", CURRENT_UID)
+    monkeypatch.setattr(
+        wrapper.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="LoadState=not-found\nMemoryMax=infinity\n",
+        ),
+    )
+
+    try:
+        wrapper._run(
+            ["run", "safe-unit", str(64 * 1024 * 1024), str(payload), "--", "/bin/true"]
+        )
+    except ValueError as exc:
+        assert "absent or unbounded" in str(exc)
+    else:
+        raise AssertionError("unbounded aggregate slice was accepted")
+
+
+def test_worker_exec_consumes_private_environment(tmp_path, monkeypatch):
+    env_root = tmp_path / "input"
+    env_root.mkdir(mode=0o700)
+    payload = env_root / "payload.json"
+    payload.write_text('{"HOME": "/safe", "PATH": "/usr/bin"}', encoding="utf-8")
+    payload.chmod(0o600)
+    monkeypatch.setattr(wrapper, "ENV_ROOT", env_root)
+    monkeypatch.setattr(wrapper, "WORKER_UID", CURRENT_UID)
+    calls = []
+    monkeypatch.setattr(
+        wrapper.os,
+        "execvpe",
+        lambda executable, argv, env: calls.append((executable, argv, env)),
+    )
+
+    assert wrapper._exec_worker(
+        ["exec", str(payload), "--", "/bin/true", "--literal"]
+    ) == 127
+    assert calls == [
+        (
+            "/bin/true",
+            ["/bin/true", "--literal"],
+            {"HOME": "/safe", "PATH": "/usr/bin"},
+        )
+    ]
+    assert not payload.exists()

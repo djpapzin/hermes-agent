@@ -670,6 +670,7 @@ class _CuaDriverSession:
         # an opaque "never reached ready".
         self._startup_phase = "binary-check"
 
+        scoped_argv: list[str] = []
         try:
             if not cua_driver_binary_available():
                 raise RuntimeError(cua_driver_install_hint())
@@ -727,6 +728,16 @@ class _CuaDriverSession:
             self._ready_event.set()
             raise
         finally:
+            if scoped_argv:
+                try:
+                    from tools.process_registry import _discard_scope_environment
+
+                    _discard_scope_environment(scoped_argv)
+                except Exception:
+                    logger.debug(
+                        "Could not remove CUA worker environment payload",
+                        exc_info=True,
+                    )
             # Clearing _session before the contexts unwind would let a
             # racing call_tool see None during teardown — but the
             # outer context-manager exits AFTER this block, so set to

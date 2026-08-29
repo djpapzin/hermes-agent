@@ -1352,6 +1352,8 @@ class LocalEnvironment(BaseEnvironment):
             try:
                 from tools.process_registry import (
                     _build_systemd_scope_argv,
+                    _cleanup_scope_environment_when_done,
+                    _discard_scope_environment,
                     _is_supervised_gateway_process,
                     _worker_cgroup_mode,
                     _worker_scope_backend,
@@ -1406,19 +1408,32 @@ class LocalEnvironment(BaseEnvironment):
 
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
-        proc = subprocess.Popen(
-            args,
-            text=True,
-            env=run_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            start_new_session=True,
-            cwd=_popen_cwd,
-            **_popen_kwargs,
-        )
+        try:
+            proc = subprocess.Popen(
+                args,
+                text=True,
+                env=run_env,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+                start_new_session=True,
+                cwd=_popen_cwd,
+                **_popen_kwargs,
+            )
+        except BaseException:
+            if not _IS_WINDOWS:
+                try:
+                    _discard_scope_environment(args)
+                except NameError:
+                    pass
+            raise
+        if not _IS_WINDOWS:
+            try:
+                _cleanup_scope_environment_when_done(proc, args)
+            except NameError:
+                pass
         if not _IS_WINDOWS:
             proc._hermes_systemd_unit = systemd_unit
             try:

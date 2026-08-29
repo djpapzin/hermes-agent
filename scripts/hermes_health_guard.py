@@ -33,10 +33,11 @@ class GuardSnapshot:
     state_db_exists: bool
     active_agents: int
     queued_tasks: int
+    probe_errors: tuple[str, ...] = ()
 
 
 def evaluate(snapshot: GuardSnapshot, *, max_tasks: int, max_memory: int, max_wal: int, lock_threshold: int) -> list[str]:
-    reasons: list[str] = []
+    reasons: list[str] = [f"probe_unavailable={item}" for item in snapshot.probe_errors]
     if snapshot.active_state != "active":
         reasons.append(f"active_state={snapshot.active_state or 'unknown'}")
     if snapshot.tasks > max_tasks:
@@ -63,7 +64,16 @@ def evaluate(snapshot: GuardSnapshot, *, max_tasks: int, max_memory: int, max_wa
 
 
 def _run(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, check=False, text=True, capture_output=True)
+    try:
+        return subprocess.run(
+            args,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(args, 124, "", str(exc))
 
 
 def _runtime_counts(path: Path) -> tuple[int, int]:
@@ -83,9 +93,30 @@ def _telegram_enabled(path: Path) -> bool:
         import yaml
 
         payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        gateway = payload.get("gateway") if isinstance(payload, dict) else {}
         platforms = payload.get("platforms") if isinstance(payload, dict) else {}
+        if not isinstance(platforms, dict):
+            platforms = {}
+        if isinstance(gateway, dict) and isinstance(gateway.get("platforms"), dict):
+            platforms = {**platforms, **gateway["platforms"]}
         telegram = platforms.get("telegram") if isinstance(platforms, dict) else {}
-        return bool(telegram.get("enabled")) if isinstance(telegram, dict) else False
+        if isinstance(telegram, dict) and "enabled" in telegram:
+            return bool(telegram.get("enabled"))
+        if isinstance(telegram, dict) and telegram.get("token"):
+            return True
+        if os.environ.get("TELEGRAM_BOT_TOKEN"):
+            return True
+        env_path = path.parent / ".env"
+        if env_path.is_file():
+            for raw in env_path.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.removeprefix("export ").strip()
+                if key == "TELEGRAM_BOT_TOKEN" and value.strip().strip("'\""):
+                    return True
+        return False
     except (ImportError, OSError, TypeError, ValueError):
         return False
 
@@ -97,15 +128,19 @@ def collect_snapshot(
     lock_window_seconds: int,
     runner: Callable[..., subprocess.CompletedProcess[str]] = _run,
 ) -> GuardSnapshot:
+    probe_errors: list[str] = []
+
     def prop(name: str) -> str:
         proc = runner(
             "systemctl", "show", unit, f"--property={name}", "--value"
         )
+        if proc.returncode != 0:
+            probe_errors.append(f"systemctl:{name}")
         return proc.stdout.strip()
 
     active = prop("ActiveState")
     main_pid = int(prop("MainPID") or 0)
-    journal = runner(
+    journal_result = runner(
         "journalctl",
         "-u",
         unit,
@@ -113,8 +148,14 @@ def collect_snapshot(
         f"-{lock_window_seconds} seconds",
         "--no-pager",
         "--output=cat",
-    ).stdout.lower()
-    sockets = runner("ss", "-H", "-tnp").stdout
+    )
+    if journal_result.returncode != 0:
+        probe_errors.append("journalctl")
+    journal = journal_result.stdout.lower()
+    socket_result = runner("ss", "-H", "-tnp")
+    if socket_result.returncode != 0:
+        probe_errors.append("ss")
+    sockets = socket_result.stdout
     pid_marker = f"pid={main_pid},"
     telegram_connected = any(
         "ESTAB" in line
@@ -141,6 +182,7 @@ def collect_snapshot(
         state_db_exists=(hermes_home / "state.db").exists(),
         active_agents=active_agents,
         queued_tasks=queued_tasks,
+        probe_errors=tuple(probe_errors),
     )
 
 

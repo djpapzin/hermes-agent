@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from gateway.shutdown_forensics import snapshot_shutdown_context
+from scripts import hermes_gateway_diagnostics as diagnostics
 from scripts.hermes_gateway_diagnostics import collect
 
 
@@ -28,8 +29,8 @@ def test_diagnostic_groups_worker_cgroup_memory_and_oom_events(tmp_path, monkeyp
     (proc / "meminfo").write_text("MemAvailable: 4096 kB\n", encoding="utf-8")
     for pid, rss, relative in (
         (100, 1000, "system.slice/hermes.service"),
-        (200, 2000, "system.slice/hermes-worker-browser.scope"),
-        (201, 3000, "system.slice/hermes-worker-browser.scope"),
+        (200, 2000, "hermes-workers.slice/hermes-worker-browser.scope"),
+        (201, 3000, "hermes-workers.slice/hermes-worker-browser.scope"),
     ):
         root = proc / str(pid)
         root.mkdir()
@@ -39,7 +40,7 @@ def test_diagnostic_groups_worker_cgroup_memory_and_oom_events(tmp_path, monkeyp
     for relative, current, events in (
         ("system.slice/hermes.service", "100", "oom 0\noom_kill 0\n"),
         (
-            "system.slice/hermes-worker-browser.scope",
+            "hermes-workers.slice/hermes-worker-browser.scope",
             "500",
             "oom 1\noom_kill 1\n",
         ),
@@ -50,6 +51,13 @@ def test_diagnostic_groups_worker_cgroup_memory_and_oom_events(tmp_path, monkeyp
         (root / "memory.high").write_text("1000", encoding="utf-8")
         (root / "memory.max").write_text("2000", encoding="utf-8")
         (root / "memory.events").write_text(events, encoding="utf-8")
+    worker_slice = cgroups / "hermes-workers.slice"
+    (worker_slice / "memory.current").write_text("500", encoding="utf-8")
+    (worker_slice / "memory.high").write_text("800", encoding="utf-8")
+    (worker_slice / "memory.max").write_text("1000", encoding="utf-8")
+    (worker_slice / "memory.events").write_text(
+        "high 1\noom 1\noom_kill 0\n", encoding="utf-8"
+    )
 
     monkeypatch.setattr(
         "scripts.hermes_gateway_diagnostics._service_pid", lambda _unit: 100
@@ -64,6 +72,8 @@ def test_diagnostic_groups_worker_cgroup_memory_and_oom_events(tmp_path, monkeyp
     assert result["worker_process_count"] == 2
     assert result["worker_cgroups"][0]["rss_kb"] == 5000
     assert result["worker_cgroups"][0]["memory_events"]["oom_kill"] == 1
+    assert result["worker_slices"][0]["memory_max"] == "1000"
+    assert result["worker_slices"][0]["memory_events"]["high"] == 1
     assert len(result["workers"]) == 2
 
 
@@ -114,3 +124,19 @@ def test_diagnostic_scans_orphan_worker_when_gateway_is_absent(tmp_path, monkeyp
     assert result["gateway_pid"] is None
     assert result["worker_count"] == 1
     assert result["workers"][0]["pid"] == 222
+
+
+def test_diagnostic_defaults_to_active_profile_home(tmp_path, monkeypatch, capsys):
+    seen = []
+    monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        diagnostics,
+        "collect",
+        lambda _unit, home: seen.append(home) or {},
+    )
+    monkeypatch.setattr(diagnostics, "_bounded_incident_journal", lambda *_args: [])
+    monkeypatch.setattr("sys.argv", ["hermes_gateway_diagnostics.py"])
+
+    assert diagnostics.main() == 0
+    assert seen == [tmp_path]
+    capsys.readouterr()
