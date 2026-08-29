@@ -192,7 +192,7 @@ def _user_scope_oom_evidence(unit: str, started_at: float) -> bool:
             "--since",
             f"@{int(started_at)}",
             "--no-pager",
-            "--output=cat",
+            "--output=json",
             "--lines=100",
         ],
         check=False,
@@ -202,10 +202,24 @@ def _user_scope_oom_evidence(unit: str, started_at: float) -> bool:
     )
     marker = "A process of this unit has been killed by the OOM killer."
     scope_unit = unit + ".scope"
-    return result.returncode == 0 and any(
-        line.strip() in {marker, f"{scope_unit}: {marker}"}
-        for line in result.stdout.splitlines()
-    )
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.splitlines():
+        try:
+            row = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if (
+            row.get("_COMM") == "systemd"
+            and row.get("SYSLOG_IDENTIFIER") == "systemd"
+            and row.get("_TRANSPORT") == "journal"
+            and row.get("_SYSTEMD_USER_UNIT") == "init.scope"
+            and row.get("USER_UNIT") == scope_unit
+            and str(row.get("MESSAGE") or "").strip()
+            in {marker, f"{scope_unit}: {marker}"}
+        ):
+            return True
+    return False
 
 
 def run_proof(

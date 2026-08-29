@@ -76,11 +76,40 @@ def test_wrapper_emits_only_unit_bound_recent_oom_attestation(monkeypatch, capsy
     monkeypatch.setattr(wrapper.subprocess, "run", run)
     since = int(time.time())
     unit = "hermes-worker-system-proof.scope"
-    marker = f"{unit}: A process of this unit has been killed by the OOM killer.\n"
+    marker = json.dumps({
+        "_PID": "1",
+        "_UID": "0",
+        "_COMM": "systemd",
+        "SYSLOG_IDENTIFIER": "systemd",
+        "_TRANSPORT": "journal",
+        "UNIT": unit,
+        "MESSAGE": f"{unit}: A process of this unit has been killed by the OOM killer.",
+    }) + "\n"
 
     assert wrapper.main(["evidence", unit, str(since)]) == 0
     assert json.loads(capsys.readouterr().out) == {"oom_kill": True, "unit": unit}
     assert calls[0][0][0:3] == ["/usr/bin/journalctl", "--unit", unit]
+
+
+def test_wrapper_rejects_forged_worker_oom_message(monkeypatch, capsys):
+    monkeypatch.setattr(wrapper, "_validate_caller", lambda: None)
+    unit = "hermes-worker-system-proof.scope"
+    forged = json.dumps({
+        "_PID": "999",
+        "_UID": "996",
+        "_COMM": "logger",
+        "_TRANSPORT": "syslog",
+        "_SYSTEMD_UNIT": unit,
+        "MESSAGE": f"{unit}: A process of this unit has been killed by the OOM killer.",
+    }) + "\n"
+    monkeypatch.setattr(
+        wrapper.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=forged),
+    )
+
+    assert wrapper.main(["evidence", unit, str(int(time.time()))]) == 0
+    assert json.loads(capsys.readouterr().out)["oom_kill"] is False
 
 
 def test_wrapper_rejects_stale_or_non_worker_evidence_queries(monkeypatch):

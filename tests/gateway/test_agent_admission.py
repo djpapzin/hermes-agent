@@ -62,6 +62,20 @@ def test_admission_persistence_runs_off_controller_thread(monkeypatch):
     writer_release.set()
 
 
+def test_admission_timestamp_is_captured_before_queueing(monkeypatch):
+    event_queue = queue.Queue(maxsize=1)
+    monkeypatch.setattr(admission_module, "_admission_event_queue", event_queue)
+    monkeypatch.setattr(admission_module, "_admission_writer_started", True)
+    monkeypatch.setattr(admission_module.time, "time", lambda: 123.25)
+
+    admission_module._queue_admission_event({"decision": "queue"})
+
+    assert event_queue.get_nowait() == {
+        "decision": "queue",
+        "timestamp": 123.25,
+    }
+
+
 def test_cgroup_headroom_uses_memory_max_minus_current(tmp_path):
     cgroup_file = tmp_path / "cgroup"
     cgroup_file.write_text("0::/system.slice/hermes.service\n", encoding="utf-8")

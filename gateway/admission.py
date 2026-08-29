@@ -41,7 +41,7 @@ def _append_admission_event(payload: dict) -> None:
 
     path = _admission_events_path()
     record = dict(payload)
-    record["timestamp"] = time.time()
+    record.setdefault("timestamp", time.time())
     encoded = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
     if len(encoded) > 8192:
         return
@@ -78,6 +78,8 @@ def _queue_admission_event(payload: dict) -> None:
     """Enqueue evidence without filesystem I/O on the gateway event loop."""
 
     global _admission_writer_started
+    record = dict(payload)
+    record.setdefault("timestamp", time.time())
     if not _admission_writer_started:
         with _admission_writer_lock:
             if not _admission_writer_started:
@@ -89,7 +91,7 @@ def _queue_admission_event(payload: dict) -> None:
                 ).start()
                 _admission_writer_started = True
     try:
-        _admission_event_queue.put_nowait(dict(payload))
+        _admission_event_queue.put_nowait(record)
     except queue.Full:
         logger.warning("Admission evidence queue is full; dropping one event")
 

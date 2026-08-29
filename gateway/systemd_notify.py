@@ -73,6 +73,8 @@ class SystemdWatchdog:
         self._lag_tolerance_seconds = lag_tolerance_seconds
         self._task: Optional[asyncio.Task[None]] = None
         self._unhealthy = False
+        self._expired = False
+        self._last_heartbeat_at: Optional[float] = None
         self._stopping = False
         self._stopping_notified = False
         self._shutdown_keepalive: Optional[threading.Thread] = None
@@ -114,6 +116,8 @@ class SystemdWatchdog:
             return False
         self._stopping = False
         self._unhealthy = False
+        self._expired = False
+        self._last_heartbeat_at = None
         self._stopping_notified = False
         self._task = asyncio.create_task(self._run(), name="hermes-systemd-watchdog")
         return True
@@ -123,7 +127,10 @@ class SystemdWatchdog:
         if not self.enabled:
             return False
         safe_status = str(status or "Gateway running").replace("\n", " ")
-        return notify(f"READY=1\nSTATUS={safe_status}")
+        sent = notify(f"READY=1\nSTATUS={safe_status}")
+        if sent:
+            self._last_heartbeat_at = time.monotonic()
+        return sent
 
     def record_tick(self, *, scheduled_at: float, now: float) -> bool:
         """Feed systemd whenever the event loop demonstrates forward progress.
@@ -133,12 +140,26 @@ class SystemdWatchdog:
         withholding this heartbeat would turn one transient delay into a
         guaranteed service abort even after the gateway became responsive.
         """
-        if not self.enabled or self._stopping:
+        if not self.enabled or self._stopping or self._expired:
             return False
         try:
             lag = float(now) - float(scheduled_at)
         except (TypeError, ValueError):
             lag = float("inf")
+        interval = self.interval_seconds or 0.0
+        last_heartbeat_at = self._last_heartbeat_at
+        if (
+            last_heartbeat_at is not None
+            and (
+                not math.isfinite(now)
+                or now - last_heartbeat_at >= interval
+            )
+        ):
+            self._unhealthy = True
+            self._expired = True
+            notify("STATUS=watchdog expired: hard deadline exceeded")
+            return False
+
         was_unhealthy = self._unhealthy
         self._unhealthy = not math.isfinite(lag) or lag > self._lag_tolerance()
         if self._unhealthy:
@@ -147,6 +168,7 @@ class SystemdWatchdog:
             notify("WATCHDOG=1\nSTATUS=Hermes Gateway running")
         else:
             notify("WATCHDOG=1")
+        self._last_heartbeat_at = now
         return True
 
     async def _run(self) -> None:
@@ -160,7 +182,8 @@ class SystemdWatchdog:
             while not self._stopping:
                 await asyncio.sleep(max(0.0, scheduled_at - loop.time()))
                 now = loop.time()
-                self.record_tick(scheduled_at=scheduled_at, now=now)
+                if not self.record_tick(scheduled_at=scheduled_at, now=now):
+                    return
                 scheduled_at += cadence
                 if scheduled_at < now:
                     scheduled_at = now + cadence

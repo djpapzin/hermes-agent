@@ -49,11 +49,12 @@ or external health guard is a different failure path.
 
 ### Systemd watchdog semantics
 
-The gateway heartbeat reports every observed event-loop tick to systemd. A
-late callback is recorded as `watchdog delayed: event loop recovered`, but it
-must not permanently latch the heartbeat off: the callback itself proves that
-the loop resumed. `WatchdogSec` remains the authoritative hard deadline and
-will still abort a loop that makes no progress at all.
+The gateway heartbeat reports every event-loop tick that recovers before the
+last successful heartbeat reaches `WatchdogSec`. Such a late callback is
+recorded as `watchdog delayed: event loop recovered` and must not permanently
+latch the heartbeat off. A callback at or beyond the hard deadline records
+`watchdog expired` without sending `WATCHDOG=1`, so it cannot race systemd and
+re-arm an already-expired watchdog.
 
 This distinction matters under parallel load. A transient delay shorter than
 `WatchdogSec` must recover in place; otherwise one late tick becomes a

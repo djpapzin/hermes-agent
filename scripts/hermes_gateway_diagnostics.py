@@ -13,21 +13,18 @@ from hermes_constants import get_hermes_home
 
 
 _INCIDENT_MARKERS = (
-    "HERMES_ADMISSION",
-    "HERMES_HEALTH",
-    "HERMES_RECOVERY",
-    "Shutdown context:",
-    "Received SIG",
     "Watchdog timeout",
     "watchdog timeout",
-    "killed by the OOM killer",
-    "Killed process",
-    "Out of memory",
     "Main process exited",
     "Failed with result",
     "Scheduled restart job",
     "Stopping Hermes Agent Gateway",
     "Started Hermes Agent Gateway",
+)
+_KERNEL_INCIDENT_MARKERS = (
+    "killed by the OOM killer",
+    "Killed process",
+    "Out of memory",
 )
 
 _ADMISSION_EVENT_FIELDS = (
@@ -188,18 +185,19 @@ def _bounded_incident_journal(
     unit: str, since_minutes: int, manager: str = "auto"
 ) -> list[dict[str, str]]:
     """Return only lifecycle/resource evidence, never general chat logs."""
-    gateway_commands = []
+    commands: list[tuple[list[str], str]] = []
     if manager in {"auto", "system"}:
-        gateway_commands.append(["journalctl", "-u", unit])
+        commands.append((["journalctl", "--unit", unit], "gateway-system"))
     if manager in {"auto", "user"}:
-        gateway_commands.append(["journalctl", "--user", "-u", unit])
-    commands = [
-        *gateway_commands,
-        ["journalctl", "-u", "hermes-health-guard.service"],
-        ["journalctl", "-k"],
-    ]
+        commands.append((["journalctl", "--user-unit", unit], "gateway-user"))
+    commands.extend(
+        [
+            (["journalctl", "--unit", "hermes-health-guard.service"], "health"),
+            (["journalctl", "--dmesg"], "kernel"),
+        ]
+    )
     events: list[dict[str, str]] = []
-    for base in commands:
+    for base, source in commands:
         try:
             result = subprocess.run(
                 [
@@ -225,17 +223,56 @@ def _bounded_incident_journal(
             except (TypeError, ValueError):
                 continue
             message = str(row.get("MESSAGE") or "")
-            if not any(marker in message for marker in _INCIDENT_MARKERS):
+            if source == "gateway-system":
+                trusted = (
+                    row.get("_PID") == "1"
+                    and row.get("_UID") == "0"
+                    and row.get("_COMM") == "systemd"
+                    and row.get("SYSLOG_IDENTIFIER") == "systemd"
+                    and row.get("_TRANSPORT") == "journal"
+                    and row.get("_SYSTEMD_UNIT") == "init.scope"
+                    and row.get("UNIT") == unit
+                    and any(marker in message for marker in _INCIDENT_MARKERS)
+                )
+                event_unit = unit
+            elif source == "gateway-user":
+                trusted = (
+                    row.get("_COMM") == "systemd"
+                    and row.get("SYSLOG_IDENTIFIER") == "systemd"
+                    and row.get("_TRANSPORT") == "journal"
+                    and row.get("_SYSTEMD_USER_UNIT") == "init.scope"
+                    and row.get("USER_UNIT") == unit
+                    and any(marker in message for marker in _INCIDENT_MARKERS)
+                )
+                event_unit = unit
+            elif source == "health":
+                trusted = (
+                    row.get("_SYSTEMD_UNIT") == "hermes-health-guard.service"
+                    and message.startswith(("HERMES_HEALTH ", "HERMES_RECOVERY "))
+                )
+                event_unit = "hermes-health-guard.service"
+            else:
+                trusted = (
+                    row.get("_TRANSPORT") == "kernel"
+                    and any(marker in message for marker in _KERNEL_INCIDENT_MARKERS)
+                )
+                event_unit = "kernel"
+            if not trusted:
                 continue
             events.append(
                 {
                     "timestamp_realtime_usec": str(
                         row.get("__REALTIME_TIMESTAMP") or ""
                     ),
-                    "unit": str(row.get("_SYSTEMD_UNIT") or "kernel"),
+                    "unit": event_unit,
                     "message": message[:500],
                 }
             )
+    events.sort(
+        key=lambda event: int(event["timestamp_realtime_usec"])
+        if event["timestamp_realtime_usec"].isdigit()
+        else -1
+    )
     return events[-100:]
 
 

@@ -231,7 +231,7 @@ def _oom_evidence(argv: list[str]) -> int:
             "--since",
             f"@{since}",
             "--no-pager",
-            "--output=cat",
+            "--output=json",
             "--lines=100",
         ],
         check=False,
@@ -240,10 +240,25 @@ def _oom_evidence(argv: list[str]) -> int:
         timeout=5,
     )
     marker = "A process of this unit has been killed by the OOM killer."
-    observed = result.returncode == 0 and any(
-        line.strip() in {marker, f"{unit}: {marker}"}
-        for line in result.stdout.splitlines()
-    )
+    observed = False
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            try:
+                row = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if (
+                row.get("_PID") == "1"
+                and row.get("_UID") == "0"
+                and row.get("_COMM") == "systemd"
+                and row.get("SYSLOG_IDENTIFIER") == "systemd"
+                and row.get("_TRANSPORT") == "journal"
+                and row.get("UNIT") == unit
+                and str(row.get("MESSAGE") or "").strip()
+                in {marker, f"{unit}: {marker}"}
+            ):
+                observed = True
+                break
     print(json.dumps({"unit": unit, "oom_kill": observed}, sort_keys=True))
     return 0
 

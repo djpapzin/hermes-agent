@@ -119,6 +119,25 @@ def test_watchdog_late_tick_still_proves_liveness_and_can_recover(monkeypatch):
     assert calls[-1] == "WATCHDOG=1\nSTATUS=Hermes Gateway running"
 
 
+def test_watchdog_does_not_rearm_after_hard_deadline(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    monkeypatch.setattr(
+        notify_mod, "notify", lambda message: calls.append(message) or True
+    )
+    watchdog = notify_mod.SystemdWatchdog(lag_tolerance_seconds=0.1)
+
+    assert watchdog.record_tick(scheduled_at=10.0, now=10.0) is True
+    assert watchdog.record_tick(scheduled_at=10.5, now=11.01) is False
+    assert watchdog.unhealthy is True
+    assert calls[-1].startswith("STATUS=watchdog expired")
+    assert "WATCHDOG=1" not in calls[-1]
+
+
 @pytest.mark.asyncio
 async def test_watchdog_sends_ready_heartbeat_and_stopping(monkeypatch):
     calls: list[str] = []
