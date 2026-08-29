@@ -96,14 +96,13 @@ def test_user_scope_oom_evidence_is_exact_and_bounded(monkeypatch):
 
     assert worker_scope._user_scope_oom_evidence("hermes-worker-proof", 123.9)
     argv, kwargs = calls[0]
-    assert argv[:5] == [
+    assert argv[:4] == [
         "journalctl",
-        "--user",
-        "--unit",
+        "--user-unit",
         "hermes-worker-proof.scope",
         "--since",
     ]
-    assert argv[5] == "@123"
+    assert argv[4] == "@123"
     assert kwargs["timeout"] == 8
 
 

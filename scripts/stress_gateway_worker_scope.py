@@ -187,8 +187,7 @@ def _user_scope_oom_evidence(unit: str, started_at: float) -> bool:
     result = subprocess.run(
         [
             "journalctl",
-            "--user",
-            "--unit",
+            "--user-unit",
             unit + ".scope",
             "--since",
             f"@{int(started_at)}",
