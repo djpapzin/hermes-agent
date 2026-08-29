@@ -454,6 +454,32 @@ def _stop_systemd_unit(unit_name: str) -> bool:
     binary = shutil.which("systemctl")
     if binary is None:
         return False
+    command = [binary, "--user", "stop", unit_name]
+    if unit_name.startswith("hermes-worker-system-"):
+        sudo = shutil.which("sudo")
+        if sudo is None or not _SYSTEM_SCOPE_WRAPPER.is_file():
+            return False
+        command = [
+            sudo,
+            "-n",
+            str(_SYSTEM_SCOPE_WRAPPER),
+            "stop",
+            unit_name,
+        ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, timeout=15, stdin=subprocess.DEVNULL
+        )
+        if result.returncode == 0:
+            return True
+        stderr = (result.stderr or b"").decode(errors="replace").lower()
+        return any(
+            marker in stderr
+            for marker in ("not loaded", "not found", "does not exist")
+        )
+    except Exception as exc:
+        logger.debug("systemctl stop %s failed: %s", unit_name, exc)
+        return False
 
 
 def _systemd_unit_has_processes(
@@ -489,29 +515,6 @@ def _systemd_unit_has_processes(
         return False
     except (OSError, subprocess.TimeoutExpired):
         return True
-    command = [binary, "--user", "stop", unit_name]
-    if unit_name.startswith("hermes-worker-system-"):
-        sudo = shutil.which("sudo")
-        if sudo is None or not _SYSTEM_SCOPE_WRAPPER.is_file():
-            return False
-        command = [
-            sudo,
-            "-n",
-            str(_SYSTEM_SCOPE_WRAPPER),
-            "stop",
-            unit_name,
-        ]
-    try:
-        result = subprocess.run(
-            command, capture_output=True, timeout=15, stdin=subprocess.DEVNULL
-        )
-        if result.returncode == 0:
-            return True
-        stderr = (result.stderr or b"").decode(errors="replace").lower()
-        return any(marker in stderr for marker in ("not loaded", "not found", "does not exist"))
-    except Exception as exc:
-        logger.debug("systemctl stop %s failed: %s", unit_name, exc)
-        return False
 
 
 def format_uptime_short(seconds: int) -> str:

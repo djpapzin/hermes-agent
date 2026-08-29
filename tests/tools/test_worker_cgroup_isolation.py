@@ -43,6 +43,29 @@ def test_kill_all_reaps_finished_launcher_scope():
     stop.assert_called_once_with(session.systemd_unit)
 
 
+def test_system_worker_scope_stop_routes_through_root_wrapper(monkeypatch, tmp_path):
+    import tools.process_registry as pr
+
+    wrapper = tmp_path / "hermes-worker-scope"
+    wrapper.touch()
+    monkeypatch.setattr(pr, "_SYSTEM_SCOPE_WRAPPER", wrapper)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: {"systemctl": "/usr/bin/systemctl", "sudo": "/usr/bin/sudo"}.get(name),
+    )
+    completed = MagicMock(returncode=0, stderr=b"")
+    monkeypatch.setattr(pr.subprocess, "run", MagicMock(return_value=completed))
+    unit = "hermes-worker-system-detached-child.scope"
+
+    assert pr._stop_systemd_unit(unit) is True
+    pr.subprocess.run.assert_called_once_with(
+        ["/usr/bin/sudo", "-n", str(wrapper), "stop", unit],
+        capture_output=True,
+        timeout=15,
+        stdin=pr.subprocess.DEVNULL,
+    )
+
+
 def test_system_scope_routes_through_validating_root_wrapper(monkeypatch, tmp_path):
     import tools.process_registry as pr
 
