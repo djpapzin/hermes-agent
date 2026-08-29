@@ -132,7 +132,7 @@ async def test_watchdog_sends_ready_heartbeat_and_stopping(monkeypatch):
 
     assert any(message.startswith("READY=1") for message in calls)
     assert "WATCHDOG=1" in calls
-    assert calls[-1] == "STOPPING=1"
+    assert any(message.startswith("STOPPING=1\nWATCHDOG=1") for message in calls)
     assert watchdog.unhealthy is False
 
 

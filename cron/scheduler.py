@@ -2656,6 +2656,10 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+from gateway.admission import gateway_admitted_sync as _gateway_admitted_sync
+
+
+@_gateway_admitted_sync("cron", id_kwargs=("job",))
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:

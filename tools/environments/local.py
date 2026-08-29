@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
@@ -1346,6 +1347,30 @@ class LocalEnvironment(BaseEnvironment):
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
+        systemd_unit = ""
+        if not _IS_WINDOWS:
+            try:
+                from tools.process_registry import (
+                    _build_systemd_scope_argv,
+                    _is_supervised_gateway_process,
+                    _worker_cgroup_mode,
+                    _worker_scope_backend,
+                )
+
+                if _is_supervised_gateway_process() and _worker_cgroup_mode() != "off":
+                    backend = _worker_scope_backend()
+                    if backend is None and _worker_cgroup_mode() == "required":
+                        raise RuntimeError(
+                            "Worker cgroup isolation is required but no systemd scope backend is available"
+                        )
+                    if backend is not None:
+                        suffix = f"fg-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+                        args = _build_systemd_scope_argv(args, suffix, backend=backend)
+                        systemd_unit = f"hermes-worker-{'system-' if backend == 'system' else ''}{suffix}.scope"
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                logger.warning("Could not prepare foreground worker cgroup: %s", exc)
 
         # Recover when the cwd has been deleted out from under us — usually by
         # a previous tool call that ran ``rm -rf`` on its own working dir
@@ -1390,6 +1415,7 @@ class LocalEnvironment(BaseEnvironment):
             **_popen_kwargs,
         )
         if not _IS_WINDOWS:
+            proc._hermes_systemd_unit = systemd_unit
             try:
                 proc._hermes_pgid = os.getpgid(proc.pid)
             except ProcessLookupError:
@@ -1478,6 +1504,17 @@ class LocalEnvironment(BaseEnvironment):
                 proc.kill()
             except Exception:
                 pass
+        finally:
+            systemd_unit = getattr(proc, "_hermes_systemd_unit", "")
+            if systemd_unit:
+                try:
+                    from tools.process_registry import _stop_systemd_unit
+                    _stop_systemd_unit(systemd_unit)
+                except Exception:
+                    logger.warning(
+                        "Could not stop foreground worker scope %s",
+                        systemd_unit,
+                    )
 
     def _update_cwd(self, result: dict):
         """Update cwd from the stdout marker emitted by the wrapped command.

@@ -30,6 +30,8 @@ def test_positive_watchdog_config_generates_notify_unit(monkeypatch):
     assert "Type=notify" in unit
     assert "NotifyAccess=main" in unit
     assert "WatchdogSec=120s" in unit
+    assert "KillMode=mixed" in unit
+    assert "OOMPolicy=continue" in unit
 
 
 def test_positive_watchdog_config_generates_notify_system_unit(monkeypatch, tmp_path):

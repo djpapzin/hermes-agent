@@ -871,6 +871,10 @@ class GatewayConfig:
     thread_sessions_per_user: bool = False  # When False (default), threads are shared across all participants
     max_concurrent_sessions: Optional[int] = None  # Positive int caps simultaneous active chat sessions
     max_concurrent_session_wait_seconds: Optional[int] = None  # Wait for capacity before returning a busy response
+    max_parallel_agents: Optional[int] = 3
+    min_host_memory_headroom_mb: int = 2048
+    agent_queue_limit: int = 16
+    admission_poll_interval_seconds: float = 2.0
 
     # Multi-profile multiplexing (opt-in; default off preserves one-gateway-per-profile).
     # When True, the default profile's gateway serves inbound messages for every
@@ -1016,6 +1020,12 @@ class GatewayConfig:
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "max_concurrent_session_wait_seconds": self.max_concurrent_session_wait_seconds,
+            "admission": {
+                "max_parallel_agents": self.max_parallel_agents,
+                "min_host_memory_headroom_mb": self.min_host_memory_headroom_mb,
+                "queue_limit": self.agent_queue_limit,
+                "poll_interval_seconds": self.admission_poll_interval_seconds,
+            },
             "multiplex_profiles": self.multiplex_profiles,
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
@@ -1115,6 +1125,29 @@ class GatewayConfig:
             max_concurrent_raw,
             max_concurrent_key,
         )
+        admission = data.get("admission", nested_gateway.get("admission", {}))
+        if not isinstance(admission, dict):
+            admission = {}
+        max_parallel_agents = _coerce_optional_positive_int(
+            admission.get("max_parallel_agents", 3),
+            "gateway.admission.max_parallel_agents",
+        )
+        try:
+            min_host_memory_headroom_mb = max(
+                0, int(admission.get("min_host_memory_headroom_mb", 2048) or 0)
+            )
+        except (TypeError, ValueError):
+            min_host_memory_headroom_mb = 2048
+        try:
+            agent_queue_limit = max(0, int(admission.get("queue_limit", 16)))
+        except (TypeError, ValueError):
+            agent_queue_limit = 16
+        try:
+            admission_poll_interval_seconds = max(
+                0.05, float(admission.get("poll_interval_seconds", 2.0))
+            )
+        except (TypeError, ValueError):
+            admission_poll_interval_seconds = 2.0
         if "max_concurrent_session_wait_seconds" in data:
             max_wait_raw = data.get("max_concurrent_session_wait_seconds")
             max_wait_key = "max_concurrent_session_wait_seconds"
@@ -1161,6 +1194,10 @@ class GatewayConfig:
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             max_concurrent_sessions=max_concurrent_sessions,
             max_concurrent_session_wait_seconds=max_concurrent_session_wait_seconds,
+            max_parallel_agents=max_parallel_agents,
+            min_host_memory_headroom_mb=min_host_memory_headroom_mb,
+            agent_queue_limit=agent_queue_limit,
+            admission_poll_interval_seconds=admission_poll_interval_seconds,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
@@ -1320,6 +1357,8 @@ def load_gateway_config() -> GatewayConfig:
                     gw_data["max_concurrent_session_wait_seconds"] = gateway_section[
                         "max_concurrent_session_wait_seconds"
                     ]
+                if "admission" in gateway_section:
+                    gw_data["admission"] = gateway_section["admission"]
                 if "systemd_watchdog_seconds" in gateway_section:
                     gw_data["systemd_watchdog_seconds"] = gateway_section[
                         "systemd_watchdog_seconds"

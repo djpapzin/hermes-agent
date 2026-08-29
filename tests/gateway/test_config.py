@@ -316,6 +316,26 @@ class TestStreamingConfig:
 
 
 class TestGatewayConfigRoundtrip:
+    def test_admission_defaults_are_bounded(self):
+        config = GatewayConfig.from_dict({})
+        assert config.max_parallel_agents == 3
+        assert config.min_host_memory_headroom_mb == 2048
+        assert config.agent_queue_limit == 16
+
+    def test_admission_config_roundtrip(self):
+        config = GatewayConfig.from_dict({"gateway": {"admission": {
+            "max_parallel_agents": 3,
+            "min_host_memory_headroom_mb": 2048,
+            "queue_limit": 9,
+            "poll_interval_seconds": 0.5,
+        }}})
+        assert config.agent_queue_limit == 9
+        assert config.admission_poll_interval_seconds == 0.5
+        restored = GatewayConfig.from_dict(config.to_dict())
+        assert restored.max_parallel_agents == 3
+        assert restored.min_host_memory_headroom_mb == 2048
+        assert restored.agent_queue_limit == 9
+
     def test_full_roundtrip(self):
         config = GatewayConfig(
             platforms={

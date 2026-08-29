@@ -3140,6 +3140,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._draining = False
         self._profile_failed_platforms: Dict[str, Dict[Platform, asyncio.Task]] = {}
         self._systemd_watchdog = None
+        from gateway.admission import AgentAdmissionController
+        _admission_max = getattr(self.config, "max_parallel_agents", None)
+        if _admission_max is None:
+            _admission_max = getattr(self.config, "max_concurrent_sessions", None)
+        self._agent_admission = AgentAdmissionController(
+            max_parallel=_admission_max,
+            min_headroom_mb=getattr(self.config, "min_host_memory_headroom_mb", 0),
+            queue_limit=getattr(self.config, "agent_queue_limit", 32),
+            poll_interval_seconds=getattr(
+                self.config, "admission_poll_interval_seconds", 2.0
+            ),
+        )
+        self._admission_waiting_sessions: set[str] = set()
+        self._background_agent_refs: Dict[str, Any] = {}
         # External (NAS-driven) drain state — distinct from the shutdown
         # ``_draining`` flag above. Set by ``_drain_control_watcher`` when the
         # ``.drain_request.json`` marker is present: the gateway flips
@@ -4461,12 +4475,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _running_agent_count(self) -> int:
         return len(self._running_agents)
 
+    def _active_background_agent_count(self) -> int:
+        """Count admitted /background agents outside ``_running_agents``."""
+        try:
+            admission = getattr(self, "_agent_admission", None)
+            if admission is None:
+                return 0
+            return sum(
+                1
+                for task_id in admission.snapshot().active_task_ids
+                if task_id.startswith("background:")
+            )
+        except Exception:
+            return 0
+
     def _active_work_count(self) -> int:
         """All agent work the gateway must expose and drain as one total."""
         return (
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
+            + self._active_background_agent_count()
         )
 
     def _active_cron_job_count(self) -> int:
@@ -4913,9 +4942,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(active_agents=self._active_work_count())
+            admission = getattr(self, "_agent_admission", None)
+            snapshot = admission.snapshot() if admission is not None else None
+            admission_payload = (
+                {
+                    "active_workers": snapshot.active,
+                    "queued_tasks": snapshot.queued,
+                    "max_parallel": snapshot.max_parallel,
+                    "effective_available_memory_mb": snapshot.available_memory_mb,
+                    "host_available_memory_mb": snapshot.host_available_memory_mb,
+                    "cgroup_available_memory_mb": snapshot.cgroup_available_memory_mb,
+                    "min_headroom_mb": snapshot.min_headroom_mb,
+                    "active_task_ids": list(snapshot.active_task_ids),
+                    "queued_task_ids": list(snapshot.queued_task_ids),
+                }
+                if snapshot is not None
+                else {}
+            )
+            write_runtime_status(
+                active_agents=self._active_work_count(),
+                admission=admission_payload,
+            )
         except Exception:
             pass
+
+    async def _send_admission_queue_notice(self, source: Any, message: str) -> None:
+        self._persist_active_agents()
+        await self._send_goal_status_notice(source, message)
+
+    async def _send_background_admission_queue_notice(
+        self,
+        message: str,
+        *,
+        source: "SessionSource",
+        task_id: str,
+    ) -> None:
+        """Tell the originating chat when a /background task is queued."""
+        self._persist_active_agents()
+        await self._send_goal_status_notice(
+            source,
+            f"Background task {task_id}: {message}",
+        )
 
     # ------------------------------------------------------------------
     # External drain control (NAS-driven quiesce-without-restart, Phase 2).
@@ -6193,25 +6260,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_active_count = self._running_agent_count()
         last_cron_count = self._active_cron_job_count()
         last_api_count = self._active_api_run_count()
+        last_background_count = self._active_background_agent_count()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
-            nonlocal last_active_count, last_cron_count, last_api_count, last_status_at
+            nonlocal last_active_count, last_cron_count, last_api_count
+            nonlocal last_background_count, last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
             cron_count = self._active_cron_job_count()
             api_count = self._active_api_run_count()
+            background_count = self._active_background_agent_count()
             if (
                 force
                 or active_count != last_active_count
                 or cron_count != last_cron_count
                 or api_count != last_api_count
+                or background_count != last_background_count
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
                 last_active_count = active_count
                 last_cron_count = cron_count
                 last_api_count = api_count
+                last_background_count = background_count
                 last_status_at = now
 
         # Cron jobs run on the scheduler's own thread pool, outside
@@ -6220,7 +6292,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # or a cron job's tool work gets killed with zero warning the
         # instant it's the only active thing running (#60432).
         # API-server / desk sessions have the same structural gap (#63529).
-        if not self._running_agents and last_cron_count == 0 and last_api_count == 0:
+        if (
+            not self._running_agents
+            and last_cron_count == 0
+            and last_api_count == 0
+            and last_background_count == 0
+        ):
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -6234,6 +6311,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._running_agents
                 or self._active_cron_job_count()
                 or self._active_api_run_count()
+                or self._active_background_agent_count()
             )
             and asyncio.get_running_loop().time() < deadline
         ):
@@ -6243,6 +6321,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             bool(self._running_agents)
             or bool(self._active_cron_job_count())
             or bool(self._active_api_run_count())
+            or bool(self._active_background_agent_count())
         )
         _maybe_update_status(force=True)
         return snapshot, timed_out
@@ -6256,6 +6335,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Interrupted running agent for session %s during shutdown", session_key)
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
+        for task_id, agent in list(self._background_agent_refs.items()):
+            try:
+                agent.interrupt(reason)
+                logger.debug("Interrupted background agent %s during shutdown", task_id)
+            except Exception as exc:
+                logger.debug("Failed interrupting background agent %s: %s", task_id, exc)
 
     async def _notify_active_sessions_of_shutdown(self) -> None:
         """Send shutdown/restart notifications to active chats and home channels.
@@ -7374,6 +7459,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._gateway_loop = asyncio.get_running_loop()
         except RuntimeError:
             self._gateway_loop = None
+        if self._gateway_loop is not None:
+            from gateway.admission import install_gateway_admission
+            self._agent_admission.set_change_callback(self._persist_active_agents)
+            install_gateway_admission(self._agent_admission, self._gateway_loop)
         logger.info("Session storage: %s", self.config.sessions_dir)
 
         # Sanity-check that systemd's TimeoutStopSec covers our drain
@@ -9031,6 +9120,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running = False
             self._draining = True
 
+            admission = getattr(self, "_agent_admission", None)
+            if admission is not None:
+                reconciled = await admission.close(
+                    "Gateway is restarting; this queued task was not started. "
+                    "Please resend after the gateway is back online."
+                )
+                if reconciled:
+                    logger.warning("Shutdown reconciled queued tasks: %s", ", ".join(reconciled))
+                self._persist_active_agents()
+
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
                 await stop_watchdog()
@@ -9066,13 +9165,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()
+            _background_count = self._active_background_agent_count
+            _background_at_start = _background_count()
             _drain_started_at = time.monotonic()
             active_agents, timed_out = await self._drain_active_agents(timeout)
             logger.info(
                 "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
                 "timed_out=%s, active_at_start=%d, active_now=%d, "
                 "cron_at_start=%d, cron_now=%d, "
-                "api_at_start=%d, api_now=%d)",
+                "api_at_start=%d, api_now=%d, background_at_start=%d, background_now=%d)",
                 _phase_elapsed(),
                 time.monotonic() - _drain_started_at,
                 timed_out,
@@ -9082,6 +9183,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._active_cron_job_count(),
                 _api_at_start,
                 self._active_api_run_count(),
+                _background_at_start,
+                _background_count(),
             )
 
             if not timed_out:
@@ -9101,12 +9204,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if timed_out:
                 logger.warning(
                     "Gateway drain timed out after %.1fs with %d active agent(s), "
-                    "%d in-flight cron job(s), and %d api_server run(s); "
+                    "%d in-flight cron job(s), %d api_server run(s), and %d background agent(s); "
                     "interrupting remaining work.",
                     timeout,
                     self._running_agent_count(),
                     self._active_cron_job_count(),
                     self._active_api_run_count(),
+                    _background_count(),
                 )
                 # Mark forcibly-interrupted sessions as resume_pending BEFORE
                 # interrupting the agents.  This preserves each session's
@@ -9146,7 +9250,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
                 interrupt_deadline = asyncio.get_running_loop().time() + 5.0
-                while self._running_agents and asyncio.get_running_loop().time() < interrupt_deadline:
+                while (
+                    self._running_agents
+                    or self._active_api_run_count()
+                    or _background_count()
+                ) and asyncio.get_running_loop().time() < interrupt_deadline:
                     self._update_runtime_status("draining")
                     await asyncio.sleep(0.1)
 
@@ -11473,11 +11581,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # message arriving during any of those yields would pass the
         # "already running" guard and spin up a duplicate agent for the
         # same session — corrupting the transcript.
+        _admission = getattr(self, "_agent_admission", None)
+        _admission_acquired = False
+        if _admission is not None and not self._is_session_running(_quick_key):
+            from gateway.admission import AdmissionRejected
+            if _quick_key in self._admission_waiting_sessions:
+                return "This session already has a queued task. Use /status to check capacity."
+            self._admission_waiting_sessions.add(_quick_key)
+            try:
+                await _admission.acquire(
+                    _quick_key,
+                    on_queued=lambda message: self._send_admission_queue_notice(source, message),
+                )
+                _admission_acquired = True
+                self._persist_active_agents()
+            except AdmissionRejected as exc:
+                return str(exc)
+            finally:
+                self._admission_waiting_sessions.discard(_quick_key)
         _active_session_lease, _limit_message = await self._claim_active_session_slot_with_wait(
             _quick_key,
             source,
         )
         if _limit_message is not None:
+            if _admission_acquired:
+                await _admission.release(_quick_key, outcome="lease_rejected")
+                self._persist_active_agents()
             logger.info(
                 "Rejecting new active session %s: max_concurrent_sessions reached",
                 _quick_key,
@@ -11546,6 +11675,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
+            if _admission_acquired:
+                await _admission.release(_quick_key)
+                self._persist_active_agents()
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -14820,6 +14952,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 prompt, source, task_id, event_message_id, media_urls, media_types,
             )
 
+    from gateway.admission import gateway_admitted_async as _gateway_admitted_async
+
+    @_gateway_admitted_async(
+        "background",
+        id_kwargs=("task_id",),
+        queued_notice_method="_send_background_admission_queue_notice",
+        queued_notice_kwargs=("source", "task_id"),
+    )
     async def _run_background_task_inner(
         self,
         prompt: str,
@@ -14920,13 +15060,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
+                background_refs = getattr(self, "_background_agent_refs", None)
+                if background_refs is None:
+                    background_refs = {}
+                    self._background_agent_refs = background_refs
+                background_refs[task_id] = agent
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
                         task_id=task_id,
                     )
                 finally:
-                    self._cleanup_agent_resources(agent)
+                    try:
+                        self._cleanup_agent_resources(agent)
+                    finally:
+                        background_refs.pop(task_id, None)
 
             result = await self._run_in_executor_with_context(run_sync)
 
@@ -22768,7 +22916,34 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 snapshot_shutdown_context,
                 spawn_async_diagnostic,
             )
-            _shutdown_ctx = snapshot_shutdown_context(received_signal)
+            _admission = getattr(runner, "_agent_admission", None)
+            _admission_snapshot = _admission.snapshot() if _admission else None
+            try:
+                from tools.process_registry import process_registry
+                _worker_pids = [
+                    int(session["pid"])
+                    for session in process_registry.list_sessions()
+                    if session.get("pid") and session.get("status") == "running"
+                ]
+            except Exception:
+                _worker_pids = []
+            _shutdown_ctx = snapshot_shutdown_context(
+                received_signal,
+                shutdown_reason=(
+                    "planned_takeover" if planned_takeover else
+                    "planned_stop" if planned_stop else
+                    "unexpected_external_signal"
+                ),
+                active_task_ids=(
+                    list(_admission_snapshot.active_task_ids)
+                    if _admission_snapshot else list(runner._snapshot_running_agents())
+                ),
+                queued_task_ids=(
+                    list(_admission_snapshot.queued_task_ids)
+                    if _admission_snapshot else []
+                ),
+                worker_pids=_worker_pids,
+            )
         except Exception as _e:
             _shutdown_ctx = None
             logger.debug("snapshot_shutdown_context failed: %s", _e)

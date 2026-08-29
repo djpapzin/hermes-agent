@@ -4619,6 +4619,11 @@ class APIServerAdapter(BasePlatformAdapter):
             async_delivery=False,
         )
 
+    from gateway.admission import gateway_admitted_async as _gateway_admitted_async
+
+    @_gateway_admitted_async(
+        "api", id_kwargs=("active_run_id", "session_id", "gateway_session_key")
+    )
     async def _run_agent(
         self,
         user_message: str,

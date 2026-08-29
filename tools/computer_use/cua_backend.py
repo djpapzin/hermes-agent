@@ -680,12 +680,19 @@ class _CuaDriverSession:
             self._startup_phase = "manifest-discovery"
             command, args = _resolve_mcp_invocation(_CUA_DRIVER_CMD)
             _t_manifest = _time.monotonic()
+            sanitized_child_env = _sanitize_subprocess_env(cua_driver_child_env())
+            from tools.process_registry import build_gateway_worker_scope_argv
+            scoped_argv, _scope_unit = build_gateway_worker_scope_argv(
+                [command, *args],
+                unit_suffix=f"cua-mcp-{uuid.uuid4().hex[:8]}",
+                environment=sanitized_child_env,
+            )
             params = StdioServerParameters(
-                command=command,
-                args=args,
+                command=scoped_argv[0],
+                args=scoped_argv[1:],
                 # Apply the telemetry policy first (default: disabled), then
                 # sanitize Hermes-managed secrets out of the child env.
-                env=_sanitize_subprocess_env(cua_driver_child_env()),
+                env=sanitized_child_env,
             )
 
             async with stdio_client(params) as (read, write):
@@ -2504,4 +2511,3 @@ class CuaDriverBackend(ComputerUseBackend):
             meta.update(structured)
         return _action_result_from(name, ok, message, meta, structured,
                                    requested_delivery=args.get("delivery_mode"))
-
