@@ -87,15 +87,33 @@ _SYSTEMD_SYSTEM_SCOPE_AVAILABLE: Optional[bool] = None
 _MIN_WORKER_MEMORY_MAX_BYTES = 64 * 1024 * 1024
 _DEFAULT_WORKER_MEMORY_MAX_BYTES = 1024 * 1024 * 1024
 _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
+_SYSTEM_SCOPE_WRAPPER = Path("/usr/local/sbin/hermes-worker-scope")
 
 
-def _current_posix_ids() -> tuple[int, int]:
-    """Return uid/gid without importing POSIX-only os attributes on Windows."""
-    uid_fn = getattr(os, "getuid", None)
-    gid_fn = getattr(os, "getgid", None)
-    if not callable(uid_fn) or not callable(gid_fn):
-        raise RuntimeError("systemd worker scopes require POSIX uid/gid support")
-    return int(uid_fn()), int(gid_fn())
+def _write_worker_environment(
+    environment: Optional[Dict[str, str]], unit_suffix: str
+) -> Path:
+    """Write a private, one-shot environment payload for the root wrapper."""
+    env_dir = get_hermes_home() / "state" / "worker-env"
+    env_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = env_dir / f"{unit_suffix}-{uuid.uuid4().hex}.json"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags | nofollow, 0o600)
+    try:
+        payload = {
+            str(key): str(value)
+            for key, value in (environment or {}).items()
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key))
+        }
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return path
 
 
 def _worker_memory_max_bytes() -> int:
@@ -200,16 +218,22 @@ def _systemd_run_system_scope_available() -> bool:
     try:
         import shutil
         sudo, systemd_run = shutil.which("sudo"), shutil.which("systemd-run")
-        if sudo and systemd_run and not _IS_WINDOWS:
-            uid, gid = _current_posix_ids()
-            unit = f"hermes-worker-system-probe-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-            result = subprocess.run([
-                sudo, "-n", systemd_run, "--system", "--scope", "--quiet",
-                "--unit", unit, "--collect", "--uid", str(uid),
-                "--gid", str(gid), "--property", "MemoryAccounting=yes",
-                "--property", f"MemoryMax={_worker_memory_max_bytes()}",
-                "--property", "MemorySwapMax=0", "--", "/bin/true",
-            ], capture_output=True, timeout=3, stdin=subprocess.DEVNULL)
+        if (
+            sudo
+            and systemd_run
+            and _SYSTEM_SCOPE_WRAPPER.is_file()
+            and not _IS_WINDOWS
+        ):
+            suffix = f"probe-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+            command = _build_systemd_scope_argv(
+                ["/bin/true"], suffix, backend="system", environment={}
+            )
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=3,
+                stdin=subprocess.DEVNULL,
+            )
             available = result.returncode == 0
     except Exception as exc:
         logger.debug("systemd system-scope probe error: %s", exc)
@@ -254,25 +278,26 @@ def _build_systemd_scope_argv(
     prefix = [binary, "--user"]
     if backend == "system":
         sudo = shutil.which("sudo")
-        if sudo is None:
+        if sudo is None or not _SYSTEM_SCOPE_WRAPPER.is_file():
             return shell_argv
-        prefix = [sudo, "-n"]
-        if environment:
-            preserve = sorted(key for key in environment if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) and key not in {
-                "HOME", "LOGNAME", "PATH", "SHELL", "SUDO_COMMAND", "SUDO_GID", "SUDO_UID", "SUDO_USER", "USER",
-            })
-            if preserve:
-                prefix.append(f"--preserve-env={','.join(preserve)}")
-        prefix.extend([binary, "--system"])
+        env_path = _write_worker_environment(environment, safe_suffix)
+        return [
+            sudo,
+            "-n",
+            str(_SYSTEM_SCOPE_WRAPPER),
+            "run",
+            safe_suffix,
+            str(memory_max),
+            str(env_path),
+            "--",
+            *shell_argv,
+        ]
     argv = [*prefix, "--scope", "--quiet", "--unit",
             f"hermes-worker-{'system-' if backend == 'system' else ''}{safe_suffix}",
             "--collect", "--property", "MemoryAccounting=yes",
             "--property", f"MemoryMax={memory_max}", "--property",
             f"MemoryHigh={max(_MIN_WORKER_MEMORY_MAX_BYTES, memory_max * 9 // 10)}",
             "--property", "MemorySwapMax=0"]
-    if backend == "system":
-        uid, gid = _current_posix_ids()
-        argv.extend(["--uid", str(uid), "--gid", str(gid)])
     return [*argv, "--", *shell_argv]
 
 
@@ -305,9 +330,15 @@ def _stop_systemd_unit(unit_name: str) -> bool:
     command = [binary, "--user", "stop", unit_name]
     if unit_name.startswith("hermes-worker-system-"):
         sudo = shutil.which("sudo")
-        if sudo is None:
+        if sudo is None or not _SYSTEM_SCOPE_WRAPPER.is_file():
             return False
-        command = [sudo, "-n", binary, "--system", "stop", unit_name]
+        command = [
+            sudo,
+            "-n",
+            str(_SYSTEM_SCOPE_WRAPPER),
+            "stop",
+            unit_name,
+        ]
     try:
         result = subprocess.run(
             command, capture_output=True, timeout=15, stdin=subprocess.DEVNULL

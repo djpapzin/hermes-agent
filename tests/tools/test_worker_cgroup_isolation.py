@@ -1,48 +1,111 @@
 """Behavior-level worker cgroup isolation tests for the VM downstream."""
 
+import json
 from unittest.mock import patch
 
 import pytest
 
 
-def test_system_scope_is_unprivileged_and_memory_bounded(monkeypatch):
+def test_worker_environment_payload_is_private_and_filters_invalid_names(
+    monkeypatch, tmp_path
+):
+    import tools.process_registry as pr
+
+    monkeypatch.setattr(pr, "get_hermes_home", lambda: tmp_path)
+    path = pr._write_worker_environment(
+        {"DISPLAY": ":99", "BAD-NAME": "drop"}, "scope"
+    )
+
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert json.loads(path.read_text(encoding="utf-8")) == {"DISPLAY": ":99"}
+
+
+def test_kill_all_reaps_finished_launcher_scope():
+    import tools.process_registry as pr
+
+    registry = pr.ProcessRegistry()
+    session = pr.ProcessSession(
+        id="finished-scoped",
+        command="true",
+        task_id="task",
+        started_at=0,
+        exited=True,
+        exit_code=0,
+        systemd_unit="hermes-worker-system-finished-scoped.scope",
+    )
+    registry._finished[session.id] = session
+
+    with patch.object(pr, "_stop_systemd_unit", return_value=True) as stop:
+        assert registry.kill_all() == 1
+
+    stop.assert_called_once_with(session.systemd_unit)
+
+
+def test_system_scope_routes_through_validating_root_wrapper(monkeypatch, tmp_path):
     import tools.process_registry as pr
 
     monkeypatch.setattr(
         "shutil.which",
         lambda name: {"systemd-run": "/usr/bin/systemd-run", "sudo": "/usr/bin/sudo"}.get(name),
     )
-    monkeypatch.setattr(pr.os, "getuid", lambda: 996)
-    monkeypatch.setattr(pr.os, "getgid", lambda: 997)
+    wrapper = tmp_path / "hermes-worker-scope"
+    wrapper.touch()
+    env_path = tmp_path / "worker-env.json"
+    monkeypatch.setattr(pr, "_SYSTEM_SCOPE_WRAPPER", wrapper)
+    monkeypatch.setattr(pr, "_write_worker_environment", lambda *_args: env_path)
     monkeypatch.setattr(pr, "_worker_memory_max_bytes", lambda: 512 * 1024 * 1024)
 
     argv = pr._build_systemd_scope_argv(
         ["/bin/bash", "-c", "true"], "test", backend="system"
     )
 
-    assert argv[:4] == ["/usr/bin/sudo", "-n", "/usr/bin/systemd-run", "--system"]
-    assert argv[argv.index("--uid") + 1] == "996"
-    assert argv[argv.index("--gid") + 1] == "997"
-    assert "MemoryMax=536870912" in argv
-    assert "MemoryHigh=483183820" in argv
-    assert "MemorySwapMax=0" in argv
+    assert argv == [
+        "/usr/bin/sudo",
+        "-n",
+        str(wrapper),
+        "run",
+        "test",
+        "536870912",
+        str(env_path),
+        "--",
+        "/bin/bash",
+        "-c",
+        "true",
+    ]
 
 
-def test_system_scope_preserves_only_safe_environment_names(monkeypatch):
+def test_system_scope_serializes_environment_outside_sudo_arguments(
+    monkeypatch, tmp_path
+):
     import tools.process_registry as pr
 
     monkeypatch.setattr(
         "shutil.which",
         lambda name: {"systemd-run": "/usr/bin/systemd-run", "sudo": "/usr/bin/sudo"}.get(name),
     )
-    argv = pr._build_systemd_scope_argv(
-        ["/usr/bin/env"], "browser-test", backend="system",
-        environment={"DISPLAY": ":99", "AGENT_BROWSER_SOCKET_DIR": "/tmp/s", "PATH": "/bad"},
+    wrapper = tmp_path / "hermes-worker-scope"
+    wrapper.touch()
+    env_path = tmp_path / "worker-env.json"
+    write_env = patch.object(
+        pr, "_write_worker_environment", return_value=env_path
     )
-    preserve = next(value for value in argv if value.startswith("--preserve-env="))
-    assert "DISPLAY" in preserve
-    assert "AGENT_BROWSER_SOCKET_DIR" in preserve
-    assert "PATH" not in preserve
+    monkeypatch.setattr(pr, "_SYSTEM_SCOPE_WRAPPER", wrapper)
+    environment = {
+        "DISPLAY": ":99",
+        "AGENT_BROWSER_SOCKET_DIR": "/tmp/s",
+        "PATH": "/safe",
+    }
+    with write_env as writer:
+        argv = pr._build_systemd_scope_argv(
+            ["/usr/bin/env"],
+            "browser-test",
+            backend="system",
+            environment=environment,
+        )
+
+    writer.assert_called_once_with(environment, "browser-test")
+    assert str(env_path) in argv
+    assert "DISPLAY" not in " ".join(argv)
     assert "/tmp/s" not in " ".join(argv)
 
 

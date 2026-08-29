@@ -65,17 +65,6 @@ def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool
     return False
 
 
-def test_kill_all_reaps_finished_launcher_scope(registry):
-    session = _make_session(sid="finished-scoped", exited=True, exit_code=0)
-    session.systemd_unit = "hermes-worker-system-finished-scoped.scope"
-    registry._finished[session.id] = session
-
-    with patch("tools.process_registry._stop_systemd_unit", return_value=True) as stop:
-        assert registry.kill_all() == 1
-
-    stop.assert_called_once_with(session.systemd_unit)
-
-
 def test_write_stdin_uses_str_for_windows_pty(monkeypatch, registry):
     """pywinpty expects str input; bytes raises a PyString conversion error."""
     written = []
