@@ -173,6 +173,15 @@ class SystemdWatchdog:
             self._last_heartbeat_at = now
         return sent
 
+    def _retry_delay(self, *, now: float, cadence: float) -> float:
+        """Retry strictly before the last successful heartbeat deadline."""
+        last_success = self._last_heartbeat_at
+        interval = self.interval_seconds
+        if last_success is None or interval is None:
+            return max(0.0, cadence / 4.0)
+        remaining = interval - (now - last_success)
+        return max(0.0, min(cadence / 4.0, remaining / 2.0))
+
     async def _run(self) -> None:
         interval = self.interval_seconds
         if interval is None:
@@ -188,16 +197,7 @@ class SystemdWatchdog:
                 if self._expired:
                     return
                 if not sent:
-                    last_success = self._last_heartbeat_at
-                    remaining = (
-                        interval - (now - last_success)
-                        if last_success is not None
-                        else cadence
-                    )
-                    retry_delay = max(
-                        0.01,
-                        min(cadence / 4.0, max(0.01, remaining / 2.0)),
-                    )
+                    retry_delay = self._retry_delay(now=now, cadence=cadence)
                     scheduled_at = now + retry_delay
                     continue
                 scheduled_at += cadence
@@ -227,6 +227,18 @@ class SystemdWatchdog:
             except Exception:
                 pass
         self._task = None
+        interval_seconds = self.interval_seconds
+        last_heartbeat_at = self._last_heartbeat_at
+        if (
+            self.enabled
+            and not self._expired
+            and interval_seconds is not None
+            and last_heartbeat_at is not None
+            and time.monotonic() - last_heartbeat_at >= interval_seconds
+        ):
+            self._unhealthy = True
+            self._expired = True
+            notify("STATUS=watchdog expired: hard deadline exceeded during shutdown")
         if self.enabled and not self._expired and not self._stopping_notified:
             notify("STOPPING=1\nWATCHDOG=1\nSTATUS=Hermes Gateway draining")
             self._stopping_notified = True

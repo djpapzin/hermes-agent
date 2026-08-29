@@ -20,12 +20,13 @@ from __future__ import annotations
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from gateway.structured_journal import emit_native_journal
 
 
 _SHUTDOWN_EVENT_MAX_RECORD_BYTES = 16 * 1024
@@ -389,23 +390,14 @@ def emit_shutdown_context(ctx: Dict[str, Any]) -> bool:
     diagnostic requires that metadata and payload PID to agree, separating the
     gateway from same-UID workers in independent systemd scopes.
     """
-    try:
-        payload = _encoded_shutdown_event(ctx)
-        message = b"\n".join(
-            (
-                b"MESSAGE=" + _SHUTDOWN_MESSAGE_PREFIX.encode("ascii") + payload,
-                b"PRIORITY=4",
-                b"SYSLOG_IDENTIFIER=hermes-shutdown-forensics",
-                b"HERMES_EVENT=gateway_shutdown",
-            )
-        )
-        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sender:
-            sender.setblocking(False)
-            sender.connect(_JOURNAL_SOCKET)
-            sender.send(message)
-        return True
-    except (OSError, TypeError, ValueError, UnicodeError):
-        return False
+    return emit_native_journal(
+        _encoded_shutdown_event(ctx),
+        message_prefix=_SHUTDOWN_MESSAGE_PREFIX.encode("ascii"),
+        identifier="hermes-shutdown-forensics",
+        event="gateway_shutdown",
+        priority=4,
+        journal_socket=_JOURNAL_SOCKET,
+    )
 
 
 def spawn_async_diagnostic(

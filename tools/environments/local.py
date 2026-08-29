@@ -1354,26 +1354,22 @@ class LocalEnvironment(BaseEnvironment):
                     _build_systemd_scope_argv,
                     _cleanup_scope_environment_when_done,
                     _discard_scope_environment,
+                    _gateway_worker_scope_backend,
                     _is_supervised_gateway_process,
-                    _worker_cgroup_mode,
-                    _worker_scope_backend,
                 )
 
-                if _is_supervised_gateway_process() and _worker_cgroup_mode() != "off":
-                    backend = _worker_scope_backend()
-                    if backend is None and _worker_cgroup_mode() in {"required", "system"}:
-                        raise RuntimeError(
-                            "Worker cgroup isolation is required but no systemd scope backend is available"
-                        )
-                    if backend is not None:
-                        suffix = f"fg-{os.getpid()}-{uuid.uuid4().hex[:12]}"
-                        args = _build_systemd_scope_argv(
-                            args,
-                            suffix,
-                            backend=backend,
-                            environment=run_env,
-                        )
-                        systemd_unit = f"hermes-worker-{'system-' if backend == 'system' else ''}{suffix}.scope"
+                if _is_supervised_gateway_process():
+                    backend = _gateway_worker_scope_backend()
+                    if backend is None:  # pragma: no cover - identity already verified
+                        raise RuntimeError("Supervised gateway worker isolation is unavailable")
+                    suffix = f"fg-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+                    args = _build_systemd_scope_argv(
+                        args,
+                        suffix,
+                        backend=backend,
+                        environment=run_env,
+                    )
+                    systemd_unit = f"hermes-worker-{'system-' if backend == 'system' else ''}{suffix}.scope"
             except RuntimeError:
                 raise
             except Exception as exc:

@@ -366,6 +366,19 @@ def _is_supervised_gateway_process() -> bool:
         return False
 
 
+def _gateway_worker_scope_backend() -> Optional[str]:
+    """Return the worker scope backend, failing closed inside the gateway."""
+    if not _is_supervised_gateway_process():
+        return None
+    backend = _worker_scope_backend()
+    if backend is None:
+        raise RuntimeError(
+            "Supervised gateway worker cgroup isolation is unavailable; "
+            "refusing to run workload in the control-plane cgroup"
+        )
+    return backend
+
+
 def _build_systemd_scope_argv(
     shell_argv: List[str], unit_suffix: str, backend: str = "user",
     environment: Optional[Dict[str, str]] = None,
@@ -373,7 +386,7 @@ def _build_systemd_scope_argv(
     import shutil
     binary = shutil.which("systemd-run")
     if binary is None:
-        return shell_argv
+        raise RuntimeError("systemd-run is unavailable for worker isolation")
     safe_suffix = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(unit_suffix)).strip("-.")
     safe_suffix = (safe_suffix or uuid.uuid4().hex)[:160]
     memory_max = _worker_memory_max_bytes()
@@ -381,7 +394,9 @@ def _build_systemd_scope_argv(
     if backend == "system":
         sudo = shutil.which("sudo")
         if sudo is None or not _SYSTEM_SCOPE_WRAPPER.is_file():
-            return shell_argv
+            raise RuntimeError(
+                "system worker scope wrapper is unavailable for worker isolation"
+            )
         env_path = _write_worker_environment(environment, safe_suffix)
         return [
             sudo,
@@ -409,15 +424,9 @@ def build_gateway_worker_scope_argv(
 ) -> tuple[List[str], Optional[str]]:
     if _IS_WINDOWS or not _is_supervised_gateway_process():
         return argv, None
-    mode = _worker_cgroup_mode()
-    if mode == "off":
-        return argv, None
-    backend = _worker_scope_backend()
-    if backend is None:
-        if mode in {"required", "system"}:
-            raise RuntimeError("Worker cgroup isolation is required but no systemd scope backend is available")
-        logger.warning("Gateway workload %s is not isolated in a systemd scope", unit_suffix)
-        return argv, None
+    backend = _gateway_worker_scope_backend()
+    if backend is None:  # pragma: no cover - guarded by supervised identity above
+        raise RuntimeError("Supervised gateway worker isolation is unavailable")
     wrapped = _build_systemd_scope_argv(argv, unit_suffix, backend, environment)
     safe_suffix = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(unit_suffix)).strip("-.")
     safe_suffix = (safe_suffix or "worker")[:160]
@@ -1143,9 +1152,12 @@ class ProcessRegistry:
                 pty_env.setdefault("PAGER", "cat")
                 pty_argv = [user_shell, "-lic", f"set +m; {command}"]
                 pty_in_supervised_gateway = not _IS_WINDOWS and _is_supervised_gateway_process()
-                pty_cgroup_mode = _worker_cgroup_mode()
-                pty_scope_backend = _worker_scope_backend() if pty_in_supervised_gateway else None
-                if pty_in_supervised_gateway and pty_cgroup_mode != "off" and pty_scope_backend:
+                pty_scope_backend = (
+                    _gateway_worker_scope_backend()
+                    if pty_in_supervised_gateway
+                    else None
+                )
+                if pty_in_supervised_gateway and pty_scope_backend:
                     pty_argv = _build_systemd_scope_argv(
                         pty_argv, session.id, pty_scope_backend, pty_env
                     )
@@ -1153,12 +1165,6 @@ class ProcessRegistry:
                         f"hermes-worker-{'system-' if pty_scope_backend == 'system' else ''}{session.id}.scope"
                     )
                     pty_scope_attempted = True
-                elif pty_in_supervised_gateway:
-                    if pty_cgroup_mode in {"required", "system"}:
-                        raise RuntimeError(
-                            "Worker cgroup isolation is required but no systemd scope backend is available"
-                        )
-                    logger.warning("PTY worker %s shares the gateway cgroup", session.id)
                 try:
                     pty_proc = _PtyProcessCls.spawn(
                         pty_argv,
@@ -1216,9 +1222,10 @@ class ProcessRegistry:
 
         shell_argv = [user_shell, "-lic", f"set +m; {command}"]
         in_supervised_gateway = not _IS_WINDOWS and _is_supervised_gateway_process()
-        cgroup_mode = _worker_cgroup_mode()
-        scope_backend = _worker_scope_backend() if in_supervised_gateway else None
-        if in_supervised_gateway and cgroup_mode != "off" and scope_backend:
+        scope_backend = (
+            _gateway_worker_scope_backend() if in_supervised_gateway else None
+        )
+        if in_supervised_gateway and scope_backend:
             unit_suffix = f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id
             spawn_argv = _build_systemd_scope_argv(
                 shell_argv, unit_suffix, scope_backend, bg_env
@@ -1228,12 +1235,6 @@ class ProcessRegistry:
             )
         else:
             spawn_argv = shell_argv
-            if in_supervised_gateway:
-                if cgroup_mode in {"required", "system"}:
-                    raise RuntimeError(
-                        "Worker cgroup isolation is required but no systemd scope backend is available"
-                    )
-                logger.warning("Local worker %s shares the gateway cgroup", session.id)
 
         try:
             proc = subprocess.Popen(

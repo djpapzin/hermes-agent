@@ -17,10 +17,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
+from gateway.structured_journal import emit_native_journal
+
 logger = logging.getLogger(__name__)
 
 _QUEUE_NOTICE_TIMEOUT_SECONDS = 5.0
-_ADMISSION_EVENTS_MAX_BYTES = 4 * 1024 * 1024
+_ADMISSION_EVENT_MAX_RECORD_BYTES = 8 * 1024
+_ADMISSION_MESSAGE_PREFIX = b"HERMES_ADMISSION "
 
 _registry_lock = threading.Lock()
 _gateway_controller: Optional["AgentAdmissionController"] = None
@@ -30,46 +33,31 @@ _admission_writer_lock = threading.Lock()
 _admission_writer_started = False
 
 
-def _admission_events_path() -> Path:
-    from hermes_constants import get_hermes_home
-
-    return get_hermes_home() / "state" / "admission-events.jsonl"
-
-
-def _append_admission_event(payload: dict) -> None:
-    """Persist one controlled JSON record outside mixed human-readable logs."""
-
-    path = _admission_events_path()
+def _emit_admission_event(payload: dict) -> None:
+    """Emit one controlled record through journald's manager-attested channel."""
     record = dict(payload)
     record.setdefault("timestamp", time.time())
-    encoded = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
-    if len(encoded) > 8192:
+    record["event"] = "gateway_admission"
+    record["gateway_pid"] = os.getpid()
+    encoded = json.dumps(record, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
+    if len(encoded) > _ADMISSION_EVENT_MAX_RECORD_BYTES:
         return
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            if path.lstat().st_size >= _ADMISSION_EVENTS_MAX_BYTES:
-                if path.is_symlink():
-                    return
-                os.replace(path, path.with_suffix(".jsonl.1"))
-        except FileNotFoundError:
-            pass
-        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(path, flags, 0o600)
-        try:
-            os.write(descriptor, encoded)
-        finally:
-            os.close(descriptor)
-    except OSError:
-        logger.debug("Could not persist admission event", exc_info=True)
+    if not emit_native_journal(
+        encoded,
+        message_prefix=_ADMISSION_MESSAGE_PREFIX,
+        identifier="hermes-admission",
+        event="gateway_admission",
+    ):
+        logger.debug("Could not emit admission event to native journal")
 
 
 def _admission_event_writer(event_queue: queue.Queue[dict]) -> None:
     while True:
         payload = event_queue.get()
         try:
-            _append_admission_event(payload)
+            _emit_admission_event(payload)
         finally:
             event_queue.task_done()
 

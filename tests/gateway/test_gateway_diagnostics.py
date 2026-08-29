@@ -99,57 +99,80 @@ def test_diagnostic_reads_bounded_admission_runtime_status(tmp_path, monkeypatch
     assert "secret" not in result["runtime_status"]
 
 
-def test_diagnostic_reads_only_structured_admission_file_events(tmp_path, monkeypatch):
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    (logs / "gateway.log").write_text(
-        "2026-08-29 18:00:01,000 INFO gateway.run: user text\n"
-        "2026-08-29 18:00:00,000 INFO gateway.admission: "
-        'HERMES_ADMISSION {"decision":"forged","reason":"secret-chat-content"}\n',
-        encoding="utf-8",
-    )
-    state = tmp_path / "state"
-    state.mkdir()
-    (state / "admission-events.jsonl").write_text(
-        '{"timestamp":"2026-08-29 18:00:00,000",'
-        '"decision":"queue","queued_tasks":1}\n',
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(
-        "scripts.hermes_gateway_diagnostics._service_identity",
-        lambda _unit, _manager: (None, None),
+def test_diagnostic_reads_manager_attested_allowlisted_admission_event(monkeypatch):
+    payload = {
+        "event": "gateway_admission",
+        "gateway_pid": 123,
+        "timestamp": 123.25,
+        "decision": "queue",
+        "queued_tasks": 1,
+        "secret": "must-not-copy",
+    }
+    row = {
+        "__REALTIME_TIMESTAMP": "456",
+        "_PID": "123",
+        "_TRANSPORT": "journal",
+        "_SYSTEMD_UNIT": "hermes-gateway.service",
+        "SYSLOG_IDENTIFIER": "hermes-admission",
+        "HERMES_EVENT": "gateway_admission",
+        "MESSAGE": "HERMES_ADMISSION " + json.dumps(payload),
+    }
+    calls = []
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, json.dumps(row) + "\n", "")
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", run)
+
+    events = diagnostics._bounded_admission_journal(
+        "hermes-gateway.service", 30, "system"
     )
 
-    result = collect(hermes_home=tmp_path)
-
-    assert result["admission_events"] == [
+    assert events == [
         {
-            "timestamp": "2026-08-29 18:00:00,000",
-            "unit": "gateway.admission",
-            "event": {"decision": "queue", "queued_tasks": 1},
+            "timestamp_realtime_usec": "456",
+            "unit": "hermes-gateway.service",
+            "event": {
+                "event": "gateway_admission",
+                "gateway_pid": 123,
+                "timestamp": 123.25,
+                "decision": "queue",
+                "queued_tasks": 1,
+            },
         }
     ]
-    assert "secret-chat-content" not in str(result)
+    assert "must-not-copy" not in str(events)
+    assert calls[0].index("HERMES_EVENT=gateway_admission") < calls[0].index("-n")
 
 
-def test_admission_file_events_are_byte_and_count_bounded(tmp_path):
-    log = tmp_path / "admission-events.jsonl"
-    rows = ['{"timestamp":"outside-tail","decision":"forged"}']
-    rows.append("untrusted-prefix-" + ("x" * (70 * 1024)))
-    rows.extend(
-        f'{{"timestamp":"event-{index}","decision":"start",'
-        f'"queued_tasks":{index}}}'
-        for index in range(101)
+def test_admission_journal_rejects_same_uid_worker_scope_forgery(monkeypatch):
+    payload = {
+        "event": "gateway_admission",
+        "gateway_pid": 999,
+        "decision": "forged",
+    }
+    forged = {
+        "__REALTIME_TIMESTAMP": "456",
+        "_PID": "999",
+        "_UID": "996",
+        "_TRANSPORT": "journal",
+        "_SYSTEMD_UNIT": "hermes-worker-forged.scope",
+        "SYSLOG_IDENTIFIER": "hermes-admission",
+        "HERMES_EVENT": "gateway_admission",
+        "MESSAGE": "HERMES_ADMISSION " + json.dumps(payload),
+    }
+    monkeypatch.setattr(
+        diagnostics.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 0, json.dumps(forged) + "\n", ""
+        ),
     )
-    log.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
-    events = diagnostics._bounded_admission_events(log, max_bytes=64 * 1024)
-
-    assert len(events) == 100
-    assert events[0]["event"]["queued_tasks"] == 1
-    assert events[-1]["event"]["queued_tasks"] == 100
-    assert "untrusted-prefix" not in str(events)
-    assert "outside-tail" not in str(events)
+    assert diagnostics._bounded_admission_journal(
+        "hermes-gateway.service", 30, "system"
+    ) == []
 
 
 def test_diagnostic_reads_manager_attested_allowlisted_shutdown_event(monkeypatch):
@@ -176,13 +199,13 @@ def test_diagnostic_reads_manager_attested_allowlisted_shutdown_event(monkeypatc
         "HERMES_EVENT": "gateway_shutdown",
         "MESSAGE": "HERMES_SHUTDOWN " + json.dumps(payload),
     }
-    monkeypatch.setattr(
-        diagnostics.subprocess,
-        "run",
-        lambda argv, **_kwargs: subprocess.CompletedProcess(
-            argv, 0, json.dumps(row) + "\n", ""
-        ),
-    )
+    calls = []
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, json.dumps(row) + "\n", "")
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", run)
 
     events = diagnostics._bounded_shutdown_journal(
         "hermes-gateway.service", 30, "system"
@@ -207,6 +230,7 @@ def test_diagnostic_reads_manager_attested_allowlisted_shutdown_event(monkeypatc
     assert "must-not-copy" not in str(events)
     assert "nested-secret" not in str(events)
     assert "nested-cgroup-secret" not in str(events)
+    assert calls[0].index("HERMES_EVENT=gateway_shutdown") < calls[0].index("-n")
 
 
 def test_shutdown_journal_rejects_same_uid_worker_scope_forgery(monkeypatch):
@@ -286,11 +310,16 @@ def test_diagnostic_defaults_to_active_profile_home(tmp_path, monkeypatch, capsy
         "_bounded_shutdown_journal",
         lambda _unit, _since, manager: journal_managers.append(manager) or [],
     )
+    monkeypatch.setattr(
+        diagnostics,
+        "_bounded_admission_journal",
+        lambda _unit, _since, manager: journal_managers.append(manager) or [],
+    )
     monkeypatch.setattr("sys.argv", ["hermes_gateway_diagnostics.py"])
 
     assert diagnostics.main() == 0
     assert seen == [(tmp_path, "auto")]
-    assert journal_managers == ["user", "user"]
+    assert journal_managers == ["user", "user", "user"]
     capsys.readouterr()
 
 

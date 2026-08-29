@@ -76,6 +76,15 @@ def test_system_scope_routes_through_validating_root_wrapper(monkeypatch, tmp_pa
     ]
 
 
+def test_scope_builder_never_silently_returns_unscoped_command(monkeypatch):
+    import tools.process_registry as pr
+
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+
+    with pytest.raises(RuntimeError, match="systemd-run is unavailable"):
+        pr._build_systemd_scope_argv(["/bin/true"], "test", backend="user")
+
+
 def test_system_scope_serializes_environment_outside_sudo_arguments(
     monkeypatch, tmp_path
 ):
@@ -283,7 +292,7 @@ def test_required_mode_refuses_worker_in_gateway_cgroup(monkeypatch, tmp_path):
     monkeypatch.setattr(pr, "_worker_scope_backend", lambda: None)
 
     with patch("subprocess.Popen") as spawn:
-        with pytest.raises(RuntimeError, match="cgroup isolation is required"):
+        with pytest.raises(RuntimeError, match="worker cgroup isolation is unavailable"):
             registry.spawn_local("echo unsafe", cwd=str(tmp_path))
     spawn.assert_not_called()
 
@@ -295,7 +304,21 @@ def test_explicit_system_mode_refuses_unbounded_fallback(monkeypatch):
     monkeypatch.setattr(pr, "_worker_cgroup_mode", lambda: "system")
     monkeypatch.setattr(pr, "_worker_scope_backend", lambda: None)
 
-    with pytest.raises(RuntimeError, match="cgroup isolation is required"):
+    with pytest.raises(RuntimeError, match="worker cgroup isolation is unavailable"):
+        pr.build_gateway_worker_scope_argv(["/bin/true"], unit_suffix="test")
+
+
+@pytest.mark.parametrize("mode", ["auto", "user", "off"])
+def test_supervised_gateway_never_falls_back_to_unscoped_worker(
+    monkeypatch, mode
+):
+    import tools.process_registry as pr
+
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setattr(pr, "_worker_cgroup_mode", lambda: mode)
+    monkeypatch.setattr(pr, "_worker_scope_backend", lambda: None)
+
+    with pytest.raises(RuntimeError, match="control-plane cgroup"):
         pr.build_gateway_worker_scope_argv(["/bin/true"], unit_suffix="test")
 
 

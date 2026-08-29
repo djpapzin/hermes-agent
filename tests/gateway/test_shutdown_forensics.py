@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from gateway import shutdown_forensics as sf
+from gateway import structured_journal as sj
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +189,7 @@ class TestEmitShutdownContext:
                 calls.append(("send", message))
                 return len(message)
 
-        monkeypatch.setattr(sf.socket, "socket", lambda *_args: _Sender())
+        monkeypatch.setattr(sj.socket, "socket", lambda *_args: _Sender())
         ctx = sf.snapshot_shutdown_context(
             signal.SIGTERM,
             shutdown_reason="unexpected_external_signal",
@@ -232,7 +233,7 @@ class TestEmitShutdownContext:
             def connect(self, _address):
                 raise BlockingIOError
 
-        monkeypatch.setattr(sf.socket, "socket", lambda *_args: _Sender())
+        monkeypatch.setattr(sj.socket, "socket", lambda *_args: _Sender())
 
         assert sf.emit_shutdown_context({"signal": "SIGTERM"}) is False
 

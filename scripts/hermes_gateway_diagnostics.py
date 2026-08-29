@@ -39,7 +39,7 @@ _ADMISSION_EVENT_FIELDS = (
     "cgroup_available_memory_mb",
     "min_headroom_mb",
 )
-_ADMISSION_LOG_TAIL_BYTES = 512 * 1024
+_ADMISSION_MESSAGE_PREFIX = "HERMES_ADMISSION "
 _SHUTDOWN_MESSAGE_PREFIX = "HERMES_SHUTDOWN "
 
 _SHUTDOWN_SCALAR_FIELDS = (
@@ -294,43 +294,107 @@ def _bounded_incident_journal(
     return events[-100:]
 
 
-def _bounded_admission_events(
-    path: Path, *, max_bytes: int = _ADMISSION_LOG_TAIL_BYTES
-) -> list[dict[str, Any]]:
-    """Read allowlisted records from the dedicated admission JSONL tail."""
+def _journal_commands(
+    unit: str,
+    manager: str,
+    *,
+    identifier: str,
+    event: str,
+) -> list[tuple[list[str], str]]:
+    commands: list[tuple[list[str], str]] = []
+    matches = [
+        f"SYSLOG_IDENTIFIER={identifier}",
+        f"HERMES_EVENT={event}",
+    ]
+    if manager in {"auto", "system"}:
+        commands.append((["journalctl", "--unit", unit, *matches], "system"))
+    if manager in {"auto", "user"}:
+        commands.append((["journalctl", "--user-unit", unit, *matches], "user"))
+    return commands
 
-    try:
-        with path.open("rb") as handle:
-            handle.seek(0, 2)
-            size = handle.tell()
-            start = max(0, size - max(1, max_bytes))
-            handle.seek(start)
-            raw = handle.read(max(1, max_bytes))
-    except OSError:
-        return []
-    lines = raw.decode("utf-8", errors="replace").splitlines()
-    if start:
-        lines = lines[1:]
+
+def _bounded_admission_journal(
+    unit: str, since_minutes: int, manager: str = "auto"
+) -> list[dict[str, Any]]:
+    """Return manager-attested native-journal admission records."""
+    commands = _journal_commands(
+        unit,
+        manager,
+        identifier="hermes-admission",
+        event="gateway_admission",
+    )
     events: list[dict[str, Any]] = []
-    for line in lines:
+    for base, source in commands:
         try:
-            payload = json.loads(line)
-        except (TypeError, ValueError):
+            result = subprocess.run(
+                [
+                    *base,
+                    "--since",
+                    f"{max(1, since_minutes)} minutes ago",
+                    "-n",
+                    "300",
+                    "-o",
+                    "json",
+                    "--no-pager",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
             continue
-        if not isinstance(payload, dict):
-            continue
-        event = {
-            key: payload[key]
-            for key in _ADMISSION_EVENT_FIELDS
-            if key in payload
-        }
-        events.append(
-            {
-                "timestamp": str(payload.get("timestamp") or ""),
-                "unit": "gateway.admission",
-                "event": event,
+        for line in result.stdout.splitlines():
+            try:
+                row = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            message = str(row.get("MESSAGE") or "")
+            if not message.startswith(_ADMISSION_MESSAGE_PREFIX):
+                continue
+            trusted_unit = (
+                row.get("_SYSTEMD_UNIT") == unit
+                if source == "system"
+                else row.get("_SYSTEMD_USER_UNIT") == unit
+            )
+            if not (
+                trusted_unit
+                and row.get("_TRANSPORT") == "journal"
+                and row.get("SYSLOG_IDENTIFIER") == "hermes-admission"
+                and row.get("HERMES_EVENT") == "gateway_admission"
+            ):
+                continue
+            try:
+                payload = json.loads(message[len(_ADMISSION_MESSAGE_PREFIX):])
+            except (TypeError, ValueError):
+                continue
+            row_pid = str(row.get("_PID") or "")
+            if not (
+                isinstance(payload, dict)
+                and payload.get("event") == "gateway_admission"
+                and row_pid.isdigit()
+                and payload.get("gateway_pid") == int(row_pid)
+            ):
+                continue
+            safe = {
+                key: payload[key]
+                for key in ("event", "gateway_pid", "timestamp", *_ADMISSION_EVENT_FIELDS)
+                if key in payload
             }
-        )
+            events.append(
+                {
+                    "timestamp_realtime_usec": str(
+                        row.get("__REALTIME_TIMESTAMP") or ""
+                    ),
+                    "unit": unit,
+                    "event": safe,
+                }
+            )
+    events.sort(
+        key=lambda event: int(event["timestamp_realtime_usec"])
+        if event["timestamp_realtime_usec"].isdigit()
+        else -1
+    )
     return events[-100:]
 
 
@@ -392,11 +456,12 @@ def _bounded_shutdown_journal(
     unit: str, since_minutes: int, manager: str = "auto"
 ) -> list[dict[str, Any]]:
     """Return manager-attested native-journal shutdown records."""
-    commands: list[tuple[list[str], str]] = []
-    if manager in {"auto", "system"}:
-        commands.append((["journalctl", "--unit", unit], "system"))
-    if manager in {"auto", "user"}:
-        commands.append((["journalctl", "--user-unit", unit], "user"))
+    commands = _journal_commands(
+        unit,
+        manager,
+        identifier="hermes-shutdown-forensics",
+        event="gateway_shutdown",
+    )
     events: list[dict[str, Any]] = []
     for base, source in commands:
         try:
@@ -581,9 +646,6 @@ def collect(
     result["worker_cgroups"] = worker_scope_rows[:100]
     result["worker_slices"] = worker_slice_rows
     result["worker_count"] = len(worker_scope_rows)
-    result["admission_events"] = _bounded_admission_events(
-        hermes_home / "state" / "admission-events.jsonl"
-    )
     return result
 
 
@@ -599,6 +661,9 @@ def main() -> int:
         args.unit, args.since_minutes, result.get("service_manager", args.manager)
     )
     result["shutdown_events"] = _bounded_shutdown_journal(
+        args.unit, args.since_minutes, result.get("service_manager", args.manager)
+    )
+    result["admission_events"] = _bounded_admission_journal(
         args.unit, args.since_minutes, result.get("service_manager", args.manager)
     )
     print(json.dumps(result, indent=2, sort_keys=True))

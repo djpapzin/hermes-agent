@@ -162,6 +162,21 @@ def test_watchdog_failed_notify_does_not_advance_success_deadline(monkeypatch):
     assert "WATCHDOG=1" not in calls[-1]
 
 
+def test_watchdog_retry_is_strictly_before_remaining_deadline(monkeypatch):
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    watchdog = notify_mod.SystemdWatchdog()
+    watchdog._last_heartbeat_at = 10.0
+
+    remaining = 0.001
+    delay = watchdog._retry_delay(now=10.0 + 1.0 - remaining, cadence=0.5)
+
+    assert 0 <= delay < remaining
+
+
 @pytest.mark.asyncio
 async def test_watchdog_sampler_retries_after_transient_notify_failure(monkeypatch):
     calls: list[str] = []
@@ -206,6 +221,29 @@ async def test_expired_watchdog_shutdown_does_not_rearm_manager(monkeypatch):
     await watchdog.stop()
 
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_rechecks_expired_heartbeat_before_stopping_notify(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setenv("NOTIFY_SOCKET", "/tmp/hermes-test-notify")
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")
+
+    import gateway.systemd_notify as notify_mod
+
+    monkeypatch.setattr(
+        notify_mod, "notify", lambda message: calls.append(message) or True
+    )
+    monkeypatch.setattr(notify_mod.time, "monotonic", lambda: 20.0)
+    watchdog = notify_mod.SystemdWatchdog()
+    watchdog._last_heartbeat_at = 18.0
+
+    await watchdog.stop()
+
+    assert watchdog.unhealthy is True
+    assert watchdog._expired is True
+    assert calls == ["STATUS=watchdog expired: hard deadline exceeded during shutdown"]
+    assert not any("STOPPING=1" in message or "WATCHDOG=1" in message for message in calls)
 
 
 @pytest.mark.asyncio

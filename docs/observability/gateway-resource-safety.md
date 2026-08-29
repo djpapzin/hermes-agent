@@ -23,12 +23,13 @@ diagnostic requires trusted journald PID/unit metadata to match the payload, so
 same-UID workers in independent scopes cannot forge gateway evidence.
 
 The same output includes at most 100 filtered lifecycle/resource journal
-events from the gateway, health guard, and kernel, plus at most 100 structured
-admission records from a bounded 512 KiB tail of
-`state/admission-events.jsonl`, plus at most 100 authenticated structured
-shutdown journal records. The gateway writes only controlled fields to these
-channels; the diagnostic allowlists them again and never parses mixed
-human-readable chat or command logs.
+events from the gateway, health guard, and kernel, plus at most 100
+manager-attested structured admission records and 100 manager-attested
+structured shutdown records from native journald. Both queries apply exact
+event and identifier matches before their bounded result cap. The gateway
+writes only controlled fields to these channels; the diagnostic requires the
+trusted unit and PID metadata to match each payload, allowlists fields again,
+and never parses same-UID files or mixed human-readable chat/command logs.
 
 Admission uses the tighter of host `MemAvailable` and finite gateway-cgroup
 headroom (`MemoryMax - MemoryCurrent`). Structured admission logs expose both
@@ -79,6 +80,11 @@ admission and memory evidence before changing the watchdog interval.
 - For production Linux gateways, verify either `systemd-run --user --scope` or
   the same-UID `sudo -n systemd-run --system --scope --uid=<runtime-user>` path
   works before selecting `terminal.worker_cgroup_mode: required`.
+- A supervised gateway fails closed if no worker-scope backend is available,
+  including `auto`, `user`, or `off` configurations. Running model-controlled
+  work inside the control-plane cgroup would defeat both resource isolation and
+  manager-attested diagnostic provenance. CLI processes outside the supervised
+  gateway retain their existing fallback behavior.
 
 ### Replace restart-on-pressure health guards
 

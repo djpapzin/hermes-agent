@@ -22,10 +22,17 @@ from gateway.admission import (
 )
 
 
-def test_structured_admission_journal_is_dedicated_and_bounded(tmp_path, monkeypatch):
-    journal = tmp_path / "state" / "admission-events.jsonl"
-    monkeypatch.setattr(admission_module, "_admission_events_path", lambda: journal)
-    admission_module._append_admission_event(
+def test_structured_admission_journal_is_dedicated_and_bounded(monkeypatch):
+    emitted = []
+    monkeypatch.setattr(
+        admission_module,
+        "emit_native_journal",
+        lambda payload, **kwargs: emitted.append((payload, kwargs)) or True,
+    )
+    monkeypatch.setattr(admission_module.os, "getpid", lambda: 4321)
+    monkeypatch.setattr(admission_module.time, "time", lambda: 123.25)
+
+    admission_module._emit_admission_event(
         {
             "decision": "queue",
             "task_id": "task-1",
@@ -34,12 +41,17 @@ def test_structured_admission_journal_is_dedicated_and_bounded(tmp_path, monkeyp
         }
     )
 
-    row = admission_module.json.loads(journal.read_text(encoding="utf-8"))
+    row = admission_module.json.loads(emitted[0][0])
+    kwargs = emitted[0][1]
+    assert row["event"] == "gateway_admission"
+    assert row["gateway_pid"] == 4321
     assert row["decision"] == "queue"
     assert row["task_id"] == "task-1"
     assert row["active_workers"] == 0
     assert row["queued_tasks"] == 0
-    assert isinstance(row["timestamp"], float)
+    assert row["timestamp"] == 123.25
+    assert kwargs["identifier"] == "hermes-admission"
+    assert kwargs["event"] == "gateway_admission"
 
 
 def test_admission_persistence_runs_off_controller_thread(monkeypatch):
@@ -53,7 +65,7 @@ def test_admission_persistence_runs_off_controller_thread(monkeypatch):
 
     monkeypatch.setattr(admission_module, "_admission_event_queue", event_queue)
     monkeypatch.setattr(admission_module, "_admission_writer_started", False)
-    monkeypatch.setattr(admission_module, "_append_admission_event", blocked_writer)
+    monkeypatch.setattr(admission_module, "_emit_admission_event", blocked_writer)
 
     admission_module._queue_admission_event({"decision": "queue"})
 
