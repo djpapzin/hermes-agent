@@ -76,16 +76,24 @@ def _run(*args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(args, 124, "", str(exc))
 
 
-def _runtime_counts(path: Path) -> tuple[int, int]:
+def _runtime_snapshot(path: Path) -> tuple[int, int, bool | None]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         admission = payload.get("admission") if isinstance(payload, dict) else {}
+        platforms = payload.get("platforms") if isinstance(payload, dict) else {}
+        telegram = platforms.get("telegram") if isinstance(platforms, dict) else None
+        telegram_connected = (
+            telegram.get("state") == "connected"
+            if isinstance(telegram, dict) and "state" in telegram
+            else None
+        )
         return (
             max(0, int(payload.get("active_agents", 0))),
             max(0, int((admission or {}).get("queued_tasks", 0))),
+            telegram_connected,
         )
     except (OSError, TypeError, ValueError):
-        return 0, 0
+        return 0, 0, None
 
 
 def _telegram_enabled(path: Path) -> bool:
@@ -165,14 +173,19 @@ def collect_snapshot(
         probe_errors.append("ss")
     sockets = socket_result.stdout
     pid_marker = f"pid={main_pid},"
-    telegram_connected = any(
+    socket_telegram_connected = any(
         "ESTAB" in line
         and pid_marker in line
         and ("149.154." in line or "91.108." in line)
         for line in sockets.splitlines()
     )
-    active_agents, queued_tasks = _runtime_counts(
+    active_agents, queued_tasks, runtime_telegram_connected = _runtime_snapshot(
         hermes_home / "gateway_state.json"
+    )
+    telegram_connected = (
+        runtime_telegram_connected
+        if runtime_telegram_connected is not None
+        else socket_telegram_connected
     )
     wal = hermes_home / "state.db-wal"
     return GuardSnapshot(

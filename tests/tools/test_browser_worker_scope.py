@@ -44,3 +44,22 @@ def test_timed_out_browser_stops_complete_scope_before_launcher():
 
     stop.assert_called_once_with("hermes-worker-system-browser.scope")
     assert proc.killed is True
+
+
+def test_timed_out_browser_also_stops_daemon_origin_scope():
+    class Proc:
+        _hermes_systemd_unit = "hermes-worker-system-command.scope"
+
+        def poll(self):
+            return 0
+
+    with patch("tools.process_registry._stop_systemd_unit") as stop:
+        _stop_scoped_browser_workload(
+            Proc(),
+            {"daemon_systemd_unit": "hermes-worker-system-daemon.scope"},
+        )
+
+    assert [call.args[0] for call in stop.call_args_list] == [
+        "hermes-worker-system-command.scope",
+        "hermes-worker-system-daemon.scope",
+    ]

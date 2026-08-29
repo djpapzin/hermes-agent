@@ -4987,6 +4987,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         await self._send_goal_status_notice(source, message)
 
+    async def _handle_admitted_compress_command(
+        self,
+        event: Any,
+        source: Any,
+        session_key: str,
+        *,
+        is_internal: bool = False,
+    ) -> Any:
+        """Run model-backed compression under the global worker admission gate."""
+        if getattr(self, "_external_drain_active", False) and not is_internal:
+            return (
+                "⏳ This agent is draining for a maintenance action and isn't "
+                "accepting new turns right now. It'll be back in a moment — "
+                "please resend shortly."
+            )
+        admission = getattr(self, "_agent_admission", None)
+        if admission is None:
+            return await self._handle_compress_command(event)
+
+        from gateway.admission import AdmissionRejected
+
+        task_id = f"compress:{session_key}"
+        try:
+            await admission.acquire(
+                task_id,
+                on_queued=lambda message: self._send_admission_queue_notice(
+                    source, message
+                ),
+            )
+            self._persist_active_agents()
+        except AdmissionRejected as exc:
+            return str(exc)
+
+        outcome = "finished"
+        try:
+            return await self._handle_compress_command(event)
+        except BaseException:
+            outcome = "failed"
+            raise
+        finally:
+            await asyncio.shield(admission.release(task_id, outcome=outcome))
+            self._persist_active_agents()
+
     async def _send_background_admission_queue_notice(
         self,
         message: str,
@@ -11226,7 +11269,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_set_home_command(event)
 
         if canonical == "compress":
-            return await self._handle_compress_command(event)
+            return await self._handle_admitted_compress_command(
+                event,
+                source,
+                _quick_key,
+                is_internal=is_internal,
+            )
 
         if canonical == "usage":
             return await self._handle_usage_command(event)

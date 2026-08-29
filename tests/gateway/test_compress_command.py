@@ -1,7 +1,8 @@
 """Tests for gateway /compress user-facing messaging."""
 
+import asyncio
 from datetime import datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -56,6 +57,37 @@ def _make_runner(history: list[dict[str, str]]):
     runner.session_store._save = MagicMock()
     runner._session_db = None
     return runner
+
+
+@pytest.mark.asyncio
+async def test_compress_command_queues_under_global_admission():
+    from gateway.admission import AgentAdmissionController
+
+    runner = _make_runner(_make_history())
+    controller = AgentAdmissionController(
+        max_parallel=1, queue_limit=1, poll_interval_seconds=0.01
+    )
+    await controller.acquire("existing")
+    runner._agent_admission = controller
+    runner._external_drain_active = False
+    runner._persist_active_agents = MagicMock()
+    runner._send_admission_queue_notice = AsyncMock()
+    runner._handle_compress_command = AsyncMock(return_value="compressed")
+    event = _make_event()
+
+    task = asyncio.create_task(
+        runner._handle_admitted_compress_command(
+            event, event.source, "telegram:c1"
+        )
+    )
+    await asyncio.sleep(0.03)
+    assert controller.snapshot().queued == 1
+    runner._handle_compress_command.assert_not_awaited()
+
+    await controller.release("existing")
+    assert await asyncio.wait_for(task, timeout=0.2) == "compressed"
+    runner._handle_compress_command.assert_awaited_once_with(event)
+    assert controller.snapshot().active == 0
 
 
 @pytest.mark.asyncio

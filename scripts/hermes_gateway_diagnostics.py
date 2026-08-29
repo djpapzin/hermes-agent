@@ -45,19 +45,26 @@ def _fields(path: Path) -> dict[str, int]:
     return result
 
 
-def _service_pid(unit: str) -> int | None:
-    try:
-        result = subprocess.run(
-            ["systemctl", "show", unit, "--property=MainPID", "--value"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-        raw = result.stdout.strip()
-        return int(raw) if result.returncode == 0 and raw.isdigit() and raw != "0" else None
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return None
+def _service_pid(unit: str, manager: str = "auto") -> int | None:
+    managers = ("system", "user") if manager == "auto" else (manager,)
+    for candidate in managers:
+        argv = ["systemctl"]
+        if candidate == "user":
+            argv.append("--user")
+        try:
+            result = subprocess.run(
+                [*argv, "show", unit, "--property=MainPID", "--value"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            raw = result.stdout.strip()
+            if result.returncode == 0 and raw.isdigit() and raw != "0":
+                return int(raw)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            continue
+    return None
 
 
 def _runtime_status(path: Path) -> dict[str, Any] | None:
@@ -81,10 +88,17 @@ def _runtime_status(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _bounded_incident_journal(unit: str, since_minutes: int) -> list[dict[str, str]]:
+def _bounded_incident_journal(
+    unit: str, since_minutes: int, manager: str = "auto"
+) -> list[dict[str, str]]:
     """Return only lifecycle/resource evidence, never general chat logs."""
+    gateway_commands = []
+    if manager in {"auto", "system"}:
+        gateway_commands.append(["journalctl", "-u", unit])
+    if manager in {"auto", "user"}:
+        gateway_commands.append(["journalctl", "--user", "-u", unit])
     commands = [
-        ["journalctl", "-u", unit],
+        *gateway_commands,
         ["journalctl", "-u", "hermes-health-guard.service"],
         ["journalctl", "-k"],
     ]
@@ -134,10 +148,12 @@ def collect(
     hermes_home: Path = Path.home() / ".hermes",
     proc_root: Path = Path("/proc"),
     cgroup_root: Path = Path("/sys/fs/cgroup"),
+    manager: str = "auto",
 ) -> dict[str, Any]:
-    pid = _service_pid(unit)
+    pid = _service_pid(unit) if manager == "auto" else _service_pid(unit, manager)
     result: dict[str, Any] = {
         "unit": unit,
+        "service_manager": manager,
         "gateway_pid": pid,
         "host_memory_kb": _fields(proc_root / "meminfo"),
     }
@@ -240,10 +256,11 @@ def main() -> int:
     parser.add_argument("--unit", default="hermes-gateway.service")
     parser.add_argument("--hermes-home", type=Path, default=get_hermes_home())
     parser.add_argument("--since-minutes", type=int, default=30)
+    parser.add_argument("--manager", choices=("auto", "system", "user"), default="auto")
     args = parser.parse_args()
-    result = collect(args.unit, args.hermes_home)
+    result = collect(args.unit, args.hermes_home, manager=args.manager)
     result["incident_events"] = _bounded_incident_journal(
-        args.unit, args.since_minutes
+        args.unit, args.since_minutes, args.manager
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0

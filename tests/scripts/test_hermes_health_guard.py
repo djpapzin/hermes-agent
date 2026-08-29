@@ -157,3 +157,16 @@ def test_telegram_enablement_resolves_nested_config_and_secret_file(tmp_path):
         encoding="utf-8",
     )
     assert _telegram_enabled(config) is False
+
+
+def test_runtime_platform_state_recognizes_proxied_telegram_connection(tmp_path):
+    from scripts.hermes_health_guard import _runtime_snapshot
+
+    state = tmp_path / "gateway_state.json"
+    state.write_text(
+        '{"active_agents": 1, "admission": {"queued_tasks": 2}, '
+        '"platforms": {"telegram": {"state": "connected"}}}',
+        encoding="utf-8",
+    )
+
+    assert _runtime_snapshot(state) == (1, 2, True)

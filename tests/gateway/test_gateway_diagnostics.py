@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 from gateway.shutdown_forensics import snapshot_shutdown_context
 from scripts import hermes_gateway_diagnostics as diagnostics
@@ -132,11 +133,27 @@ def test_diagnostic_defaults_to_active_profile_home(tmp_path, monkeypatch, capsy
     monkeypatch.setattr(
         diagnostics,
         "collect",
-        lambda _unit, home: seen.append(home) or {},
+        lambda _unit, home, manager="auto": seen.append((home, manager)) or {},
     )
     monkeypatch.setattr(diagnostics, "_bounded_incident_journal", lambda *_args: [])
     monkeypatch.setattr("sys.argv", ["hermes_gateway_diagnostics.py"])
 
     assert diagnostics.main() == 0
-    assert seen == [tmp_path]
+    assert seen == [(tmp_path, "auto")]
     capsys.readouterr()
+
+
+def test_service_pid_auto_detects_user_manager(monkeypatch):
+    calls = []
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        if "--user" in argv:
+            return subprocess.CompletedProcess(argv, 0, "4321\n", "")
+        return subprocess.CompletedProcess(argv, 0, "0\n", "")
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", run)
+
+    assert diagnostics._service_pid("hermes-gateway.service") == 4321
+    assert calls[0][0] == "systemctl" and "--user" not in calls[0]
+    assert "--user" in calls[1]

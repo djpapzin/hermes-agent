@@ -2276,7 +2276,7 @@ class ProcessRegistry:
         now = time.time()
         expired = [
             sid for sid, s in self._finished.items()
-            if (now - s.started_at) > FINISHED_TTL_SECONDS
+            if not s.systemd_unit and (now - s.started_at) > FINISHED_TTL_SECONDS
         ]
         for sid in expired:
             del self._finished[sid]
@@ -2285,8 +2285,9 @@ class ProcessRegistry:
 
         # If still over limit, remove oldest finished
         total = len(self._running) + len(self._finished)
-        if total >= MAX_PROCESSES and self._finished:
-            oldest_id = min(self._finished, key=lambda sid: self._finished[sid].started_at)
+        prunable = [sid for sid, s in self._finished.items() if not s.systemd_unit]
+        if total >= MAX_PROCESSES and prunable:
+            oldest_id = min(prunable, key=lambda sid: self._finished[sid].started_at)
             del self._finished[oldest_id]
             self._completion_consumed.discard(oldest_id)
             self._poll_observed.discard(oldest_id)
@@ -2309,35 +2310,38 @@ class ProcessRegistry:
         """Write running process metadata to checkpoint file atomically."""
         try:
             with self._lock:
+                sessions = [
+                    *(s for s in self._running.values() if not s.exited),
+                    *(s for s in self._finished.values() if s.systemd_unit),
+                ]
                 entries = []
-                for s in self._running.values():
-                    if not s.exited:
-                        # Lazily backfill the kernel start time for host PIDs so
-                        # recovery after restart can detect PID recycling even
-                        # for sessions spawned before this field existed.
-                        if s.host_start_time is None and s.pid_scope == "host" and s.pid:
-                            s.host_start_time = self._safe_host_start_time(s.pid)
-                        entries.append({
-                            "session_id": s.id,
-                            "command": s.command,
-                            "pid": s.pid,
-                            "pid_scope": s.pid_scope,
-                            "host_start_time": s.host_start_time,
-                            "systemd_unit": s.systemd_unit,
-                            "cwd": s.cwd,
-                            "started_at": s.started_at,
-                            "task_id": s.task_id,
-                            "session_key": s.session_key,
-                            "watcher_platform": s.watcher_platform,
-                            "watcher_chat_id": s.watcher_chat_id,
-                            "watcher_user_id": s.watcher_user_id,
-                            "watcher_user_name": s.watcher_user_name,
-                            "watcher_thread_id": s.watcher_thread_id,
-                            "watcher_message_id": s.watcher_message_id,
-                            "watcher_interval": s.watcher_interval,
-                            "notify_on_complete": s.notify_on_complete,
-                            "watch_patterns": s.watch_patterns,
-                        })
+                for s in sessions:
+                    # Lazily backfill the kernel start time for host PIDs so
+                    # recovery after restart can detect PID recycling even
+                    # for sessions spawned before this field existed.
+                    if s.host_start_time is None and s.pid_scope == "host" and s.pid:
+                        s.host_start_time = self._safe_host_start_time(s.pid)
+                    entries.append({
+                        "session_id": s.id,
+                        "command": s.command,
+                        "pid": s.pid,
+                        "pid_scope": s.pid_scope,
+                        "host_start_time": s.host_start_time,
+                        "systemd_unit": s.systemd_unit,
+                        "cwd": s.cwd,
+                        "started_at": s.started_at,
+                        "task_id": s.task_id,
+                        "session_key": s.session_key,
+                        "watcher_platform": s.watcher_platform,
+                        "watcher_chat_id": s.watcher_chat_id,
+                        "watcher_user_id": s.watcher_user_id,
+                        "watcher_user_name": s.watcher_user_name,
+                        "watcher_thread_id": s.watcher_thread_id,
+                        "watcher_message_id": s.watcher_message_id,
+                        "watcher_interval": s.watcher_interval,
+                        "notify_on_complete": s.notify_on_complete,
+                        "watch_patterns": s.watch_patterns,
+                    })
             
             # Atomic write to avoid corruption on crash
             from utils import atomic_json_write
