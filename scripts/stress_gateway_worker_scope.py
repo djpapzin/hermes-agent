@@ -138,7 +138,7 @@ def service_state(unit: str) -> ServiceState:
 
 
 def worker_oom_observed(
-    *, unit: str, kernel_rows: list[str], wrapper_attested: bool = False
+    *, unit: str, kernel_rows: list[str], unit_attested: bool = False
 ) -> bool:
     """Classify the bounded probe's OOM outcome across launch backends.
 
@@ -148,7 +148,7 @@ def worker_oom_observed(
     journal attestation.
     """
 
-    return wrapper_attested or any(
+    return unit_attested or any(
         unit in line and "oom" in line.lower() for line in kernel_rows
     )
 
@@ -178,6 +178,32 @@ def _system_scope_oom_evidence(unit: str, started_at: float) -> bool:
         and isinstance(payload, dict)
         and payload.get("unit") == unit + ".scope"
         and payload.get("oom_kill") is True
+    )
+
+
+def _user_scope_oom_evidence(unit: str, started_at: float) -> bool:
+    """Read only the caller's recent exact-unit user-manager journal."""
+
+    result = subprocess.run(
+        [
+            "journalctl",
+            "--user",
+            "--unit",
+            unit + ".scope",
+            "--since",
+            f"@{int(started_at)}",
+            "--no-pager",
+            "--output=cat",
+            "--lines=100",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+    marker = "A process of this unit has been killed by the OOM killer."
+    return result.returncode == 0 and any(
+        line.strip() == marker for line in result.stdout.splitlines()
     )
 
 
@@ -252,13 +278,15 @@ def run_proof(
         for line in kernel.stdout.splitlines()
         if unit in line or ("oom" in line.lower() and "hermes-worker" in line)
     ][-20:]
-    wrapper_attested = (
-        _system_scope_oom_evidence(unit, started_at) if backend == "system" else False
+    unit_attested = (
+        _system_scope_oom_evidence(unit, started_at)
+        if backend == "system"
+        else _user_scope_oom_evidence(unit, started_at)
     )
     oom_observed = worker_oom_observed(
         unit=unit,
         kernel_rows=kernel_rows,
-        wrapper_attested=wrapper_attested,
+        unit_attested=unit_attested,
     )
     gateway_survived = (
         after.active_state == "active"
@@ -274,7 +302,7 @@ def run_proof(
         "allocation_mb": allocation_mb,
         "worker_returncode": result.returncode,
         "worker_oom_observed": oom_observed,
-        "wrapper_oom_attested": wrapper_attested,
+        "unit_oom_attested": unit_attested,
         "gateway_before": asdict(before),
         "gateway_after": asdict(after),
         "gateway_survived": gateway_survived,
