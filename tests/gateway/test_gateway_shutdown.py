@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import gateway.run as gateway_run
+from gateway.admission import AgentAdmissionController
 from gateway.config import HomeChannel, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
@@ -310,7 +311,11 @@ async def test_drain_active_agents_throttles_status_updates():
 async def test_drain_waits_for_admitted_chat_before_running_agent_registration():
     runner, _adapter = make_restart_runner()
     runner._update_runtime_status = MagicMock()
-    runner._agent_admission._memory_reader = lambda: 8192
+    runner._agent_admission = AgentAdmissionController(
+        max_parallel=3,
+        memory_reader=lambda: 8192,
+        poll_interval_seconds=0.01,
+    )
     task_id = "agent:main:telegram:dm:handoff"
     await runner._agent_admission.acquire(task_id)
 
