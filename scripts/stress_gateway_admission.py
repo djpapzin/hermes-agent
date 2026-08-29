@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import psutil
+
 _ADMISSION_PATH = Path(__file__).resolve().parents[1] / "gateway" / "admission.py"
 _SPEC = importlib.util.spec_from_file_location("hermes_gateway_admission", _ADMISSION_PATH)
 if _SPEC is None or _SPEC.loader is None:
@@ -88,11 +90,7 @@ async def run(
     queue_resumed_and_drained = (
         len(started) == workers and snapshot.active == 0 and snapshot.queued == 0
     )
-    try:
-        os.kill(control_plane_pid, 0)
-        control_plane_survived = True
-    except OSError:
-        control_plane_survived = False
+    control_plane_survived = psutil.pid_exists(control_plane_pid)
     return {
         "workers": workers,
         "parallel_limit": parallel,

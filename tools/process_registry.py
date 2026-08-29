@@ -89,6 +89,15 @@ _DEFAULT_WORKER_MEMORY_MAX_BYTES = 1024 * 1024 * 1024
 _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
 
 
+def _current_posix_ids() -> tuple[int, int]:
+    """Return uid/gid without importing POSIX-only os attributes on Windows."""
+    uid_fn = getattr(os, "getuid", None)
+    gid_fn = getattr(os, "getgid", None)
+    if not callable(uid_fn) or not callable(gid_fn):
+        raise RuntimeError("systemd worker scopes require POSIX uid/gid support")
+    return int(uid_fn()), int(gid_fn())
+
+
 def _worker_memory_max_bytes() -> int:
     """Return a finite per-worker limit bounded by config and host capacity."""
     override_bound: Optional[int] = None
@@ -192,11 +201,12 @@ def _systemd_run_system_scope_available() -> bool:
         import shutil
         sudo, systemd_run = shutil.which("sudo"), shutil.which("systemd-run")
         if sudo and systemd_run and not _IS_WINDOWS:
+            uid, gid = _current_posix_ids()
             unit = f"hermes-worker-system-probe-{os.getpid()}-{uuid.uuid4().hex[:8]}"
             result = subprocess.run([
                 sudo, "-n", systemd_run, "--system", "--scope", "--quiet",
-                "--unit", unit, "--collect", "--uid", str(os.getuid()),
-                "--gid", str(os.getgid()), "--property", "MemoryAccounting=yes",
+                "--unit", unit, "--collect", "--uid", str(uid),
+                "--gid", str(gid), "--property", "MemoryAccounting=yes",
                 "--property", f"MemoryMax={_worker_memory_max_bytes()}",
                 "--property", "MemorySwapMax=0", "--", "/bin/true",
             ], capture_output=True, timeout=3)
@@ -261,7 +271,8 @@ def _build_systemd_scope_argv(
             f"MemoryHigh={max(_MIN_WORKER_MEMORY_MAX_BYTES, memory_max * 9 // 10)}",
             "--property", "MemorySwapMax=0"]
     if backend == "system":
-        argv.extend(["--uid", str(os.getuid()), "--gid", str(os.getgid())])
+        uid, gid = _current_posix_ids()
+        argv.extend(["--uid", str(uid), "--gid", str(gid)])
     return [*argv, "--", *shell_argv]
 
 

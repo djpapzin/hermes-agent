@@ -21,6 +21,14 @@ class ServiceState:
     restarts: int
 
 
+def _current_posix_ids() -> tuple[int, int]:
+    uid_fn = getattr(os, "getuid", None)
+    gid_fn = getattr(os, "getgid", None)
+    if not callable(uid_fn) or not callable(gid_fn):
+        raise RuntimeError("the cgroup proof requires POSIX uid/gid support")
+    return int(uid_fn()), int(gid_fn())
+
+
 def validate_bounds(memory_max_mb: int, allocation_mb: int) -> None:
     if not 16 <= memory_max_mb <= 64:
         raise ValueError("memory-max-mb must be between 16 and 64")
@@ -117,13 +125,14 @@ def run_proof(
         raise RuntimeError(f"refusing proof: {gateway_unit} is not active")
 
     unit = f"hermes-worker-boundary-proof-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    uid, gid = _current_posix_ids()
     command = build_scope_command(
         backend=backend,
         unit=unit,
         memory_max_mb=memory_max_mb,
         allocation_mb=allocation_mb,
-        uid=os.getuid(),
-        gid=os.getgid(),
+        uid=uid,
+        gid=gid,
     )
     started_at = time.time()
     try:
