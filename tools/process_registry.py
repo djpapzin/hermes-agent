@@ -183,7 +183,7 @@ def _systemd_run_user_scope_available() -> bool:
                     "--collect", "--property", "MemoryAccounting=yes",
                     "--property", f"MemoryMax={_worker_memory_max_bytes()}",
                     "--property", "MemorySwapMax=0", "--", "/bin/true",
-                ], capture_output=True, timeout=3)
+                ], capture_output=True, timeout=3, stdin=subprocess.DEVNULL)
                 available = result.returncode == 0
         except Exception as exc:
             logger.debug("systemd user-scope probe error: %s", exc)
@@ -209,7 +209,7 @@ def _systemd_run_system_scope_available() -> bool:
                 "--gid", str(gid), "--property", "MemoryAccounting=yes",
                 "--property", f"MemoryMax={_worker_memory_max_bytes()}",
                 "--property", "MemorySwapMax=0", "--", "/bin/true",
-            ], capture_output=True, timeout=3)
+            ], capture_output=True, timeout=3, stdin=subprocess.DEVNULL)
             available = result.returncode == 0
     except Exception as exc:
         logger.debug("systemd system-scope probe error: %s", exc)
@@ -309,7 +309,9 @@ def _stop_systemd_unit(unit_name: str) -> bool:
             return False
         command = [sudo, "-n", binary, "--system", "stop", unit_name]
     try:
-        result = subprocess.run(command, capture_output=True, timeout=15)
+        result = subprocess.run(
+            command, capture_output=True, timeout=15, stdin=subprocess.DEVNULL
+        )
         if result.returncode == 0:
             return True
         stderr = (result.stderr or b"").decode(errors="replace").lower()

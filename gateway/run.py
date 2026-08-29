@@ -6335,7 +6335,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Interrupted running agent for session %s during shutdown", session_key)
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
-        for task_id, agent in list(self._background_agent_refs.items()):
+        for task_id, agent in list(
+            getattr(self, "_background_agent_refs", {}).items()
+        ):
             try:
                 agent.interrupt(reason)
                 logger.debug("Interrupted background agent %s during shutdown", task_id)
