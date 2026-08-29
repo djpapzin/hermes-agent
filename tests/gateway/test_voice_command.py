@@ -77,6 +77,7 @@ def _make_runner(tmp_path):
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
     runner._voice_mode = {}
+    runner._voice_default_mode = "off"
     runner._VOICE_MODE_PATH = tmp_path / "gateway_voice_mode.json"
     runner._session_db = None
     runner.session_store = MagicMock()
@@ -128,6 +129,16 @@ class TestHandleVoiceCommand:
         event = _make_event("/voice status")
         result = await runner._handle_voice_command(event)
         assert "voice reply" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_voice_status_uses_configured_default(self, runner):
+        runner._voice_default_mode = "all"
+        event = _make_event("/voice status")
+
+        result = await runner._handle_voice_command(event)
+
+        assert "all" in result.lower()
+        assert runner._voice_mode == {}
 
     @pytest.mark.asyncio
     async def test_toggle_off_to_on(self, runner):
@@ -306,6 +317,19 @@ class TestAutoVoiceReply:
         return runner._should_send_voice_reply(
             event, response, agent_messages or []
         )
+
+    def test_text_input_uses_configured_all_default(self, runner):
+        runner._voice_default_mode = "all"
+        event = _make_event(message_type=MessageType.TEXT)
+
+        assert runner._should_send_voice_reply(event, "Hello!", []) is True
+
+    def test_explicit_off_overrides_configured_all_default(self, runner):
+        runner._voice_default_mode = "all"
+        runner._voice_mode["telegram:123"] = "off"
+        event = _make_event(message_type=MessageType.TEXT)
+
+        assert runner._should_send_voice_reply(event, "Hello!", []) is False
 
     # -- Full platform x input x mode matrix --------------------------------
     #

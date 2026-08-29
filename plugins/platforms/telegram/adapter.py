@@ -24,6 +24,48 @@ from typing import Dict, List, Optional, Set, Any
 
 logger = logging.getLogger(__name__)
 
+_CODEX_ROUTE_RE = re.compile(
+    r"^(?:"
+    r"/(?:queue|sessions|view|create|restart|delete|tmux|codex_sessions|"
+    r"tmux_sessions|codex_status|codex_refresh)(?:@[^\s]+)?(?:\s|$)|"
+    r"[A-Za-z0-9_-]{1,40}:\s*\S"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _hermes_codex_route_retired(message) -> bool:
+    """Return True when Codex control text must bypass the Hermes agent.
+
+    The dedicated Codex bot owns command/response handling. This is an
+    inbound Hermes-only cutover gate; it does not affect outbound Hermes
+    gateway/security alerts or the human allowlist.
+    """
+    if os.getenv("HERMES_TELEGRAM_CODEX_ROUTE_DISABLED", "0").strip().lower() not in {
+        "1", "true", "yes", "on"
+    }:
+        return False
+    text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+    return isinstance(text, str) and bool(_CODEX_ROUTE_RE.match(text.strip()))
+
+
+def _telegram_relay_bot_return_allowed(message) -> bool:
+    """Authorize only the configured bot's private self-chat return update."""
+    user = getattr(message, "from_user", None)
+    chat = getattr(message, "chat", None)
+    if not user or not chat or getattr(user, "is_bot", False) is not True:
+        return False
+    user_id = str(getattr(user, "id", "")).strip()
+    chat_id = str(getattr(chat, "id", "")).strip()
+    if getattr(chat, "type", "") != "private" or not user_id or chat_id != user_id:
+        return False
+    allowed = {
+        item.strip()
+        for item in os.getenv("TELEGRAM_ALLOWED_RELAY_BOTS", "").split(",")
+        if item.strip()
+    }
+    return user_id in allowed
+
 
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
@@ -985,6 +1027,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Return True when Telegram auth env vars make an early decision safe."""
         keys = (
             "TELEGRAM_ALLOWED_USERS",
+            "TELEGRAM_ALLOWED_RELAY_BOTS",
             "TELEGRAM_GROUP_ALLOWED_USERS",
             "TELEGRAM_GROUP_ALLOWED_CHATS",
             "TELEGRAM_ALLOW_ALL_USERS",
@@ -1018,6 +1061,21 @@ class TelegramAdapter(BasePlatformAdapter):
         if adapter_allow_from is not None:
             allowed = {str(u).strip() for u in adapter_allow_from if str(u).strip()}
             return user_id in allowed or "*" in allowed
+
+        if _telegram_relay_bot_return_allowed(message):
+            return True
+
+        # Bot-to-bot relay authorization is deliberately separate from the
+        # human-user allowlist. It remains subject to the normal group/topic
+        # processing gates after this intake check.
+        if getattr(source, "is_bot", False):
+            relay_bots = {
+                item.strip()
+                for item in os.getenv("TELEGRAM_ALLOWED_RELAY_BOTS", "").split(",")
+                if item.strip()
+            }
+            if user_id in relay_bots:
+                return True
 
         # Test/custom injection only. The class method named
         # _is_callback_user_authorized is for inline button callbacks and must
@@ -1286,6 +1344,30 @@ class TelegramAdapter(BasePlatformAdapter):
                 return True
         return False
 
+    @staticmethod
+    def _telegram_retry_after_seconds(error: Exception) -> Optional[float]:
+        """Extract Telegram flood-control delay from RetryAfter or error text."""
+        retry_after = getattr(error, "retry_after", None)
+        if retry_after is not None:
+            try:
+                return float(retry_after)
+            except (TypeError, ValueError):
+                pass
+        err_str = str(error)
+        match = re.search(
+            r"retry\s+(?:after|in)\s+(\d+(?:\.\d+)?)",
+            err_str,
+            re.IGNORECASE,
+        )
+        if match:
+            try:
+                return float(match.group(1))
+            except (TypeError, ValueError):
+                return None
+        if "retry after" in err_str.lower() or "flood control" in err_str.lower():
+            return 1.0
+        return None
+
     async def _send_with_dm_topic_reply_anchor_retry(
         self,
         send_fn: Any,
@@ -1295,30 +1377,57 @@ class TelegramAdapter(BasePlatformAdapter):
         media_label: str,
         reset_media: Optional[Any] = None,
     ) -> Any:
-        """Retry stale private-topic media replies once without the topic anchor."""
-        try:
-            return await send_fn(**send_kwargs)
-        except Exception as send_err:
-            if not self._should_retry_without_dm_topic_reply_anchor(
-                send_err,
-                metadata,
-                reply_to_message_id,
-            ):
+        """Send media with DM-anchor fallback and bounded flood retries."""
+        kwargs = dict(send_kwargs)
+        stripped_anchor = False
+        max_flood_attempts = 3
+        flood_attempt = 0
+        while True:
+            try:
+                return await send_fn(**kwargs)
+            except Exception as send_err:
+                if (
+                    not stripped_anchor
+                    and self._should_retry_without_dm_topic_reply_anchor(
+                        send_err,
+                        metadata,
+                        reply_to_message_id,
+                    )
+                ):
+                    logger.warning(
+                        "[%s] Reply target deleted for Telegram %s, "
+                        "retrying without reply/topic anchor: %s",
+                        self.name,
+                        media_label,
+                        _redact_telegram_error_text(send_err),
+                    )
+                    if reset_media is not None:
+                        reset_media()
+                    kwargs = dict(send_kwargs)
+                    kwargs["reply_to_message_id"] = None
+                    kwargs.pop("message_thread_id", None)
+                    kwargs.pop("direct_messages_topic_id", None)
+                    stripped_anchor = True
+                    continue
+
+                wait = self._telegram_retry_after_seconds(send_err)
+                if wait is not None and flood_attempt < max_flood_attempts - 1:
+                    logger.warning(
+                        "[%s] Telegram flood control on %s (attempt %d/%d), "
+                        "retrying in %.1fs: %s",
+                        self.name,
+                        media_label,
+                        flood_attempt + 1,
+                        max_flood_attempts,
+                        wait,
+                        _redact_telegram_error_text(send_err),
+                    )
+                    if reset_media is not None:
+                        reset_media()
+                    await asyncio.sleep(wait)
+                    flood_attempt += 1
+                    continue
                 raise
-            logger.warning(
-                "[%s] Reply target deleted for Telegram %s, "
-                "retrying without reply/topic anchor: %s",
-                self.name,
-                media_label,
-                _redact_telegram_error_text(send_err),
-            )
-            if reset_media is not None:
-                reset_media()
-            retry_kwargs = dict(send_kwargs)
-            retry_kwargs["reply_to_message_id"] = None
-            retry_kwargs.pop("message_thread_id", None)
-            retry_kwargs.pop("direct_messages_topic_id", None)
-            return await send_fn(**retry_kwargs)
 
     def _fallback_ips(self) -> list[str]:
         """Return validated fallback IPs from config (populated by _apply_env_overrides)."""
@@ -8130,6 +8239,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "chat", None), "id", None),
             )
             return
+        if _hermes_codex_route_retired(msg):
+            logger.info("[Telegram] Ignored retired Codex route on Hermes")
+            return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
@@ -8155,6 +8267,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "from_user", None), "id", None),
                 getattr(getattr(msg, "chat", None), "id", None),
             )
+            return
+        if _hermes_codex_route_retired(msg):
+            logger.info("[Telegram] Ignored retired Codex route on Hermes")
             return
         await self._ensure_forum_commands(msg)
 
@@ -8230,6 +8345,50 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=event.source.profile,
         )
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        """Short-circuit Betfred prepare phrases before the gateway agent."""
+        text = str(getattr(event, "text", "") or "")
+        lowered = text.casefold()
+        hints = (
+            "prepare betslip", "prepare a betslip", "prepare betfred",
+            "create betfred", "create a betfred", "prepare these qualifying",
+            "prepare these bets", "betfred race",
+        )
+        if any(h in lowered for h in hints):
+            def _run_hook():
+                import importlib.util
+                from pathlib import Path as _P
+                path = _P("/home/ubuntu/.hermes/hooks/betslip-grok-delegate/handler.py")
+                spec = importlib.util.spec_from_file_location("betslip_hook_live", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                src = getattr(event, "source", None)
+                return mod.handle("agent:start", {
+                    "platform": "telegram",
+                    "message": text,
+                    "user_id": str(getattr(src, "user_id", "") or ""),
+                    "chat_id": str(getattr(src, "chat_id", "") or ""),
+                })
+            try:
+                result = await asyncio.to_thread(_run_hook)
+            except Exception as exc:
+                logger.warning("[Telegram] Betslip hook failed: %s", exc)
+                result = None
+            if isinstance(result, dict) and str(result.get("decision") or "").lower() == "handled":
+                message = str(result.get("message") or "").strip() or "Betslip prepared. Wager was not submitted."
+                logger.info("[Telegram] Betslip hook handled; skipping primary model")
+                print("[hooks] telegram-adapter skipping primary model for betslip", flush=True)
+                src = getattr(event, "source", None)
+                meta = {}
+                if getattr(src, "thread_id", None):
+                    meta["thread_id"] = str(src.thread_id)
+                try:
+                    await self.send(str(getattr(src, "chat_id", "") or ""), message, reply_to=getattr(event, "message_id", None), metadata=meta or None)
+                except Exception as exc:
+                    logger.warning("[Telegram] Betslip reply send failed: %s", exc)
+                return
+        await super().handle_message(event)
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
@@ -9039,6 +9198,7 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_topic=chat_topic,
             message_id=str(message.message_id),
             is_bot=bool(getattr(user, "is_bot", False)) if user else False,
+            role_authorized=_telegram_relay_bot_return_allowed(message),
         )
         
         # Extract reply context if this message is a reply.

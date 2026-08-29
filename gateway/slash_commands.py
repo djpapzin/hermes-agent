@@ -2628,7 +2628,7 @@ class GatewaySlashCommandsMixin:
         elif args == "leave":
             return await self._handle_voice_channel_leave(event)
         elif args == "status":
-            mode = self._voice_mode.get(voice_key, "off")
+            mode = self._get_voice_mode(platform, chat_id)
             labels = {
                 "off": t("gateway.voice.label_off"),
                 "voice_only": t("gateway.voice.label_voice_only"),
@@ -2652,7 +2652,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.voice.status_mode", label=labels.get(mode, mode))
         else:
             # Toggle: off → on, on/all → off
-            current = self._voice_mode.get(voice_key, "off")
+            current = self._get_voice_mode(platform, chat_id)
             if current == "off":
                 self._voice_mode[voice_key] = "voice_only"
                 self._save_voice_modes()

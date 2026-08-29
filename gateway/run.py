@@ -3411,7 +3411,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.hooks import HookRegistry
         self.hooks = HookRegistry()
 
-        # Per-chat voice reply mode: "off" | "voice_only" | "all"
+        # Per-chat voice reply mode: "off" | "voice_only" | "all".
+        # Chats without an explicit persisted override inherit the configured
+        # voice.default_mode for every newly started gateway session.
+        self._voice_default_mode: str = self._load_voice_default_mode()
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
         # Recent voice transcripts per (guild,user) for duplicate suppression.
         # Protects against the same utterance being emitted twice by the voice
@@ -3537,6 +3540,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return a platform-namespaced key for voice mode state."""
         return f"{platform.value}:{chat_id}"
 
+    def _load_voice_default_mode(self) -> str:
+        """Load the reply mode inherited by chats without an override."""
+        try:
+            from hermes_cli.config import load_config as _load_full_config
+            mode = str(
+                ((_load_full_config().get("voice") or {}).get("default_mode", "off"))
+                or "off"
+            ).strip().lower()
+        except Exception:
+            logger.debug("voice.default_mode load failed; using off", exc_info=True)
+            return "off"
+
+        if mode not in {"off", "voice_only", "all"}:
+            logger.warning(
+                "Invalid voice.default_mode %r; expected off, voice_only, or all. "
+                "Using off.",
+                mode,
+            )
+            return "off"
+        return mode
+
+    def _get_voice_mode(self, platform: Platform, chat_id: str) -> str:
+        """Resolve an explicit chat mode or the configured session default."""
+        return self._voice_mode.get(
+            self._voice_key(platform, chat_id),
+            getattr(self, "_voice_default_mode", "off"),
+        )
+
     def _load_voice_modes(self) -> Dict[str, str]:
         try:
             data = json.loads(self._VOICE_MODE_PATH.read_text())
@@ -3626,8 +3657,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from hermes_cli.config import load_config as _load_full_config
             _full_cfg = _load_full_config()
-            _auto_tts_default = bool(
-                (_full_cfg.get("voice") or {}).get("auto_tts", False)
+            _voice_cfg = _full_cfg.get("voice") or {}
+            _auto_tts_default = bool(_voice_cfg.get("auto_tts", False)) or (
+                getattr(self, "_voice_default_mode", "off") in {"voice_only", "all"}
             )
         except Exception:
             _auto_tts_default = False
@@ -5535,6 +5567,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "Try again when another session finishes."
         )
 
+    def _get_max_concurrent_session_wait_seconds(self) -> float:
+        """Return the bounded wait for a new session slot (zero disables queuing)."""
+        value = getattr(
+            getattr(self, "config", None),
+            "max_concurrent_session_wait_seconds",
+            None,
+        )
+        try:
+            return max(0.0, float(value or 0))
+        except (TypeError, ValueError):
+            return 0.0
+
     def _claim_active_session_slot(
         self,
         session_key: str,
@@ -5563,6 +5607,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as exc:
             logger.warning("Failed to claim active session slot: %s", exc)
             return None, None
+
+    async def _claim_active_session_slot_with_wait(
+        self,
+        session_key: str,
+        source: SessionSource,
+    ) -> tuple[Any, Optional[str]]:
+        """Wait briefly for capacity so Telegram bursts receive backpressure.
+
+        Slot acquisition remains the single source of truth, including its
+        cross-process lease.  The loop is bounded so a dead worker cannot leave
+        an inbound Telegram handler waiting forever.
+        """
+        lease, limit_message = self._claim_active_session_slot(session_key, source)
+        if limit_message is None:
+            return lease, None
+
+        wait_seconds = self._get_max_concurrent_session_wait_seconds()
+        if wait_seconds <= 0:
+            return None, limit_message
+
+        deadline = time.monotonic() + wait_seconds
+        logger.info(
+            "Queueing new active session %s for up to %.1fs: max_concurrent_sessions reached",
+            session_key,
+            wait_seconds,
+        )
+        while time.monotonic() < deadline:
+            await asyncio.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+            lease, limit_message = self._claim_active_session_slot(session_key, source)
+            if limit_message is None:
+                logger.info("Dequeued active session %s after capacity became available", session_key)
+                return lease, None
+        return None, (
+            f"Hermes is still at the active session limit ({self._get_max_concurrent_sessions()}). "
+            "Your request was not lost; please resend it when another session finishes."
+        )
 
     @staticmethod
     def _agent_has_active_subagents(running_agent: Any) -> bool:
@@ -11393,7 +11473,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # message arriving during any of those yields would pass the
         # "already running" guard and spin up a duplicate agent for the
         # same session — corrupting the transcript.
-        _active_session_lease, _limit_message = self._claim_active_session_slot(
+        _active_session_lease, _limit_message = await self._claim_active_session_slot_with_wait(
             _quick_key,
             source,
         )
@@ -12908,29 +12988,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "thread_id": str(getattr(source, "thread_id", None)) if getattr(source, "thread_id", None) else "",
                 "chat_type": getattr(source, "chat_type", "") or "",
                 "session_id": session_entry.session_id,
-                "message": message_text[:500],
+                "message": message_text[:16000],
             }
-            await self.hooks.emit("agent:start", hook_ctx)
+            hook_results = []
+            try:
+                hook_results = await self.hooks.emit_collect("agent:start", hook_ctx)
+            except Exception as _hook_err:
+                logger.warning("agent:start hook dispatch failed (non-fatal): %s", _hook_err)
+                hook_results = []
+            print(
+                f"[hooks] agent:start results n={len(hook_results)}",
+                flush=True,
+            )
+            _handled = None
+            for hook_result in hook_results:
+                if not isinstance(hook_result, dict):
+                    continue
+                decision = str(hook_result.get("decision", "")).strip().lower()
+                print(f"[hooks] agent:start decision={decision!r}", flush=True)
+                if decision in {"handled", "skip_agent"}:
+                    _handled = hook_result.get("message") or hook_result.get("response") or ""
+                    break
 
             # Run the agent. Capture the session id that this run was launched
             # against so post-run compression publication can be identity-guarded
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
-            agent_result = await self._run_agent(
-                message=message_text,
-                context_prompt=context_prompt,
-                history=history,
-                source=source,
-                session_id=_run_start_session_id,
-                session_key=session_key,
-                run_generation=run_generation,
-                event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
-                moa_config=getattr(event, "_moa_config", None),
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-            )
+            if _handled is not None:
+                logger.info(
+                    "agent:start hook handled message; skipping primary model (platform=%s)",
+                    hook_ctx.get("platform"),
+                )
+                print("[hooks] skipping primary model", flush=True)
+                agent_result = {
+                    "final_response": _handled,
+                    "api_calls": 0,
+                    "messages": [],
+                }
+            else:
+                agent_result = await self._run_agent(
+                    message=message_text,
+                    context_prompt=context_prompt,
+                    history=history,
+                    source=source,
+                    session_id=_run_start_session_id,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    event_message_id=self._reply_anchor_for_event(event),
+                    channel_prompt=event.channel_prompt,
+                    moa_config=getattr(event, "_moa_config", None),
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                )
 
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
@@ -14252,8 +14362,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Let the adapter's inactivity timer see the live voice-reply mode so it
         # doesn't disconnect a deliberately text-only (/voice off) session.
         if hasattr(adapter, "_voice_mode_getter"):
-            adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
-                self._voice_key(Platform.DISCORD, str(chat_id)), "off"
+            adapter._voice_mode_getter = lambda chat_id: self._get_voice_mode(
+                Platform.DISCORD, str(chat_id)
             )
 
         try:
@@ -14448,7 +14558,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
         chat_id = event.source.chat_id
-        voice_mode = self._voice_mode.get(self._voice_key(event.source.platform, chat_id), "off")
+        voice_mode = self._get_voice_mode(event.source.platform, chat_id)
         is_voice_input = (event.message_type == MessageType.VOICE)
 
         should = (

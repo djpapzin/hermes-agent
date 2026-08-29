@@ -2277,6 +2277,8 @@ DEFAULT_CONFIG = {
     "voice": {
         "record_key": "ctrl+b",
         "max_recording_seconds": 120,
+        # Gateway reply mode for chats without an explicit /voice setting.
+        "default_mode": "off",
         "auto_tts": False,
         "beep_enabled": True,         # Play record start/stop beeps in CLI voice mode
         "silence_threshold": 200,     # RMS below this = silence (0-32767)

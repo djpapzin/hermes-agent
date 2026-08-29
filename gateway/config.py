@@ -870,6 +870,7 @@ class GatewayConfig:
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
     thread_sessions_per_user: bool = False  # When False (default), threads are shared across all participants
     max_concurrent_sessions: Optional[int] = None  # Positive int caps simultaneous active chat sessions
+    max_concurrent_session_wait_seconds: Optional[int] = None  # Wait for capacity before returning a busy response
 
     # Multi-profile multiplexing (opt-in; default off preserves one-gateway-per-profile).
     # When True, the default profile's gateway serves inbound messages for every
@@ -1014,6 +1015,7 @@ class GatewayConfig:
             "group_sessions_per_user": self.group_sessions_per_user,
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
+            "max_concurrent_session_wait_seconds": self.max_concurrent_session_wait_seconds,
             "multiplex_profiles": self.multiplex_profiles,
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
@@ -1113,6 +1115,16 @@ class GatewayConfig:
             max_concurrent_raw,
             max_concurrent_key,
         )
+        if "max_concurrent_session_wait_seconds" in data:
+            max_wait_raw = data.get("max_concurrent_session_wait_seconds")
+            max_wait_key = "max_concurrent_session_wait_seconds"
+        else:
+            max_wait_raw = nested_gateway.get("max_concurrent_session_wait_seconds")
+            max_wait_key = "gateway.max_concurrent_session_wait_seconds"
+        max_concurrent_session_wait_seconds = _coerce_optional_positive_int(
+            max_wait_raw,
+            max_wait_key,
+        )
         unauthorized_dm_behavior = _normalize_unauthorized_dm_behavior(
             data.get("unauthorized_dm_behavior"),
             "pair",
@@ -1148,6 +1160,7 @@ class GatewayConfig:
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             max_concurrent_sessions=max_concurrent_sessions,
+            max_concurrent_session_wait_seconds=max_concurrent_session_wait_seconds,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
@@ -1303,6 +1316,10 @@ def load_gateway_config() -> GatewayConfig:
                     gw_data["multiplex_profiles"] = gateway_section["multiplex_profiles"]
                 if "max_concurrent_sessions" in gateway_section:
                     gw_data["max_concurrent_sessions"] = gateway_section["max_concurrent_sessions"]
+                if "max_concurrent_session_wait_seconds" in gateway_section:
+                    gw_data["max_concurrent_session_wait_seconds"] = gateway_section[
+                        "max_concurrent_session_wait_seconds"
+                    ]
                 if "systemd_watchdog_seconds" in gateway_section:
                     gw_data["systemd_watchdog_seconds"] = gateway_section[
                         "systemd_watchdog_seconds"
@@ -1310,6 +1327,10 @@ def load_gateway_config() -> GatewayConfig:
 
             if "max_concurrent_sessions" in yaml_cfg:
                 gw_data["max_concurrent_sessions"] = yaml_cfg["max_concurrent_sessions"]
+            if "max_concurrent_session_wait_seconds" in yaml_cfg:
+                gw_data["max_concurrent_session_wait_seconds"] = yaml_cfg[
+                    "max_concurrent_session_wait_seconds"
+                ]
 
             streaming_cfg = yaml_cfg.get("streaming")
             if not isinstance(streaming_cfg, dict) and isinstance(gateway_section, dict):

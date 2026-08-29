@@ -48,11 +48,15 @@ def _make_event(text: str = "hello", chat_id: str = "chat-1") -> MessageEvent:
     )
 
 
-def _make_runner(max_concurrent_sessions: int | None = None) -> GatewayRunner:
+def _make_runner(
+    max_concurrent_sessions: int | None = None,
+    max_concurrent_session_wait_seconds: int | None = None,
+) -> GatewayRunner:
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
         max_concurrent_sessions=max_concurrent_sessions,
+        max_concurrent_session_wait_seconds=max_concurrent_session_wait_seconds,
     )
     runner.adapters = {Platform.TELEGRAM: _FakeAdapter()}
     runner._running_agents = {}
@@ -158,6 +162,32 @@ def test_new_session_can_start_after_active_session_released(monkeypatch):
 
     assert result == "ok"
     assert sentinel_seen is True
+
+
+def test_new_session_waits_for_capacity_then_runs(monkeypatch):
+    _silence_global_gateway_hooks(monkeypatch)
+    runner = _make_runner(
+        max_concurrent_sessions=1,
+        max_concurrent_session_wait_seconds=1,
+    )
+    busy_key = _occupy_session(runner, "busy")
+    event = _make_event(chat_id="new")
+
+    async def mock_agent_run(self_inner, ev, src, qk, generation):
+        return "ok"
+
+    async def scenario():
+        async def release_capacity():
+            await asyncio.sleep(0.05)
+            runner._release_running_agent_state(busy_key)
+
+        release_task = asyncio.create_task(release_capacity())
+        with patch.object(GatewayRunner, "_handle_message_with_agent", mock_agent_run):
+            result = await runner._handle_message(event)
+        await release_task
+        return result
+
+    assert asyncio.run(scenario()) == "ok"
 
 
 def test_status_command_bypasses_active_session_limit(monkeypatch):

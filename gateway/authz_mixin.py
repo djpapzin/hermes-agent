@@ -370,6 +370,14 @@ class GatewayAuthorizationMixin:
             Platform.SLACK: "SLACK_ALLOW_BOTS",
         }
         if getattr(source, "is_bot", False):
+            if source.platform is Platform.TELEGRAM:
+                relay_bots = {
+                    item.strip()
+                    for item in _auth_env("TELEGRAM_ALLOWED_RELAY_BOTS").split(",")
+                    if item.strip()
+                }
+                if source.user_id and source.user_id in relay_bots:
+                    return True
             allow_bots_var = platform_allow_bots_map.get(source.platform)
             if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
                 return True
