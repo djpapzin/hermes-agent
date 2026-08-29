@@ -125,6 +125,24 @@ def test_diagnostic_reads_only_structured_admission_file_events(tmp_path, monkey
     assert "secret-chat-content" not in str(result)
 
 
+def test_admission_file_events_are_byte_and_count_bounded(tmp_path):
+    log = tmp_path / "gateway.log"
+    rows = ["untrusted-prefix-" + ("x" * 2048)]
+    rows.extend(
+        "2026-08-29 18:00:00,000 INFO gateway.admission: "
+        f'HERMES_ADMISSION {{"decision":"start","queued_tasks":{index}}}'
+        for index in range(101)
+    )
+    log.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    events = diagnostics._bounded_admission_events(log, max_bytes=64 * 1024)
+
+    assert len(events) == 100
+    assert events[0]["event"]["queued_tasks"] == 1
+    assert events[-1]["event"]["queued_tasks"] == 100
+    assert "untrusted-prefix" not in str(events)
+
+
 def test_diagnostic_scans_orphan_worker_when_gateway_is_absent(tmp_path, monkeypatch):
     proc = tmp_path / "proc"
     cgroups = tmp_path / "cgroup"
