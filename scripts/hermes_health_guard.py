@@ -138,8 +138,16 @@ def collect_snapshot(
             probe_errors.append(f"systemctl:{name}")
         return proc.stdout.strip()
 
+    def integer_prop(name: str) -> int:
+        value = prop(name)
+        try:
+            return int(value or 0)
+        except ValueError:
+            probe_errors.append(f"systemctl:{name}:invalid={value or 'empty'}")
+            return 0
+
     active = prop("ActiveState")
-    main_pid = int(prop("MainPID") or 0)
+    main_pid = integer_prop("MainPID")
     journal_result = runner(
         "journalctl",
         "-u",
@@ -170,8 +178,8 @@ def collect_snapshot(
     return GuardSnapshot(
         active_state=active,
         main_pid=main_pid,
-        tasks=int(prop("TasksCurrent") or 0),
-        memory_bytes=int(prop("MemoryCurrent") or 0),
+        tasks=integer_prop("TasksCurrent"),
+        memory_bytes=integer_prop("MemoryCurrent"),
         wal_bytes=wal.stat().st_size if wal.exists() else 0,
         db_locks=journal.count("database is locked"),
         telegram_poll_conflicts=journal.count(

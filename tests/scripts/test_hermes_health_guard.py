@@ -5,6 +5,7 @@ from scripts.hermes_health_guard import (
     GuardSnapshot,
     _run,
     _telegram_enabled,
+    collect_snapshot,
     evaluate,
     main,
 )
@@ -110,6 +111,33 @@ def test_subprocess_timeout_becomes_unavailable_result(monkeypatch):
     result = _run("systemctl", "show", "hermes-gateway.service")
 
     assert result.returncode == 124
+
+
+def test_unset_systemd_resource_values_are_reported_unavailable(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+
+    def runner(*args):
+        prop = next((arg for arg in args if arg.startswith("--property=")), "")
+        values = {
+            "--property=ActiveState": "inactive\n",
+            "--property=MainPID": "0\n",
+            "--property=TasksCurrent": "[not set]\n",
+            "--property=MemoryCurrent": "[not set]\n",
+        }
+        return subprocess.CompletedProcess(args, 0, values.get(prop, ""), "")
+
+    snapshot = collect_snapshot(
+        unit="hermes-gateway.service",
+        hermes_home=home,
+        lock_window_seconds=60,
+        runner=runner,
+    )
+
+    assert snapshot.tasks == 0
+    assert snapshot.memory_bytes == 0
+    assert "systemctl:TasksCurrent:invalid=[not set]" in snapshot.probe_errors
+    assert "systemctl:MemoryCurrent:invalid=[not set]" in snapshot.probe_errors
 
 
 def test_telegram_enablement_resolves_nested_config_and_secret_file(tmp_path):

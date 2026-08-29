@@ -61,9 +61,10 @@ def _installed_gateway_admission() -> tuple[
 
 def notify_gateway_admission_changed() -> None:
     """Refresh gateway status after a surface releases its own bookkeeping."""
-    controller, _loop = _installed_gateway_admission()
-    if controller is not None:
-        controller._notify_change()
+    controller, loop = _installed_gateway_admission()
+    if controller is None or loop is None or loop.is_closed():
+        return
+    loop.call_soon_threadsafe(controller._notify_change)
 
 
 async def await_admitted_handoff(

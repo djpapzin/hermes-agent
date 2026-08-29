@@ -15,6 +15,7 @@ from gateway.admission import (
     gateway_admitted_async,
     gateway_admitted_sync,
     install_gateway_admission,
+    notify_gateway_admission_changed,
 )
 
 
@@ -350,3 +351,29 @@ def test_change_callback_observes_queue_start_and_release():
 
     asyncio.run(scenario())
     assert len(changes) >= 5
+
+
+def test_cross_thread_status_refresh_is_marshaled_onto_gateway_loop():
+    callbacks = []
+
+    class Loop:
+        def is_closed(self):
+            return False
+
+        def call_soon_threadsafe(self, callback):
+            callbacks.append(callback)
+
+    changes: list[int] = []
+    controller = AgentAdmissionController(
+        max_parallel=1,
+        on_change=lambda: changes.append(1),
+    )
+    install_gateway_admission(controller, Loop())
+    try:
+        notify_gateway_admission_changed()
+        assert changes == []
+        assert callbacks == [controller._notify_change]
+        callbacks.pop()()
+        assert changes == [1]
+    finally:
+        clear_gateway_admission(controller)
