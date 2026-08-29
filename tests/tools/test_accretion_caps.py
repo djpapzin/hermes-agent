@@ -134,6 +134,25 @@ class TestReadTrackerCaps:
 
 
 class TestCompletionConsumedPrune:
+    def test_prune_backfills_systemd_unit_on_retained_legacy_session(self):
+        from tools.process_registry import ProcessRegistry
+        import time
+
+        reg = ProcessRegistry()
+
+        class _FakeSess:
+            id = "legacy-retained"
+            started_at = time.time()
+            exited = True
+
+        session = _FakeSess()
+        reg._finished[session.id] = session
+
+        with reg._lock:
+            reg._prune_if_needed()
+
+        assert session.systemd_unit == ""
+
     def test_prune_drops_completion_entry_with_expired_session(self):
         """When a finished session is pruned, _completion_consumed is
         cleared for the same session_id."""

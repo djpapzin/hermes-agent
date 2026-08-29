@@ -23,6 +23,9 @@ _INCIDENT_MARKERS = (
     "killed by the OOM killer",
     "Killed process",
     "Out of memory",
+    "Main process exited",
+    "Failed with result",
+    "Scheduled restart job",
     "Stopping Hermes Agent Gateway",
     "Started Hermes Agent Gateway",
 )

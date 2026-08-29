@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import subprocess
 
@@ -291,6 +292,29 @@ def test_auto_service_status_returns_both_loaded_manager_candidates(monkeypatch)
     assert result["service_statuses"]["system"]["active_state"] == "inactive"
     assert result["service_statuses"]["user"]["result"] == "signal"
     assert result["service_statuses"]["user"]["exec_main_status"] == 9
+
+
+def test_incident_journal_preserves_exit_code_after_restart(monkeypatch):
+    exit_message = (
+        "hermes-gateway.service: Main process exited, "
+        "code=killed, status=9/KILL"
+    )
+
+    def run(argv, **_kwargs):
+        row = {
+            "__REALTIME_TIMESTAMP": "123",
+            "_SYSTEMD_UNIT": "hermes-gateway.service",
+            "MESSAGE": exit_message if "-u" in argv else "unrelated",
+        }
+        return subprocess.CompletedProcess(argv, 0, json.dumps(row) + "\n", "")
+
+    monkeypatch.setattr(diagnostics.subprocess, "run", run)
+
+    events = diagnostics._bounded_incident_journal(
+        "hermes-gateway.service", 30, "system"
+    )
+
+    assert any(event["message"] == exit_message for event in events)
 
 
 def test_auto_manager_journal_uses_only_selected_manager(monkeypatch):

@@ -2311,7 +2311,7 @@ class ProcessRegistry:
                 s
                 for s in (*self._running.values(), *self._finished.values())
                 if (task_id is None or s.task_id == task_id)
-                and (not s.exited or bool(s.systemd_unit))
+                and (not s.exited or bool(getattr(s, "systemd_unit", "")))
             ]
 
         killed = 0
@@ -2332,6 +2332,8 @@ class ProcessRegistry:
         # First prune expired finished sessions
         now = time.time()
         for session in self._finished.values():
+            if not hasattr(session, "systemd_unit"):
+                session.systemd_unit = ""
             systemd_unit = getattr(session, "systemd_unit", "")
             if systemd_unit and not _systemd_unit_has_processes(
                 systemd_unit
@@ -2380,7 +2382,11 @@ class ProcessRegistry:
             with self._lock:
                 sessions = [
                     *(s for s in self._running.values() if not s.exited),
-                    *(s for s in self._finished.values() if s.systemd_unit),
+                    *(
+                        s
+                        for s in self._finished.values()
+                        if getattr(s, "systemd_unit", "")
+                    ),
                 ]
                 entries = []
                 for s in sessions:

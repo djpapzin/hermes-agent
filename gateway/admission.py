@@ -9,6 +9,7 @@ import inspect
 import json
 import logging
 import os
+import queue
 import threading
 import time
 import uuid
@@ -24,6 +25,9 @@ _ADMISSION_EVENTS_MAX_BYTES = 4 * 1024 * 1024
 _registry_lock = threading.Lock()
 _gateway_controller: Optional["AgentAdmissionController"] = None
 _gateway_loop: Optional[asyncio.AbstractEventLoop] = None
+_admission_event_queue: queue.Queue[dict] = queue.Queue(maxsize=1024)
+_admission_writer_lock = threading.Lock()
+_admission_writer_started = False
 
 
 def _admission_events_path() -> Path:
@@ -59,6 +63,35 @@ def _append_admission_event(payload: dict) -> None:
             os.close(descriptor)
     except OSError:
         logger.debug("Could not persist admission event", exc_info=True)
+
+
+def _admission_event_writer(event_queue: queue.Queue[dict]) -> None:
+    while True:
+        payload = event_queue.get()
+        try:
+            _append_admission_event(payload)
+        finally:
+            event_queue.task_done()
+
+
+def _queue_admission_event(payload: dict) -> None:
+    """Enqueue evidence without filesystem I/O on the gateway event loop."""
+
+    global _admission_writer_started
+    if not _admission_writer_started:
+        with _admission_writer_lock:
+            if not _admission_writer_started:
+                threading.Thread(
+                    target=_admission_event_writer,
+                    args=(_admission_event_queue,),
+                    name="hermes-admission-events",
+                    daemon=True,
+                ).start()
+                _admission_writer_started = True
+    try:
+        _admission_event_queue.put_nowait(dict(payload))
+    except queue.Full:
+        logger.warning("Admission evidence queue is full; dropping one event")
 
 
 def install_gateway_admission(
@@ -393,7 +426,7 @@ class AgentAdmissionController:
             "HERMES_ADMISSION %s",
             json.dumps(payload, sort_keys=True),
         )
-        _append_admission_event(payload)
+        _queue_admission_event(payload)
 
     async def acquire(
         self,

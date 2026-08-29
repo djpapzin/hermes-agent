@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import queue
+import threading
 
 import pytest
 
@@ -23,9 +25,14 @@ from gateway.admission import (
 def test_structured_admission_journal_is_dedicated_and_bounded(tmp_path, monkeypatch):
     journal = tmp_path / "state" / "admission-events.jsonl"
     monkeypatch.setattr(admission_module, "_admission_events_path", lambda: journal)
-    controller = AgentAdmissionController(max_parallel=1, queue_limit=1)
-
-    controller._log("queue", "task-1", "parallel-agent capacity (1/1)")
+    admission_module._append_admission_event(
+        {
+            "decision": "queue",
+            "task_id": "task-1",
+            "active_workers": 0,
+            "queued_tasks": 0,
+        }
+    )
 
     row = admission_module.json.loads(journal.read_text(encoding="utf-8"))
     assert row["decision"] == "queue"
@@ -33,6 +40,26 @@ def test_structured_admission_journal_is_dedicated_and_bounded(tmp_path, monkeyp
     assert row["active_workers"] == 0
     assert row["queued_tasks"] == 0
     assert isinstance(row["timestamp"], float)
+
+
+def test_admission_persistence_runs_off_controller_thread(monkeypatch):
+    event_queue = queue.Queue(maxsize=1)
+    writer_entered = threading.Event()
+    writer_release = threading.Event()
+
+    def blocked_writer(_payload):
+        writer_entered.set()
+        writer_release.wait(2)
+
+    monkeypatch.setattr(admission_module, "_admission_event_queue", event_queue)
+    monkeypatch.setattr(admission_module, "_admission_writer_started", False)
+    monkeypatch.setattr(admission_module, "_append_admission_event", blocked_writer)
+
+    admission_module._queue_admission_event({"decision": "queue"})
+
+    assert writer_entered.wait(1)
+    assert not writer_release.is_set()
+    writer_release.set()
 
 
 def test_cgroup_headroom_uses_memory_max_minus_current(tmp_path):
