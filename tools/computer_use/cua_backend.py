@@ -41,6 +41,7 @@ import concurrent.futures
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
@@ -106,6 +107,95 @@ _DESKTOP_WINDOW_NAMES = (
 # (telemetry ON upstream).
 _CUA_TELEMETRY_ENV_VAR = "CUA_DRIVER_RS_TELEMETRY_ENABLED"
 
+_X11_DISPLAY_SOCKET_RE = re.compile(r"^:(\d+)(?:\.\d+)?$")
+
+
+def _x11_socket_dirs() -> Tuple[Path, Path]:
+    """Return candidate X11 socket directories used for dynamic display discovery."""
+    uid = os.getuid()
+    return Path("/tmp/.X11-unix"), Path(f"/run/user/{uid}/.X11-unix")
+
+
+def _iter_x11_displays() -> list[Tuple[int, Path, float]]:
+    """Find candidate X11 displays by existing socket files."""
+    entries: list[Tuple[int, Path, float]] = []
+    for base in _x11_socket_dirs():
+        if not base.is_dir():
+            continue
+        for entry in base.iterdir():
+            if not entry.name.startswith("X") or not entry.name[1:].isdigit():
+                continue
+            try:
+                display = int(entry.name[1:])
+            except ValueError:
+                continue
+            # In some Linux variants, the X entry is a symlink or socket.
+            is_candidate = entry.is_socket() or entry.is_file() or entry.is_char_device()
+            if not is_candidate:
+                continue
+            try:
+                mtime = entry.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            entries.append((display, entry, mtime))
+    entries.sort(key=lambda item: (item[2], item[0]), reverse=True)
+    return entries
+
+
+def _display_has_socket(display: str) -> bool:
+    if not _X11_DISPLAY_SOCKET_RE.match(display):
+        return False
+    number = display.split(".", 1)[0][1:]
+    if not number.isdigit():
+        return False
+    for base in _x11_socket_dirs():
+        if (base / f"X{number}").exists():
+            return True
+    return False
+
+
+def _resolve_display(base_env: Dict[str, str]) -> Dict[str, str]:
+    env = dict(base_env)
+    display = env.get("DISPLAY", "").strip()
+    if display and _display_has_socket(display):
+        return env
+    if display:
+        env.pop("DISPLAY", None)
+
+    displays = _iter_x11_displays()
+    if displays:
+        env["DISPLAY"] = f":{displays[0][0]}"
+    return env
+
+
+def _resolve_dbus_session_bus_address(base_env: Dict[str, str]) -> Dict[str, str]:
+    env = dict(base_env)
+    runtime_dir = Path(env.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    if runtime_dir.exists():
+        env["XDG_RUNTIME_DIR"] = str(runtime_dir)
+    else:
+        env.pop("XDG_RUNTIME_DIR", None)
+
+    configured_addr = env.get("DBUS_SESSION_BUS_ADDRESS", "").strip()
+    bus_path = runtime_dir / "bus"
+    if (
+        configured_addr.startswith("unix:path=")
+        and configured_addr[len("unix:path="):]
+        and Path(configured_addr[len("unix:path="):]).exists()
+    ):
+        return env
+
+    env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+    if bus_path.exists():
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
+    return env
+
+
+def _repair_desktop_session_env(base_env: Dict[str, str]) -> Dict[str, str]:
+    env = _resolve_display(base_env)
+    env = _resolve_dbus_session_bus_address(env)
+    return env
+
 
 def _cua_telemetry_disabled() -> bool:
     """True when Hermes should disable cua-driver telemetry for this user.
@@ -135,7 +225,7 @@ def cua_driver_child_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str,
     its own default. Used by every cua-driver spawn site (MCP backend, status,
     doctor, install) so the policy is applied consistently.
     """
-    env = dict(base_env if base_env is not None else os.environ)
+    env = _repair_desktop_session_env(dict(base_env if base_env is not None else os.environ))
     if _cua_telemetry_disabled():
         env[_CUA_TELEMETRY_ENV_VAR] = "0"
     return env

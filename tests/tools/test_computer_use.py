@@ -3148,3 +3148,56 @@ class TestStartupTimeoutPhaseDetail:
                 assert False, "expected RuntimeError"
             except RuntimeError as e:
                 assert "stuck in phase: unknown" in str(e)
+
+
+class TestCuaDriverSessionEnv:
+    def test_display_discovery_prefers_active_socket_over_stale_env(self, tmp_path):
+        from tools.computer_use.cua_backend import _repair_desktop_session_env
+
+        socket_root = tmp_path / "x11"
+        x1 = socket_root / "X1"
+        x2 = socket_root / "X2"
+        x1.parent.mkdir(parents=True, exist_ok=True)
+        x1.touch()
+        x2.touch()
+        os.utime(x1, (1000, 1000))
+        os.utime(x2, (2000, 2000))
+
+        with patch(
+            "tools.computer_use.cua_backend._x11_socket_dirs",
+            return_value=(socket_root, socket_root)
+        ):
+            env = _repair_desktop_session_env({"DISPLAY": ":99"})
+            assert env["DISPLAY"] == ":2"
+
+    def test_display_keeps_existing_valid_display(self, tmp_path):
+        from tools.computer_use.cua_backend import _repair_desktop_session_env
+
+        socket_root = tmp_path / "x11"
+        x2 = socket_root / "X2"
+        x2.parent.mkdir(parents=True, exist_ok=True)
+        x2.touch()
+
+        with patch(
+            "tools.computer_use.cua_backend._x11_socket_dirs",
+            return_value=(socket_root, socket_root)
+        ):
+            env = _repair_desktop_session_env({"DISPLAY": ":2"})
+            assert env["DISPLAY"] == ":2"
+
+    def test_missing_dbus_session_bus_is_repaired_from_runtime_dir(self, tmp_path):
+        from tools.computer_use.cua_backend import _repair_desktop_session_env
+
+        runtime_root = tmp_path / "runuser"
+        bus_path = runtime_root / "bus"
+        (runtime_root / "bus").parent.mkdir(parents=True, exist_ok=True)
+        bus_path.touch()
+
+        with patch("tools.computer_use.cua_backend.os.getuid", return_value=99999):
+            env = _repair_desktop_session_env({
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/99999/bus",
+                "XDG_RUNTIME_DIR": str(runtime_root),
+                "DISPLAY": ":0",
+            })
+            assert env["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path={bus_path}"
+            assert env["XDG_RUNTIME_DIR"] == str(runtime_root)
