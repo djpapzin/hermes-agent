@@ -38,6 +38,26 @@ For the underlying contract — *why* background mode matters, the
 no-foreground invariant, click-dispatch internals — see
 **[cua.ai/docs/explanation/the-no-foreground-contract](https://cua.ai/docs/explanation/the-no-foreground-contract)**.
 
+### Lifetimes: job, Hermes session, and takeover
+
+These are separate layers:
+
+`Telegram job → Hermes session → worker/browser takeover`
+
+The Telegram job and its Hermes session are owned by the Hermes gateway. The
+worker owns only the cua-driver/browser takeover transport. A browser or
+takeover transport expiry therefore triggers a reconnect against the latest
+safe session state; it does not cancel or restart the parent job. On Linux,
+the gateway-side desktop supervisor keeps the browser, X11 display, DBus
+session bus, and AT-SPI registrar together across Hermes/browser restarts and
+VM boot. The transport discovers the active display and reconnects when the
+browser desktop generation changes.
+
+Takeover is still approval-gated. Hermes never enters passwords, OTPs, or
+other credentials through raw CDP or raw X11, and those values are not part
+of desktop-session state or diagnostics. Existing browser profiles require
+explicit permission before a takeover can control them.
+
 ## Enabling
 
 Pick whichever path is most convenient — both run the same upstream
@@ -277,11 +297,14 @@ of screenshot context, not ~600K.
     session, or set up cua-driver's autostart Scheduled Task —
     [windows-ssh](https://cua.ai/docs/how-to-guides/driver/windows-ssh)
     has the recipe.
-  - **Linux** requires a reachable display server. Headless servers
-    need Xvfb (`Xvfb :99 -screen 0 1920x1080x24`) before
-    `computer_use` can capture or inject events. Pure Wayland sessions
-    need an XWayland bridge for screen capture (cua-driver's Wayland
-    inject path handles input independently).
+  - **Linux** requires a reachable display server. Headless Hermes
+    deployments should run the persistent desktop supervisor in
+    `scripts/hermes-desktop-session.sh`; it allocates an Xvfb display with
+    `-displayfd`, starts a DBus session and AT-SPI, and writes only
+    allow-listed session state. Pure Wayland sessions need an XWayland bridge
+    for screen capture (cua-driver's Wayland inject path handles input
+    independently). Do not hard-code a display number: multiple X servers
+    may coexist and the wrong one can expose another desktop.
 
 For cross-platform GUI automation without the desktop overhead (and
 without TCC / Session 0 / X11 setup), the `browser` toolset uses a

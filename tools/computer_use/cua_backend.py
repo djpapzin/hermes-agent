@@ -48,13 +48,17 @@ import subprocess
 import sys
 import threading
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from tools.computer_use.backend import (
     ActionResult,
     CaptureResult,
     ComputerUseBackend,
     UIElement,
+)
+from tools.computer_use.desktop_session import (
+    desktop_session_child_env,
+    desktop_session_fingerprint,
 )
 
 logger = logging.getLogger(__name__)
@@ -107,94 +111,9 @@ _DESKTOP_WINDOW_NAMES = (
 # (telemetry ON upstream).
 _CUA_TELEMETRY_ENV_VAR = "CUA_DRIVER_RS_TELEMETRY_ENABLED"
 
-_X11_DISPLAY_SOCKET_RE = re.compile(r"^:(\d+)(?:\.\d+)?$")
-
-
-def _x11_socket_dirs() -> Tuple[Path, Path]:
-    """Return candidate X11 socket directories used for dynamic display discovery."""
-    uid = os.getuid()
-    return Path("/tmp/.X11-unix"), Path(f"/run/user/{uid}/.X11-unix")
-
-
-def _iter_x11_displays() -> list[Tuple[int, Path, float]]:
-    """Find candidate X11 displays by existing socket files."""
-    entries: list[Tuple[int, Path, float]] = []
-    for base in _x11_socket_dirs():
-        if not base.is_dir():
-            continue
-        for entry in base.iterdir():
-            if not entry.name.startswith("X") or not entry.name[1:].isdigit():
-                continue
-            try:
-                display = int(entry.name[1:])
-            except ValueError:
-                continue
-            # In some Linux variants, the X entry is a symlink or socket.
-            is_candidate = entry.is_socket() or entry.is_file() or entry.is_char_device()
-            if not is_candidate:
-                continue
-            try:
-                mtime = entry.stat().st_mtime
-            except OSError:
-                mtime = 0.0
-            entries.append((display, entry, mtime))
-    entries.sort(key=lambda item: (item[2], item[0]), reverse=True)
-    return entries
-
-
-def _display_has_socket(display: str) -> bool:
-    if not _X11_DISPLAY_SOCKET_RE.match(display):
-        return False
-    number = display.split(".", 1)[0][1:]
-    if not number.isdigit():
-        return False
-    for base in _x11_socket_dirs():
-        if (base / f"X{number}").exists():
-            return True
-    return False
-
-
-def _resolve_display(base_env: Dict[str, str]) -> Dict[str, str]:
-    env = dict(base_env)
-    display = env.get("DISPLAY", "").strip()
-    if display and _display_has_socket(display):
-        return env
-    if display:
-        env.pop("DISPLAY", None)
-
-    displays = _iter_x11_displays()
-    if displays:
-        env["DISPLAY"] = f":{displays[0][0]}"
-    return env
-
-
-def _resolve_dbus_session_bus_address(base_env: Dict[str, str]) -> Dict[str, str]:
-    env = dict(base_env)
-    runtime_dir = Path(env.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
-    if runtime_dir.exists():
-        env["XDG_RUNTIME_DIR"] = str(runtime_dir)
-    else:
-        env.pop("XDG_RUNTIME_DIR", None)
-
-    configured_addr = env.get("DBUS_SESSION_BUS_ADDRESS", "").strip()
-    bus_path = runtime_dir / "bus"
-    if (
-        configured_addr.startswith("unix:path=")
-        and configured_addr[len("unix:path="):]
-        and Path(configured_addr[len("unix:path="):]).exists()
-    ):
-        return env
-
-    env.pop("DBUS_SESSION_BUS_ADDRESS", None)
-    if bus_path.exists():
-        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
-    return env
-
-
 def _repair_desktop_session_env(base_env: Dict[str, str]) -> Dict[str, str]:
-    env = _resolve_display(base_env)
-    env = _resolve_dbus_session_bus_address(env)
-    return env
+    """Compatibility shim for callers/tests of the original repair helper."""
+    return desktop_session_child_env(base_env)
 
 
 def _cua_telemetry_disabled() -> bool:
@@ -669,6 +588,21 @@ class _CuaDriverSession:
         self._shutdown_event: Optional[asyncio.Event] = None  # created on bridge loop
         self._lifecycle_future = None  # concurrent.futures.Future
         self._setup_error: Optional[BaseException] = None
+        # The stdio transport is bound to the desktop that existed when it
+        # was spawned. A browser/X/DBus restart must therefore recreate this
+        # transport, while the parent Hermes run and its session id remain
+        # unchanged.
+        self._desktop_fingerprint: Optional[Tuple[object, ...]] = None
+        self._on_reconnect: Optional[Callable[[], None]] = None
+
+    def set_reconnect_callback(self, callback: Optional[Callable[[], None]]) -> None:
+        """Set a best-effort hook run after a transport reconnect.
+
+        CuaDriverBackend uses this to redeclare its stable logical session on
+        the new transport. The callback does not own the desktop or the
+        parent Hermes job.
+        """
+        self._on_reconnect = callback
 
     def _require_started(self) -> None:
         if not self._started:
@@ -706,12 +640,14 @@ class _CuaDriverSession:
             self._startup_phase = "manifest-discovery"
             command, args = _resolve_mcp_invocation(_CUA_DRIVER_CMD)
             _t_manifest = _time.monotonic()
+            child_env = cua_driver_child_env()
+            self._desktop_fingerprint = desktop_session_fingerprint(child_env)
             params = StdioServerParameters(
                 command=command,
                 args=args,
                 # Apply the telemetry policy first (default: disabled), then
                 # sanitize Hermes-managed secrets out of the child env.
-                env=_sanitize_subprocess_env(cua_driver_child_env()),
+                env=_sanitize_subprocess_env(child_env),
             )
 
             async with stdio_client(params) as (read, write):
@@ -966,8 +902,17 @@ class _CuaDriverSession:
         # Clear stale capability state; the next start populates from scratch.
         self._capabilities = {}
         self._capability_version = ""
+        self._desktop_fingerprint = None
         self._start_lifecycle_locked()
         self._started = True
+        callback = getattr(self, "_on_reconnect", None)
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                # An older driver may not expose start_session. Reconnect is
+                # still valid and must not take down the parent run.
+                logger.debug("cua-driver logical session redeclaration failed")
 
     def _call_tool_via_cli(self, name: str, args: Dict[str, Any], timeout: float) -> Dict[str, Any]:
         """Fallback transport: invoke ``cua-driver call <tool> <json>`` as a
@@ -1076,8 +1021,23 @@ class _CuaDriverSession:
                 except OSError:
                     pass
 
+    def _ensure_current_desktop_session(self) -> None:
+        """Reconnect once when the browser desktop binding has changed."""
+        expected = getattr(self, "_desktop_fingerprint", None)
+        if expected is None:
+            return
+        current = desktop_session_fingerprint()
+        if current == expected:
+            return
+        with self._lock:
+            # Another concurrent caller may already have repaired the binding.
+            if getattr(self, "_desktop_fingerprint", None) != current:
+                logger.info("cua-driver desktop session changed; reconnecting transport")
+                self._restart_session_locked()
+
     def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
         self._require_started()
+        self._ensure_current_desktop_session()
         # The cua-driver daemon proxy returns POSIX EAGAIN ("Resource
         # temporarily unavailable") for heavier calls like get_window_state when
         # its non-blocking socket buffer is full. On some machines/builds this
@@ -1243,7 +1203,11 @@ class CuaDriverBackend(ComputerUseBackend):
 
     def __init__(self) -> None:
         self._bridge = _AsyncBridge()
+        # Mint the logical run id before constructing the transport so a
+        # reconnect can redeclare the same id on the fresh MCP session.
+        self._session_id: str = f"hermes-{uuid.uuid4().hex[:12]}"
         self._session = _CuaDriverSession(self._bridge)
+        self._session.set_reconnect_callback(self._redeclare_session)
         # Sticky context — updated by capture(), used by action tools.
         self._active_pid: Optional[int] = None
         self._active_window_id: Optional[int] = None
@@ -1273,7 +1237,10 @@ class CuaDriverBackend(ComputerUseBackend):
         # unknown to the driver (older builds), the tool calls
         # degrade to the anonymous / unsynced path documented in the
         # MCP server instructions.
-        self._session_id: str = f"hermes-{uuid.uuid4().hex[:12]}"
+
+    def _redeclare_session(self) -> None:
+        """Re-register the logical run after a transport-only reconnect."""
+        self._session.call_tool("start_session", {"session": self._session_id})
 
     # ── Lifecycle ──────────────────────────────────────────────────
     def start(self) -> None:
