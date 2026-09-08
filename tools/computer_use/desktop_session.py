@@ -90,6 +90,12 @@ class _BrowserProcess:
     score: Tuple[int, int, int, int]
 
 
+def _current_uid() -> int:
+    """Return the POSIX uid, or a sentinel on platforms without one."""
+    getter = getattr(os, "getuid", None)
+    return int(getter()) if getter is not None else -1
+
+
 def _hermes_home() -> Path:
     configured = os.environ.get("HERMES_HOME")
     if configured:
@@ -108,7 +114,7 @@ def _state_path() -> Path:
 
 
 def _x11_socket_dirs() -> Tuple[Path, ...]:
-    uid = os.getuid()
+    uid = _current_uid()
     return (Path("/tmp/.X11-unix"), Path(f"/run/user/{uid}/.X11-unix"))
 
 
@@ -140,7 +146,7 @@ def _display_has_socket(display: str) -> bool:
 def _iter_x11_displays() -> List[Tuple[int, Path, float, int]]:
     entries: List[Tuple[int, Path, float, int]] = []
     seen: set[Tuple[int, str]] = set()
-    uid = os.getuid()
+    uid = _current_uid()
     for base in _x11_socket_dirs():
         try:
             children = list(base.iterdir())
@@ -172,7 +178,7 @@ def _read_state() -> Dict[str, str]:
     path = _state_path()
     try:
         info = path.stat()
-        if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        if info.st_uid != _current_uid() or info.st_mode & 0o077:
             return {}
         raw = path.read_text(encoding="utf-8", errors="strict")
     except (OSError, UnicodeError):
@@ -208,7 +214,7 @@ def _proc_uid(pid: int) -> Optional[int]:
 
 
 def _read_process_env(pid: int) -> Dict[str, str]:
-    if _proc_uid(pid) != os.getuid():
+    if _proc_uid(pid) != _current_uid():
         return {}
     try:
         raw = Path(f"/proc/{pid}/environ").read_bytes()
@@ -230,7 +236,7 @@ def _read_process_env(pid: int) -> Dict[str, str]:
 
 
 def _read_process_cmdline(pid: int) -> List[str]:
-    if _proc_uid(pid) != os.getuid():
+    if _proc_uid(pid) != _current_uid():
         return []
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
@@ -243,7 +249,7 @@ def _read_process_cmdline(pid: int) -> List[str]:
 
 
 def _read_process_cgroup(pid: int) -> str:
-    if _proc_uid(pid) != os.getuid():
+    if _proc_uid(pid) != _current_uid():
         return ""
     try:
         return Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8", errors="ignore").lower()
@@ -261,7 +267,7 @@ def _process_start_token(pid: int) -> str:
 
 
 def _browser_from_pid(pid: Optional[int], rank: int = 1000) -> Optional[_BrowserProcess]:
-    if pid is None or _proc_uid(pid) != os.getuid():
+    if pid is None or _proc_uid(pid) != _current_uid():
         return None
     cmdline = _read_process_cmdline(pid)
     if not cmdline or any(arg.startswith("--type=") for arg in cmdline[1:]):
@@ -336,7 +342,7 @@ def _address_is_valid(address: str, *, require_owner: bool = True) -> bool:
         info = path.stat()
     except OSError:
         return False
-    return not require_owner or info.st_uid == os.getuid()
+    return not require_owner or info.st_uid == _current_uid()
 
 
 def _valid_runtime_dir(value: Optional[str]) -> Optional[str]:
@@ -347,7 +353,7 @@ def _valid_runtime_dir(value: Optional[str]) -> Optional[str]:
         info = path.stat()
     except OSError:
         return None
-    if not path.is_dir() or info.st_uid != os.getuid():
+    if not path.is_dir() or info.st_uid != _current_uid():
         return None
     return str(path)
 
