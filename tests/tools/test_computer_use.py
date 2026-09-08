@@ -3148,3 +3148,82 @@ class TestStartupTimeoutPhaseDetail:
                 assert False, "expected RuntimeError"
             except RuntimeError as e:
                 assert "stuck in phase: unknown" in str(e)
+
+
+class TestCuaDriverSessionEnv:
+    def test_display_discovery_follows_active_browser_not_socket_mtime(self, tmp_path):
+        from tools.computer_use import desktop_session
+        from tools.computer_use.cua_backend import _repair_desktop_session_env
+
+        socket_root = tmp_path / "x11"
+        socket_root.mkdir()
+        (socket_root / "X7").touch()
+        (socket_root / "X42").touch()
+        bus_path = tmp_path / "bus"
+        bus_path.touch()
+        browser = desktop_session._BrowserProcess(
+            pid=4321,
+            env={
+                "DISPLAY": ":7",
+                "DBUS_SESSION_BUS_ADDRESS": f"unix:path={bus_path}",
+            },
+            score=(1000, 1, 1, 4321),
+        )
+
+        with patch.object(desktop_session, "_x11_socket_dirs", return_value=(socket_root,)), \
+             patch.object(desktop_session, "_read_state", return_value={}), \
+             patch.object(desktop_session, "_find_browser", return_value=browser):
+            env = _repair_desktop_session_env({"DISPLAY": ":42"})
+            assert env["DISPLAY"] == ":7"
+            assert env["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path={bus_path}"
+
+    def test_multiple_unrelated_sockets_do_not_guess_a_display(self, tmp_path):
+        from tools.computer_use import desktop_session
+        from tools.computer_use.cua_backend import _repair_desktop_session_env
+
+        socket_root = tmp_path / "x11"
+        socket_root.mkdir()
+        (socket_root / "X7").touch()
+        (socket_root / "X42").touch()
+
+        with patch.object(desktop_session, "_x11_socket_dirs", return_value=(socket_root,)), \
+             patch.object(desktop_session, "_read_state", return_value={}), \
+             patch.object(desktop_session, "_find_browser", return_value=None):
+            env = _repair_desktop_session_env({"DISPLAY": ":99"})
+            assert "DISPLAY" not in env
+
+    def test_stale_dbus_is_replaced_by_repair_without_logging_value(self, tmp_path):
+        from tools.computer_use import desktop_session
+        from tools.computer_use.cua_backend import _repair_desktop_session_env
+
+        socket_root = tmp_path / "x11"
+        socket_root.mkdir()
+        (socket_root / "X7").touch()
+        repaired_bus = tmp_path / "bus"
+        repaired_bus.touch()
+        browser = desktop_session._BrowserProcess(
+            pid=4321,
+            env={"DISPLAY": ":7"},
+            score=(1000, 1, 1, 4321),
+        )
+        launched = []
+
+        def fake_launch(env):
+            launched.append(True)
+            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={repaired_bus}"
+            return True
+
+        with patch.object(desktop_session, "_x11_socket_dirs", return_value=(socket_root,)), \
+             patch.object(desktop_session, "_read_state", return_value={}), \
+             patch.object(desktop_session, "_find_browser", return_value=browser), \
+             patch.object(desktop_session, "_launch_session_bus", side_effect=fake_launch), \
+             patch.object(desktop_session, "_launch_at_spi") as launch_at_spi:
+            env = _repair_desktop_session_env({
+                "DISPLAY": ":99",
+                "DBUS_SESSION_BUS_ADDRESS": "not-a-real-bus-with-token=secret",
+            })
+
+        assert env["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path={repaired_bus}"
+        assert launched == [True]
+        launch_at_spi.assert_called_once()
+        assert "secret" not in str(env)
