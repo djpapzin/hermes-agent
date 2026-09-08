@@ -47,13 +47,17 @@ import subprocess
 import sys
 import threading
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from tools.computer_use.backend import (
     ActionResult,
     CaptureResult,
     ComputerUseBackend,
     UIElement,
+)
+from tools.computer_use.desktop_session import (
+    desktop_session_child_env,
+    desktop_session_fingerprint,
 )
 
 logger = logging.getLogger(__name__)
@@ -171,6 +175,11 @@ _DESKTOP_WINDOW_NAMES = (
 _CUA_TELEMETRY_ENV_VAR = "CUA_DRIVER_RS_TELEMETRY_ENABLED"
 
 
+def _repair_desktop_session_env(base_env: Dict[str, str]) -> Dict[str, str]:
+    """Compatibility shim for callers/tests of the original repair helper."""
+    return desktop_session_child_env(base_env)
+
+
 def _cua_telemetry_disabled() -> bool:
     """True when Hermes should disable cua-driver telemetry for this user.
 
@@ -199,7 +208,7 @@ def cua_driver_child_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str,
     its own default. Used by every cua-driver spawn site (MCP backend, status,
     doctor, install) so the policy is applied consistently.
     """
-    env = dict(base_env if base_env is not None else os.environ)
+    env = _repair_desktop_session_env(dict(base_env if base_env is not None else os.environ))
     if _cua_telemetry_disabled():
         env[_CUA_TELEMETRY_ENV_VAR] = "0"
     return env
@@ -643,6 +652,21 @@ class _CuaDriverSession:
         self._shutdown_event: Optional[asyncio.Event] = None  # created on bridge loop
         self._lifecycle_future = None  # concurrent.futures.Future
         self._setup_error: Optional[BaseException] = None
+        # The stdio transport is bound to the desktop that existed when it
+        # was spawned. A browser/X/DBus restart must therefore recreate this
+        # transport, while the parent Hermes run and its session id remain
+        # unchanged.
+        self._desktop_fingerprint: Optional[Tuple[object, ...]] = None
+        self._on_reconnect: Optional[Callable[[], None]] = None
+
+    def set_reconnect_callback(self, callback: Optional[Callable[[], None]]) -> None:
+        """Set a best-effort hook run after a transport reconnect.
+
+        CuaDriverBackend uses this to redeclare its stable logical session on
+        the new transport. The callback does not own the desktop or the
+        parent Hermes job.
+        """
+        self._on_reconnect = callback
 
     def _require_started(self) -> None:
         if not self._started:
@@ -681,7 +705,9 @@ class _CuaDriverSession:
             self._startup_phase = "manifest-discovery"
             command, args = _resolve_mcp_invocation(_CUA_DRIVER_CMD)
             _t_manifest = _time.monotonic()
-            sanitized_child_env = _sanitize_subprocess_env(cua_driver_child_env())
+            child_env = cua_driver_child_env()
+            self._desktop_fingerprint = desktop_session_fingerprint(child_env)
+            sanitized_child_env = _sanitize_subprocess_env(child_env)
             from tools.process_registry import build_gateway_worker_scope_argv
             scoped_argv, _scope_unit = build_gateway_worker_scope_argv(
                 [command, *args],
@@ -968,8 +994,17 @@ class _CuaDriverSession:
         # Clear stale capability state; the next start populates from scratch.
         self._capabilities = {}
         self._capability_version = ""
+        self._desktop_fingerprint = None
         self._start_lifecycle_locked()
         self._started = True
+        callback = getattr(self, "_on_reconnect", None)
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                # An older driver may not expose start_session. Reconnect is
+                # still valid and must not take down the parent run.
+                logger.debug("cua-driver logical session redeclaration failed")
 
     def _call_tool_via_cli(self, name: str, args: Dict[str, Any], timeout: float) -> Dict[str, Any]:
         """Fallback transport: invoke ``cua-driver call <tool> <json>`` as a
@@ -1093,6 +1128,20 @@ class _CuaDriverSession:
     # into start() when the session-start hasn't flipped _started yet.
     _LIFECYCLE_CALLS = frozenset({"start_session", "end_session"})
 
+    def _ensure_current_desktop_session(self) -> None:
+        """Reconnect once when the browser desktop binding has changed."""
+        expected = getattr(self, "_desktop_fingerprint", None)
+        if expected is None:
+            return
+        current = desktop_session_fingerprint()
+        if current == expected:
+            return
+        with self._lock:
+            # Another concurrent caller may already have repaired the binding.
+            if getattr(self, "_desktop_fingerprint", None) != current:
+                logger.info("cua-driver desktop session changed; reconnecting transport")
+                self._restart_session_locked()
+
     def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
         # A prior session may have died (MCP drop / driver crash): its
         # lifecycle coro reset _started to False in its finally (#55048
@@ -1107,6 +1156,7 @@ class _CuaDriverSession:
             )
             self.start()
         self._require_started()
+        self._ensure_current_desktop_session()
         # The cua-driver daemon proxy returns POSIX EAGAIN ("Resource
         # temporarily unavailable") for heavier calls like get_window_state when
         # its non-blocking socket buffer is full. On some machines/builds this
@@ -1290,7 +1340,11 @@ class CuaDriverBackend(ComputerUseBackend):
 
     def __init__(self) -> None:
         self._bridge = _AsyncBridge()
+        # Mint the logical run id before constructing the transport so a
+        # reconnect can redeclare the same id on the fresh MCP session.
+        self._session_id: str = f"hermes-{uuid.uuid4().hex[:12]}"
         self._session = _CuaDriverSession(self._bridge)
+        self._session.set_reconnect_callback(self._redeclare_session)
         # Sticky context — updated by capture(), used by action tools.
         self._active_pid: Optional[int] = None
         self._active_window_id: Optional[int] = None
@@ -1323,7 +1377,10 @@ class CuaDriverBackend(ComputerUseBackend):
         # unknown to the driver (older builds), the tool calls
         # degrade to the anonymous / unsynced path documented in the
         # MCP server instructions.
-        self._session_id: str = f"hermes-{uuid.uuid4().hex[:12]}"
+
+    def _redeclare_session(self) -> None:
+        """Re-register the logical run after a transport-only reconnect."""
+        self._session.call_tool("start_session", {"session": self._session_id})
 
     # ── Lifecycle ──────────────────────────────────────────────────
     def start(self) -> None:
