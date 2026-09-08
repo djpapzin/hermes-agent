@@ -78,6 +78,35 @@ def test_stale_state_addresses_are_removed_from_the_next_repair(tmp_path):
     assert "DBUS_SESSION_BUS_ADDRESS=unix:path=/missing/bus" not in persisted
 
 
+def test_browser_path_keeps_hermes_transport_executable_path(tmp_path):
+    from tools.computer_use import desktop_session
+
+    state_path = tmp_path / "desktop-session.env"
+    state_path.write_text("GENERATION=one\n")
+    os.chmod(state_path, 0o600)
+    browser = desktop_session._BrowserProcess(
+        pid=4321,
+        env={
+            "DISPLAY": ":7",
+            "PATH": "/browser/bin:/usr/bin",
+        },
+        score=(1000, 1, 1, 4321),
+    )
+
+    with patch.object(desktop_session, "_state_path", return_value=state_path), \
+         patch.object(desktop_session, "_find_browser", return_value=browser), \
+         patch.object(desktop_session, "_display_has_socket", return_value=True), \
+         patch.object(desktop_session, "_address_is_valid", return_value=True):
+        env = desktop_session.desktop_session_child_env({
+            "DISPLAY": ":99",
+            "PATH": "/hermes/bin:/usr/bin",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/996/bus",
+        }, repair=False)
+
+    assert env["DISPLAY"] == ":7"
+    assert env["PATH"] == "/browser/bin:/usr/bin:/hermes/bin"
+
+
 def test_dbus_launch_output_is_parsed_without_shell_evaluation(tmp_path):
     from tools.computer_use import desktop_session
 
