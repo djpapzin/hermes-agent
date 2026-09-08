@@ -366,6 +366,25 @@ def _minimal_helper_env(env: Dict[str, str]) -> Dict[str, str]:
     }
 
 
+def _merge_path(*values: Optional[str]) -> str:
+    """Preserve both desktop and Hermes executable search paths.
+
+    The browser is the authority for display/session variables, but a
+    systemd-started browser commonly inherits only the host PATH. Replacing
+    Hermes' PATH with that browser PATH makes the child transport unable to
+    resolve the installed ``cua-driver`` binary. Keep the browser entries
+    first, then append the trusted Hermes caller PATH without duplicates.
+    """
+    entries: List[str] = []
+    for value in values:
+        if not value:
+            continue
+        for entry in value.split(os.pathsep):
+            if entry and entry not in entries:
+                entries.append(entry)
+    return os.pathsep.join(entries)
+
+
 def _launch_session_bus(env: Dict[str, str]) -> bool:
     launcher = shutil.which("dbus-launch") or "/usr/bin/dbus-launch"
     helper_env = _minimal_helper_env(env)
@@ -494,10 +513,16 @@ def _resolve_desktop_context(base_env: Dict[str, str]) -> Tuple[Dict[str, str], 
             env["DISPLAY"] = display
         else:
             env.pop("DISPLAY", None)
-        for key in ("XDG_RUNTIME_DIR", "XAUTHORITY", "HOME", "PATH"):
+        for key in ("XDG_RUNTIME_DIR", "XAUTHORITY", "HOME"):
             value = process_env.get(key)
             if value:
                 env[key] = value
+        # The browser's PATH is authoritative for its own launch, but not
+        # for Hermes' child transport. A service unit often has only the
+        # system PATH while the gateway's trusted PATH contains cua-driver.
+        merged_path = _merge_path(process_env.get("PATH"), base_env.get("PATH"))
+        if merged_path:
+            env["PATH"] = merged_path
     else:
         display = env.get("DISPLAY", "")
         if not _display_has_socket(display):
