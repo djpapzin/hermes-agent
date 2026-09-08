@@ -135,6 +135,13 @@ cleanup_outer() {
 }
 trap cleanup_outer EXIT INT TERM
 
+# A system service does not receive a logind session runtime directory. Give
+# the browser, DBus, AT-SPI, and cua-driver one private runtime root that is
+# recreated with this desktop generation and disappears with it.
+export XDG_RUNTIME_DIR="$tmp_dir/runtime"
+mkdir -p -- "$XDG_RUNTIME_DIR"
+chmod 700 -- "$XDG_RUNTIME_DIR"
+
 # Xvfb writes the allocated display number to this descriptor. This is the
 # only display selection mechanism used by the persistent browser service.
 exec {display_fd}>"$display_file"

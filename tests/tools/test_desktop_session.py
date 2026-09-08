@@ -130,6 +130,7 @@ def test_supervisor_allocates_display_and_does_not_embed_legacy_numbers():
     assert "Xvfb :99" not in source
     assert "Xvfb :122" not in source
     assert "Xvfb :124" not in source
+    assert "XDG_RUNTIME_DIR" in source
 
 
 def test_fingerprint_changes_when_supervisor_generation_changes():
