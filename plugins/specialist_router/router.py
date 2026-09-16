@@ -76,7 +76,7 @@ class Router:
 
     def _load_state(self) -> dict[str, Any]:
         try:
-            state = json.loads(self.config.state_path.read_text())
+            state = json.loads(self.config.state_path.read_text(encoding="utf-8"))
             return state if isinstance(state, dict) else {}
         except (OSError, json.JSONDecodeError, TypeError):
             return {}
@@ -133,7 +133,7 @@ class Router:
         pools = {"spark": PoolQuota(self.config.spark_model), "sol": PoolQuota(self.config.sol_model)}
         known_sessions: dict[str, str] = {}
         try:
-            state = json.loads(self.config.state_path.read_text())
+            state = json.loads(self.config.state_path.read_text(encoding="utf-8"))
             known_sessions = {
                 str(a["session_id"]): str(a["pool"])
                 for a in state.get("attempts", [])
@@ -149,7 +149,7 @@ class Router:
                 session_id = None
                 latest = None
                 try:
-                    for line in path.read_text(errors="replace").splitlines():
+                    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
                         obj = json.loads(line)
                         payload = obj.get("payload") or {}
                         if obj.get("type") == "session_meta":
@@ -313,14 +313,14 @@ class Router:
     def _save_state(self, state: dict[str, Any]) -> None:
         self.config.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.config.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, indent=2))
+        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
         tmp.replace(self.config.state_path)
 
     def format_status(self) -> str:
         quotas = self.quotas()
         state = {}
         try:
-            state = json.loads(self.config.state_path.read_text())
+            state = json.loads(self.config.state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             pass
         sol = quotas["sol"]
