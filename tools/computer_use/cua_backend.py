@@ -28,8 +28,14 @@ from tools.computer_use.cua_backend_driver import (
 from tools.computer_use.cua_backend_input import _InputMixin
 from tools.computer_use.cua_backend_parse import _action_result_from
 from tools.computer_use.cua_backend_session import _AsyncBridge, _CuaDriverSession
+from tools.computer_use.desktop_session import (
+    desktop_session_child_env,
+    desktop_session_fingerprint as _desktop_session_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
+# Kept on the facade because the session sibling resolves policy helpers here lazily.
+desktop_session_fingerprint = _desktop_session_fingerprint
 # cua-driver's anonymous PostHog telemetry gate ("0" disables; absent => ON upstream).
 _CUA_TELEMETRY_ENV_VAR = "CUA_DRIVER_RS_TELEMETRY_ENABLED"
 _CUA_NATIVE_WAYLAND_ENV_VAR = "CUA_DRIVER_RS_ENABLE_WAYLAND"
@@ -105,7 +111,7 @@ def cua_driver_child_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str,
     unless the user opted in, plus the native-Wayland bridge (``computer_use.native_wayland`` config opt-in, only when
     the child has a Wayland display). Used by every spawn site (MCP, status, doctor, install) so CLI and gateway
     runtimes share one policy."""
-    env = dict(os.environ if base_env is None else base_env)
+    env = desktop_session_child_env(dict(os.environ if base_env is None else base_env))
     if _cua_telemetry_disabled():
         env[_CUA_TELEMETRY_ENV_VAR] = "0"
     if sys.platform == "linux" and env.get("WAYLAND_DISPLAY") and bool(_computer_use_cfg().get("native_wayland", False)):
@@ -231,6 +237,8 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
                 capability_manifest=raw.strip() if isinstance(raw, str) and raw.strip() else None)
         self._bridge = _AsyncBridge()
         self._session = _CuaDriverSession(self._bridge, self._embedded_daemon)
+        self._transport_notice_lock = threading.Lock()
+        self._transport_notice: Optional[str] = None
         # Sticky target (set by capture()/focus_app(), used by actions): `_active_pid`, `_active_window_id`, `_last_app`,
         # `_last_target` (exact identity for capture_after — Linux app names may be generic, e.g. several unrelated Qt
         # windows all say Qt6Application), `_snapshot_tokens` (element_index -> element_token, attached to actions so
@@ -244,6 +252,16 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
     def _handle_transport_reset(self) -> None:
         """Invalidate every capability minted by the replaced transport."""
         self._clear_active_target()
+        with self._transport_notice_lock:
+            self._transport_notice = (
+                "Computer-use transport reconnected; reacquire fresh desktop state before another input action."
+            )
+
+    def consume_transport_notice(self) -> Optional[str]:
+        """Return and clear the next reconnect notice for the originating tool turn."""
+        with self._transport_notice_lock:
+            notice, self._transport_notice = self._transport_notice, None
+        return notice
 
     def start(self) -> None:
         contract = cua_driver_runtime_contract_status()
@@ -309,6 +327,18 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
         # re-resolving to a different element. Cleared whenever a fresh capture overwrites the snapshot
         # context.
         self._snapshot_tokens: Dict[int, str] = {}
+
+    def computer_use_target(self) -> Dict[str, Any]:
+        """Return safe target metadata for a durable worker checkpoint.
+
+        Only the app label and native numeric ids are exposed. Window titles,
+        URLs, page text, cookies, and credentials never enter job state.
+        """
+        return {
+            "app": self._last_app,
+            "pid": self._active_pid,
+            "window_id": self._active_window_id,
+        }
 
     def _set_active_target(self, target: Dict[str, Any]) -> None:
         self._active_pid = target["pid"]

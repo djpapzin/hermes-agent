@@ -77,6 +77,10 @@ _UNKNOWN_OUTCOME_MESSAGES = {
         "taken effect on the remote screen. The session has been marked suspect and will be "
         "recreated before the next computer-use call. Take fresh state before deciding "
         "whether to act again."),
+    "session_expired_no_replay": (
+        "cua-driver takeover session expired during {name}; Hermes reconnected the transport but "
+        "did not replay the input because its outcome cannot be proven. Take fresh state before "
+        "deciding whether to act again."),
 }
 
 def _outcome_unknown(name: str, exc: Exception, code: str) -> Dict[str, Any]:
@@ -205,6 +209,11 @@ class _CuaDriverSession:
         # Stable driver-side identity declared through start_session. Used to revive a logical ended-session
         # rejection without recursive call_tool re-entry or backend-owned state (#71166).
         self._declared_session_id: Optional[str] = None
+        # Secret-free identity of the browser desktop bound to the current
+        # stdio transport. A browser/X11/DBus restart must rebuild only this
+        # transport; the parent Hermes job and its public session label stay
+        # alive.
+        self._desktop_fingerprint = None
         self._transport_generation, self._transport_reset_callback = 0, None
 
     async def _lifecycle_coro(self) -> None:
@@ -230,6 +239,7 @@ class _CuaDriverSession:
             (command, args), child_env = (
                 (daemon.proxy_invocation(), daemon.child_env()) if daemon is not None
                 else (_driver._resolve_mcp_invocation(driver_cmd), _cb.cua_driver_child_env()))
+            self._desktop_fingerprint = _cb.desktop_session_fingerprint(child_env)
             _t_manifest = _time.monotonic()
             # Telemetry policy first (default: disabled), then strip Hermes secrets.
             params = StdioServerParameters(command=command, args=args, env=_sanitize_subprocess_env(child_env))
@@ -331,6 +341,24 @@ class _CuaDriverSession:
         except Exception as exc:
             logger.debug("cua-driver transport reset callback failed: %s", exc)
 
+    def _desktop_context_changed(self) -> bool:
+        """Return whether the active browser desktop changed since handshake.
+
+        The check is deliberately secret-free and best-effort.  A failed
+        probe does not tear down a healthy transport; an observed identity
+        change does, so a browser/display/DBus restart is handled before the
+        next call without replaying an action.
+        """
+        previous = getattr(self, "_desktop_fingerprint", None)
+        if previous is None:
+            return False
+        try:
+            from tools.computer_use import cua_backend as _cb
+
+            return _cb.desktop_session_fingerprint() != previous
+        except Exception:
+            return False
+
     def _stop_lifecycle_locked(self) -> None:
         self._signal_shutdown_locked()
         fut, self._lifecycle_future = self._lifecycle_future, None
@@ -411,7 +439,7 @@ class _CuaDriverSession:
         return result.get("isError") is not True
 
     def _recreate_session(self, name: str, timeout: float, log_msg: str, *, restart: bool = True,
-                          clear_timeout_suspect: bool = False) -> None:
+                          clear_timeout_suspect: bool = False) -> bool:
         """Log *log_msg* (``%s`` = *name*), then either start() a dead session or (``restart``) tear
         down and rebuild the MCP lifecycle under ``_lock`` with capabilities repopulated from scratch;
         finally re-attach the declared public label inside the replacement private lifecycle."""
@@ -432,7 +460,8 @@ class _CuaDriverSession:
             if clear_timeout_suspect:
                 self._timeout_suspect = False
         if getattr(self, "_declared_session_id", None):
-            self._redeclare_session(timeout, "cua-driver public session label %s could not be restored: %s")
+            return self._redeclare_session(timeout, "cua-driver public session label %s could not be restored: %s")
+        return True
 
     def _call_tool_via_cli(self, name: str, args: Dict[str, Any], timeout: float) -> Dict[str, Any]:
         """Fallback transport: ``cua-driver call <tool> <json>`` subprocess. The MCP stdio bridge can persistently
@@ -467,6 +496,9 @@ class _CuaDriverSession:
 
     def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
         if name not in self._LIFECYCLE_CALLS:
+            if self._desktop_context_changed():
+                self._recreate_session(
+                    name, timeout, "cua-driver desktop context changed; reconnecting before %s")
             # A prior MCP timeout marks the session suspect (possibly wedged): recreate it so one timeout never
             # poisons the run. Healthy sessions are never restarted here.
             if self._timeout_suspect:
@@ -509,13 +541,25 @@ class _CuaDriverSession:
         if name == "start_session" and ok and isinstance(declared_id, str) and declared_id:
             self._declared_session_id = declared_id
         if _is_ended_session_result(result):
-            # Revive the stable session and replay the rejected call once; a 2nd rejection surfaces as-is.
-            # Never re-runs lifecycle calls -> an end_session result is final.
+            # Revive the stable session. Reads can be replayed because they are idempotent; input must not be
+            # replayed after an expiry signal because the driver may have accepted it before reporting the
+            # logical-session rejection. The parent Hermes job remains alive in both cases.
             session_id = self._declared_session_id
             if session_id and name not in self._LIFECYCLE_CALLS:
-                logger.warning("cua-driver session %s ended during %s; reviving and retrying once", session_id, name)
-                if self._redeclare_session(timeout, "cua-driver session %s could not be revived: %s"):
-                    result = self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+                logger.warning("cua-driver session %s ended during %s; recreating transport", session_id, name)
+                if self._recreate_session(
+                    name,
+                    timeout,
+                    "cua-driver logical session ended during %s; recreating transport",
+                ):
+                    if name in self._TRANSPORT_REPLAY_SAFE_TOOLS:
+                        result = self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+                    else:
+                        result = _outcome_unknown(
+                            name,
+                            RuntimeError("takeover session expired before the input outcome was proven"),
+                            "session_expired_no_replay",
+                        )
         elif name == "end_session" and ok and declared_id == self._declared_session_id:
             self._declared_session_id = None
         return result

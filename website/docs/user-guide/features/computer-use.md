@@ -416,11 +416,90 @@ of screenshot context, not ~600K.
     session, or set up cua-driver's autostart Scheduled Task —
     [windows-ssh](https://cua.ai/docs/how-to-guides/driver/windows-ssh)
     has the recipe.
-  - **Linux** requires a reachable display server. Headless servers
-    need Xvfb (`Xvfb :99 -screen 0 1920x1080x24`) before
-    `computer_use` can capture or inject events. Pure Wayland sessions
-    need an XWayland bridge for screen capture (cua-driver's Wayland
-    inject path handles input independently).
+  - **Linux** requires a reachable display server. Headless servers need a
+    long-lived desktop supervisor that allocates an Xvfb display dynamically
+    (for example, with `Xvfb -displayfd`) before `computer_use` can capture or
+    inject events. Do not hard-code `:99` or copy a stale `DISPLAY` from an
+    earlier boot. The supervisor should run the browser and AT-SPI inside the
+    same `dbus-run-session`, persist only the allow-listed desktop state, and
+    let Hermes rediscover the active display and session bus for each
+    cua-driver transport. Pure Wayland sessions need an XWayland bridge for
+    screen capture (cua-driver's Wayland inject path handles input
+    independently).
+
+### Lifecycle and recovery
+
+For unattended work, keep these lifetimes separate:
+
+`Telegram job → Hermes session → worker/browser takeover`
+
+- The Telegram job is the durable parent: its job ID, goal, current step or
+  checkpoint, browser target, approvals, and routing metadata live in Hermes's
+  persistent gateway/worker state. A browser or takeover transport expiry must
+  never complete or cancel this job.
+- The Hermes session owns the conversation and approval context. It may
+  reconnect its computer-use transport while retaining the same public session
+  identity and resuming from the latest safe checkpoint.
+- The worker/browser takeover is only a leased transport. Its display, DBus,
+  AT-SPI bus, and browser process can be recreated after a restart, expiry, or
+  reboot. Mutating actions are not replayed after an uncertain transport
+  failure; reacquire fresh state and use the persisted checkpoint before the
+  next action.
+
+The gateway remains authoritative for job ownership. Workers renew their
+leases with heartbeats, and a reconnect adds one short status notice to the
+originating tool result (and therefore the Telegram route). A configurable
+job-level timeout, when set, is the only wall-clock limit on the parent job;
+the transport lease is not that timeout.
+
+Dispatcher-owned computer-use calls append a redacted checkpoint to the
+existing Kanban task-event/run ledger: the task row remains the job/goal and
+current-step authority, while the event records the safe browser target,
+approval scopes, routing identity, and input outcome. A pending or uncertain
+input is a durable no-replay marker; it contains no tool arguments, page text,
+screenshots, cookies, passwords, or tokens.
+
+### 900-second timeout audit
+
+The numeric value `900` appears in several unrelated Hermes lifecycles:
+
+| Surface | What expires | Effect on a long-running job |
+|---|---|---|
+| Browser/computer-use takeover (driver/runtime) | The short-lived browser-control transport | Recreate the transport, rediscover the desktop, and resume from the safe checkpoint; never cancel the parent Telegram job. |
+| `kanban_db.DEFAULT_CLAIM_TTL_SECONDS` | A worker's ownership lease | Heartbeats extend the lease. Expiry is a reclaim signal only when the gateway cannot observe a live, progressing worker; it is not a job deadline. |
+| `Task.max_runtime_seconds` / `HERMES_AGENT_TIMEOUT` | The configured worker or agent-turn wall-clock budget | This is the actual job/turn deadline when configured (the agent timeout default is 1800s); it is independent of takeover expiry. |
+| `HERMES_AGENT_TIMEOUT_WARNING` | An inactivity warning threshold | Emits a warning; it is distinct from the gateway's configurable inactivity timeout and from the computer-use transport. |
+| OAuth, interaction-ticket, and other protocol TTLs | A login/approval/one-shot protocol artifact | Expire that artifact only; they do not own a Telegram job or Hermes session. |
+
+The full duration-bearing source scan maps the other `900`/15-minute values to
+bounded sub-operations or artifacts, not a parent job. Scheduler/relay values
+(`hermes_cli/cron.py`'s `_OVERDUE_GRACE_SECONDS`, `cron/` retry and backoff
+ceilings, `gateway/delivery_ledger.py`'s `FLOOD_RETRY_CAP_SECONDS`, and
+`tools/bot_relay.py`'s `DEFAULT_ENVELOPE_TTL_SECONDS`) diagnose, retry, or
+discard one queued delivery. Loop, CLI, and service values
+(`hermes_cli/loops.py`'s `DEFAULT_SELF_PACED_CEILING_SECONDS`, `/handoff`'s
+`_HANDOFF_RUNNING_TIMEOUT`, web-server idle grace, local-runtime model unload,
+install quarantine, observability failure backoff, `hermes_startup_watchdog`'s
+lease clamp, and auth keepalive) govern cadence, an isolated service, or a
+maintenance loop. They do not cancel a gateway-owned job.
+
+Provider/protocol values (`agent` request/read timeouts and compression
+cooldowns, video-generation poll deadlines, image-catalog cache TTL,
+command-token refresh windows, Codex/OAuth/MCP OAuth/TUI OAuth waits, and
+Discord/Feishu interaction or dedup windows) expire one provider attempt,
+cache entry, token, or UI artifact. `hermes_cli/web_server_idle_exit.py`'s
+900-second grace can retire an idle SSH-isolated backend, but only when it has
+no client and no running turn; it is not the parent Kanban/Telegram job's
+owner. The 900-second config defaults inherit those same scopes.
+The source scan deliberately excludes `900k` model-context aliases, image or
+message dimensions, SQL/page-size limits, and character/token caps because
+they are not timeouts or TTLs.
+
+The source tree has no hard-coded `:99`, `:122`, or `:124` computer-use display
+binding and no single 900-second computer-use parent-session kill. The active
+display, DBus address, and AT-SPI bus are resolved from the live browser
+desktop for each transport; the gateway/worker state remains the durable job
+authority.
 
 For cross-platform GUI automation without the desktop overhead (and
 without TCC / Session 0 / X11 setup), the `browser` toolset uses a

@@ -98,6 +98,43 @@ class TestDispatch:
         parsed = json.loads(out)
         assert "error" in parsed
 
+    def test_transport_reconnect_notice_is_emitted_once(self):
+        from tools.computer_use.tool import _with_transport_notice
+
+        backend = MagicMock()
+        backend.consume_transport_notice.side_effect = [
+            "Computer-use transport reconnected; reacquire fresh desktop state before another input action.",
+            None,
+        ]
+
+        first = json.loads(_with_transport_notice(backend, json.dumps({"ok": True})))
+        second = _with_transport_notice(backend, json.dumps({"ok": True}))
+
+        assert first["transport_reconnected"] is True
+        assert "reacquire fresh desktop state" in first["transport_notice"]
+        assert json.loads(second) == {"ok": True}
+
+    def test_handle_computer_use_delivers_reconnect_notice(self, monkeypatch):
+        import tools.computer_use.tool as computer_use_tool
+
+        backend = MagicMock()
+        backend.consume_transport_notice.return_value = "transport reconnected"
+        monkeypatch.setattr(computer_use_tool, "_get_backend", lambda **_kwargs: backend)
+        monkeypatch.setattr(
+            computer_use_tool,
+            "_dispatch",
+            lambda *_args, **_kwargs: json.dumps({"ok": True}),
+        )
+
+        result = json.loads(
+            computer_use_tool.handle_computer_use(
+                {"action": "list_apps"}, session_id="telegram-parent"
+            )
+        )
+
+        assert result["transport_reconnected"] is True
+        assert result["transport_notice"] == "transport reconnected"
+
 
     def test_type_action_routes_to_type_text_backend(self, noop_backend):
         """type action must call backend.type_text, not type_text_chars (issue #24170, bug 3)."""
@@ -1351,6 +1388,79 @@ class TestCuaDriverSessionReconnect:
         assert session.call_tool("list_apps", {}) == {"ok": True}
         assert session._reconnect_log == []
         assert session._timeout_suspect is False
+
+    def test_desktop_restart_reconnects_parent_transport_without_replaying(self, monkeypatch):
+        """A browser/display restart rebuilds transport, but a mutation runs once."""
+
+        class FakeBridge:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, value, timeout=None):
+                self.calls.append(value)
+                return {"ok": True}
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+        session._desktop_fingerprint = ("old-desktop",)
+        session._reconnect_log = []
+
+        monkeypatch.setattr(
+            "tools.computer_use.cua_backend.desktop_session_fingerprint",
+            lambda: ("new-desktop",),
+        )
+
+        session._stop_lifecycle_locked = lambda: session._reconnect_log.append("stop")
+
+        def start_replacement():
+            session._reconnect_log.append("start")
+            session._desktop_fingerprint = ("new-desktop",)
+
+        session._start_lifecycle_locked = start_replacement
+
+        assert session.call_tool("click", {"element_token": "fresh-token"}) == {"ok": True}
+        assert session._reconnect_log == ["stop", "start"]
+        assert bridge.calls == [("call", "click", {"element_token": "fresh-token"})]
+
+    def test_takeover_expiry_at_900_seconds_keeps_parent_and_resumes_without_replay(self):
+        """A 15-minute takeover expiry renews the transport, not the parent job."""
+        class FakeBridge:
+            def __init__(self):
+                self.calls = []
+                # The driver reports the logical session expiry at the observed 900-second boundary.
+                self.takeover_elapsed_seconds = 900
+                self.effects = [
+                    {
+                        "isError": True,
+                        "data": "session hermes-parent has ended; call start_session",
+                        "structuredContent": {},
+                    },
+                    {"isError": False},
+                    {"isError": False, "structuredContent": {"apps": []}},
+                ]
+
+            def run(self, value, timeout=None):
+                self.calls.append(value)
+                effect = self.effects.pop(0)
+                return effect
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+        session._declared_session_id = "hermes-parent"
+
+        expired_mutation = session.call_tool("click", {"session": "hermes-parent", "x": 20, "y": 30})
+        resumed_read = session.call_tool("list_apps", {"session": "hermes-parent"})
+
+        assert bridge.takeover_elapsed_seconds == 900
+        assert expired_mutation["structuredContent"]["code"] == "session_expired_no_replay"
+        assert resumed_read["isError"] is False
+        assert session._declared_session_id == "hermes-parent"
+        assert session._reconnect_log == ["stop", "start"]
+        assert bridge.calls == [
+            ("call", "click", {"session": "hermes-parent", "x": 20, "y": 30}),
+            ("call", "start_session", {"session": "hermes-parent"}),
+            ("call", "list_apps", {"session": "hermes-parent"}),
+        ]
 
     def test_mutation_does_not_cross_to_cli_on_transient_proxy_error(self):
         class FakeBridge:
