@@ -452,6 +452,13 @@ originating tool result (and therefore the Telegram route). A configurable
 job-level timeout, when set, is the only wall-clock limit on the parent job;
 the transport lease is not that timeout.
 
+Dispatcher-owned computer-use calls append a redacted checkpoint to the
+existing Kanban task-event/run ledger: the task row remains the job/goal and
+current-step authority, while the event records the safe browser target,
+approval scopes, routing identity, and input outcome. A pending or uncertain
+input is a durable no-replay marker; it contains no tool arguments, page text,
+screenshots, cookies, passwords, or tokens.
+
 ### 900-second timeout audit
 
 The numeric value `900` appears in several unrelated Hermes lifecycles:
@@ -460,8 +467,33 @@ The numeric value `900` appears in several unrelated Hermes lifecycles:
 |---|---|---|
 | Browser/computer-use takeover (driver/runtime) | The short-lived browser-control transport | Recreate the transport, rediscover the desktop, and resume from the safe checkpoint; never cancel the parent Telegram job. |
 | `kanban_db.DEFAULT_CLAIM_TTL_SECONDS` | A worker's ownership lease | Heartbeats extend the lease. Expiry is a reclaim signal only when the gateway cannot observe a live, progressing worker; it is not a job deadline. |
+| `Task.max_runtime_seconds` / `HERMES_AGENT_TIMEOUT` | The configured worker or agent-turn wall-clock budget | This is the actual job/turn deadline when configured (the agent timeout default is 1800s); it is independent of takeover expiry. |
 | `HERMES_AGENT_TIMEOUT_WARNING` | An inactivity warning threshold | Emits a warning; it is distinct from the gateway's configurable inactivity timeout and from the computer-use transport. |
 | OAuth, interaction-ticket, and other protocol TTLs | A login/approval/one-shot protocol artifact | Expire that artifact only; they do not own a Telegram job or Hermes session. |
+
+The full duration-bearing source scan maps the other `900`/15-minute values to
+bounded sub-operations or artifacts, not a parent job. Scheduler/relay values
+(`hermes_cli/cron.py`'s `_OVERDUE_GRACE_SECONDS`, `cron/` retry and backoff
+ceilings, `gateway/delivery_ledger.py`'s `FLOOD_RETRY_CAP_SECONDS`, and
+`tools/bot_relay.py`'s `DEFAULT_ENVELOPE_TTL_SECONDS`) diagnose, retry, or
+discard one queued delivery. Loop, CLI, and service values
+(`hermes_cli/loops.py`'s `DEFAULT_SELF_PACED_CEILING_SECONDS`, `/handoff`'s
+`_HANDOFF_RUNNING_TIMEOUT`, web-server idle grace, local-runtime model unload,
+install quarantine, observability failure backoff, `hermes_startup_watchdog`'s
+lease clamp, and auth keepalive) govern cadence, an isolated service, or a
+maintenance loop. They do not cancel a gateway-owned job.
+
+Provider/protocol values (`agent` request/read timeouts and compression
+cooldowns, video-generation poll deadlines, image-catalog cache TTL,
+command-token refresh windows, Codex/OAuth/MCP OAuth/TUI OAuth waits, and
+Discord/Feishu interaction or dedup windows) expire one provider attempt,
+cache entry, token, or UI artifact. `hermes_cli/web_server_idle_exit.py`'s
+900-second grace can retire an idle SSH-isolated backend, but only when it has
+no client and no running turn; it is not the parent Kanban/Telegram job's
+owner. The 900-second config defaults inherit those same scopes.
+The source scan deliberately excludes `900k` model-context aliases, image or
+message dimensions, SQL/page-size limits, and character/token caps because
+they are not timeouts or TTLs.
 
 The source tree has no hard-coded `:99`, `:122`, or `:124` computer-use display
 binding and no single 900-second computer-use parent-session kill. The active

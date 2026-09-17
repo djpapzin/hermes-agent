@@ -328,6 +328,18 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
         # context.
         self._snapshot_tokens: Dict[int, str] = {}
 
+    def computer_use_target(self) -> Dict[str, Any]:
+        """Return safe target metadata for a durable worker checkpoint.
+
+        Only the app label and native numeric ids are exposed. Window titles,
+        URLs, page text, cookies, and credentials never enter job state.
+        """
+        return {
+            "app": self._last_app,
+            "pid": self._active_pid,
+            "window_id": self._active_window_id,
+        }
+
     def _set_active_target(self, target: Dict[str, Any]) -> None:
         self._active_pid = target["pid"]
         self._active_window_id = target["window_id"]
