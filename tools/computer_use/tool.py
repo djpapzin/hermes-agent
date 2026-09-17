@@ -310,7 +310,8 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
         with _backend_lock:
             call_lock = _backend_call_locks.setdefault(session_id, threading.RLock())
         with call_lock:
-            return _dispatch(backend, action, args, session_id=session_id or None)
+            result = _dispatch(backend, action, args, session_id=session_id or None)
+            return _with_transport_notice(backend, result)
     except Exception as e:
         logger.exception("computer_use %s failed", action)
         return json.dumps({"error": f"{action} failed: {e}"})
@@ -447,6 +448,28 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any], se
                        bring_to_front=bool(args.get("bring_to_front")), **({} if spec.input else {"session_id": session_id}))
     return res if isinstance(res, (str, dict)) else _maybe_follow_capture(backend, res, bool(args.get("capture_after")),
                                                                          session_id=session_id)
+
+
+def _with_transport_notice(backend: ComputerUseBackend, result: Any) -> Any:
+    """Attach one safe reconnect notice to the next result from a replaced transport.
+
+    The computer-use result is delivered through the originating channel (including Telegram), so this keeps the
+    operator informed without introducing a second notification path or exposing desktop/session credentials.
+    """
+    consume = getattr(backend, "consume_transport_notice", None)
+    notice = consume() if callable(consume) else None
+    if not notice:
+        return result
+    fields = {"transport_reconnected": True, "transport_notice": notice}
+    if isinstance(result, dict):
+        return {**result, **fields}
+    if isinstance(result, str):
+        with contextlib.suppress(json.JSONDecodeError):
+            payload = json.loads(result)
+            if isinstance(payload, dict):
+                return json.dumps({**payload, **fields})
+        return json.dumps({"result": result, **fields})
+    return result
 
 # ── Response shaping ────────────────────────────────────────────────────────
 def _classify_action_result(res: ActionResult) -> Dict[str, Any]:
