@@ -189,6 +189,58 @@ def _int_value(value: Optional[str]) -> Optional[int]:
     return number if number > 0 else None
 
 
+def _process_parent_pid(pid: int) -> Optional[int]:
+    """Return a Linux process' parent without trusting the comm field layout."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return None
+    _, separator, remainder = raw.partition(")")
+    if not separator:
+        return None
+    fields = remainder.split()
+    if len(fields) < 2:
+        return None
+    try:
+        parent = int(fields[1])  # state is fields[0]; ppid is fields[1]
+    except ValueError:
+        return None
+    return parent if parent > 0 else None
+
+
+def _pid_is_descendant(pid: Optional[int], ancestor: Optional[int]) -> bool:
+    """Whether *pid* is still in the desktop supervisor's process tree."""
+    if pid is None or ancestor is None or pid <= 0 or ancestor <= 0:
+        return False
+    current = pid
+    seen: set[int] = set()
+    for _ in range(64):
+        if current == ancestor:
+            return True
+        if current in seen:
+            return False
+        seen.add(current)
+        parent = _process_parent_pid(current)
+        if parent is None or parent == 1:
+            return False
+        current = parent
+    return False
+
+
+def _browser_belongs_to_state(pid: Optional[int], state: Dict[str, str]) -> bool:
+    """Reject a browser PID copied into state by another desktop generation."""
+    if pid is None:
+        return False
+    session_pid = _int_value(state.get("SESSION_PID"))
+    if session_pid is not None:
+        return _pid_is_descendant(pid, session_pid)
+    # Legacy state written before SESSION_PID existed remains usable, but a
+    # configured browser must still agree with the state rather than silently
+    # claiming a different running desktop.
+    configured_pid = _int_value(state.get("BROWSER_PID"))
+    return configured_pid is None or configured_pid == pid
+
+
 def _proc_uid(pid: int) -> Optional[int]:
     try:
         return Path(f"/proc/{pid}").stat().st_uid
@@ -289,10 +341,21 @@ def _iter_browser_processes() -> Iterable[_BrowserProcess]:
 
 
 def _find_browser(state: Dict[str, str]) -> Optional[_BrowserProcess]:
-    configured = _browser_from_pid(_int_value(state.get("BROWSER_PID")), rank=1000)
-    if configured is not None:
+    configured_pid = _int_value(state.get("BROWSER_PID"))
+    configured = _browser_from_pid(configured_pid, rank=1000)
+    if configured is not None and _browser_belongs_to_state(configured.pid, state):
         return configured
     candidates = list(_iter_browser_processes())
+    session_pid = _int_value(state.get("SESSION_PID"))
+    if session_pid is not None:
+        session_candidates = [
+            candidate
+            for candidate in candidates
+            if _pid_is_descendant(candidate.pid, session_pid)
+        ]
+        if session_candidates:
+            session_candidates.sort(key=lambda candidate: candidate.score, reverse=True)
+            return session_candidates[0]
     candidates.sort(key=lambda candidate: candidate.score, reverse=True)
     return candidates[0] if candidates else None
 
@@ -543,6 +606,7 @@ def _resolve_desktop_context(
 ) -> Tuple[Dict[str, str], Optional[int], Dict[str, str]]:
     state = _read_state()
     browser = _find_browser(state)
+    session_env = _read_process_env(_int_value(state.get("SESSION_PID")))
     env = dict(base_env)
     browser_pid: Optional[int] = None
 
@@ -550,7 +614,11 @@ def _resolve_desktop_context(
     if browser is not None:
         browser_pid = browser.pid
         display_candidates.append(browser.env.get("DISPLAY", ""))
-    display_candidates.extend((state.get("DISPLAY", ""), base_env.get("DISPLAY", "")))
+    display_candidates.extend((
+        session_env.get("DISPLAY", ""),
+        state.get("DISPLAY", ""),
+        base_env.get("DISPLAY", ""),
+    ))
     display = next(
         (
             candidate
@@ -572,13 +640,22 @@ def _resolve_desktop_context(
         for key in ("XDG_RUNTIME_DIR", "XAUTHORITY", "HOME"):
             if browser.env.get(key):
                 env[key] = browser.env[key]
+        for key in ("XDG_RUNTIME_DIR", "XAUTHORITY", "HOME"):
+            if not env.get(key) and session_env.get(key):
+                env[key] = session_env[key]
         path = _merge_path(browser.env.get("PATH"), base_env.get("PATH"))
         if path:
             env["PATH"] = path
+    for key in ("XDG_RUNTIME_DIR", "XAUTHORITY", "HOME"):
+        if not env.get(key) and session_env.get(key):
+            env[key] = session_env[key]
+    if session_env.get("PATH"):
+        env["PATH"] = _merge_path(env.get("PATH"), session_env.get("PATH"))
 
     runtime_candidates = []
     if browser is not None:
         runtime_candidates.append(browser.env.get("XDG_RUNTIME_DIR", ""))
+    runtime_candidates.append(session_env.get("XDG_RUNTIME_DIR", ""))
     runtime_candidates.extend((
         state.get("XDG_RUNTIME_DIR", ""),
         base_env.get("XDG_RUNTIME_DIR", ""),
@@ -599,6 +676,7 @@ def _resolve_desktop_context(
     bus_candidates = []
     if browser is not None:
         bus_candidates.append(browser.env.get("DBUS_SESSION_BUS_ADDRESS", ""))
+    bus_candidates.append(session_env.get("DBUS_SESSION_BUS_ADDRESS", ""))
     bus_candidates.extend((
         state.get("DBUS_SESSION_BUS_ADDRESS", ""),
         base_env.get("DBUS_SESSION_BUS_ADDRESS", ""),
@@ -621,6 +699,7 @@ def _resolve_desktop_context(
     at_spi_candidates = []
     if browser is not None:
         at_spi_candidates.append(browser.env.get("AT_SPI_BUS_ADDRESS", ""))
+    at_spi_candidates.append(session_env.get("AT_SPI_BUS_ADDRESS", ""))
     at_spi_candidates.extend((
         state.get("AT_SPI_BUS_ADDRESS", ""),
         base_env.get("AT_SPI_BUS_ADDRESS", ""),
@@ -672,7 +751,7 @@ def desktop_session_child_env(
             if at_spi:
                 env["AT_SPI_BUS_ADDRESS"] = at_spi
 
-    if env.get("DISPLAY") and browser_pid:
+    if env.get("DISPLAY") and browser_pid and _browser_belongs_to_state(browser_pid, state):
         _write_state(
             {
                 "DISPLAY": env.get("DISPLAY", ""),

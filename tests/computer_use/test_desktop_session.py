@@ -130,6 +130,101 @@ def test_missing_bus_is_repaired_and_atspi_state_is_allowlisted(monkeypatch, tmp
 
 
 @pytest.mark.linux_only
+def test_state_browser_from_another_desktop_generation_is_ignored(monkeypatch):
+    from tools.computer_use import desktop_session as module
+
+    stale = module._BrowserProcess(
+        pid=222,
+        env={"DISPLAY": ":124"},
+        score=(1000, 0, 1, 222),
+    )
+    active = module._BrowserProcess(
+        pid=333,
+        env={},
+        score=(1, 1, 1, 333),
+    )
+    monkeypatch.setattr(
+        module,
+        "_browser_from_pid",
+        lambda pid, rank=0: stale if pid == stale.pid else None,
+    )
+    monkeypatch.setattr(module, "_iter_browser_processes", lambda: [stale, active])
+    monkeypatch.setattr(
+        module,
+        "_pid_is_descendant",
+        lambda pid, ancestor: pid == active.pid and ancestor == 111,
+    )
+
+    found = module._find_browser(
+        {"BROWSER_PID": str(stale.pid), "SESSION_PID": "111"}
+    )
+
+    assert found is active
+
+
+@pytest.mark.linux_only
+def test_active_session_environment_beats_overwritten_display_state(
+    monkeypatch, tmp_path
+):
+    from tools.computer_use import desktop_session as module
+
+    runtime = str(tmp_path / "runtime")
+    active = module._BrowserProcess(
+        pid=333,
+        env={},
+        score=(1, 1, 1, 333),
+    )
+    state = {
+        "DISPLAY": ":124",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/tmp/stale-bus",
+        "AT_SPI_BUS_ADDRESS": "unix:path=/tmp/stale-atspi",
+        "BROWSER_PID": "222",
+        "SESSION_PID": "111",
+    }
+    session_env = {
+        "DISPLAY": ":77",
+        "XDG_RUNTIME_DIR": runtime,
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/tmp/active-bus",
+    }
+    written = {}
+
+    monkeypatch.setattr(module, "_read_state", lambda: state)
+    monkeypatch.setattr(module, "_find_browser", lambda _state: active)
+    monkeypatch.setattr(
+        module,
+        "_read_process_env",
+        lambda pid: session_env if pid == 111 else {},
+    )
+    monkeypatch.setattr(module, "_display_has_socket", lambda value: value == ":77")
+    monkeypatch.setattr(
+        module, "_valid_runtime_dir", lambda value: value if value == runtime else None
+    )
+    monkeypatch.setattr(
+        module,
+        "_address_is_usable",
+        lambda value, *_args, **_kwargs: value == session_env["DBUS_SESSION_BUS_ADDRESS"],
+    )
+    monkeypatch.setattr(
+        module, "_address_is_valid", lambda value, **_kwargs: value == session_env["DBUS_SESSION_BUS_ADDRESS"]
+    )
+    monkeypatch.setattr(
+        module,
+        "_pid_is_descendant",
+        lambda pid, ancestor: pid == active.pid and ancestor == 111,
+    )
+    monkeypatch.setattr(
+        module, "_write_state", lambda values, existing=None: written.update(values)
+    )
+
+    env = module.desktop_session_child_env({"DISPLAY": ":124"}, repair=False)
+
+    assert env["DISPLAY"] == ":77"
+    assert env["XDG_RUNTIME_DIR"] == runtime
+    assert env["DBUS_SESSION_BUS_ADDRESS"] == session_env["DBUS_SESSION_BUS_ADDRESS"]
+    assert written["BROWSER_PID"] == str(active.pid)
+
+
+@pytest.mark.linux_only
 def test_stale_bus_socket_is_rejected_by_liveness_probe(monkeypatch, tmp_path):
     from tools.computer_use import desktop_session as module
 

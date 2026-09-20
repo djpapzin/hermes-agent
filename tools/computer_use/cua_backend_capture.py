@@ -80,8 +80,17 @@ def _sorted_windows(out: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _tree_and_title(out: Dict[str, Any]) -> Tuple[str, str]:
     """``(tree_markdown, window_title)`` from a get_window_state result."""
-    tree = _split_tree_text(data if isinstance((data := out.get("data")), str) else "")[1]
-    return tree, (match.group(1) if (match := re.search(r'AXWindow\s+"([^"]+)"', tree)) else "")
+    data = out.get("data")
+    tree = _split_tree_text(data if isinstance(data, str) else "")[1]
+    text_title = match.group(1) if (match := re.search(r'AXWindow\s+"([^"]+)"', tree)) else ""
+
+    # Modern cua-driver responses keep the canonical title in structuredContent
+    # while ``data`` is only a compact human-readable summary.  Prefer that
+    # field so a healthy AX/screenshot response does not get reported as an
+    # untitled window merely because the text summary changed shape.
+    structured = out.get("structuredContent")
+    structured_title = structured.get("window_title") if isinstance(structured, dict) else None
+    return tree, structured_title if isinstance(structured_title, str) else text_title
 
 def _gws_is_empty(out: Dict[str, Any]) -> bool:
     """True when a get_window_state result carries neither a screenshot nor a parseable tree. Modern
