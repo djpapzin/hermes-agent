@@ -3659,6 +3659,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_header(lines, task)
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
+    _ctx_computer_use_checkpoint(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
     _ctx_comments(lines, list_comments(conn, task_id), now)
@@ -3707,6 +3708,8 @@ def _ctx_header(lines: list[str], task: Task) -> None:
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")
+    if task.current_step_key:
+        lines.append(f"Current step: {task.current_step_key}")
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
@@ -3770,6 +3773,56 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
         if meta_line:
             lines.append(meta_line)
         lines.append("")
+
+
+def _ctx_computer_use_checkpoint(
+    lines: list[str], conn: sqlite3.Connection, task_id: str, now: int,
+) -> None:
+    """Render the latest safe computer-use checkpoint for a resumed worker.
+
+    The event payload is intentionally a narrow, redacted metadata record. It
+    contains no tool arguments, screenshot bytes, page text, cookies, or
+    credentials. An ``uncertain``/``pending`` input is explicitly surfaced so
+    a successor cannot blindly repeat it after a transport or worker restart.
+    """
+    row = conn.execute(
+        "SELECT payload, created_at, run_id FROM task_events "
+        "WHERE task_id = ? AND kind IN ('computer_use_checkpoint', 'computer_use_operation') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    payload = _json_dict(row["payload"])
+    checkpoint = payload.get("checkpoint")
+    if not isinstance(checkpoint, dict):
+        return
+    action = str(checkpoint.get("action") or "unknown")
+    status = str(checkpoint.get("status") or "unknown")
+    safe_to_resume = checkpoint.get("safe_to_resume") is True
+    lines.append("## Latest computer-use checkpoint")
+    lines.append(
+        f"- `{action}` → `{status}` ({_ctx_stamp(int(row['created_at']), now)})"
+        + (f", run {int(row['run_id'])}" if row["run_id"] else "")
+    )
+    target = payload.get("browser_target")
+    if isinstance(target, dict):
+        target_bits = []
+        if target.get("app"):
+            target_bits.append(f"app={target['app']!r}")
+        for field in ("pid", "window_id"):
+            if target.get(field):
+                target_bits.append(f"{field}={target[field]}")
+        if target_bits:
+            lines.append("- browser target: " + ", ".join(target_bits))
+    if payload.get("transport_reconnected"):
+        lines.append("- transport: reconnected; the desktop target was reacquired")
+    if not safe_to_resume:
+        lines.append(
+            "- recovery rule: the last input outcome is not proven; do not replay it. "
+            "Capture fresh state and continue from the checkpoint."
+        )
+    lines.append("")
 
 
 def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:

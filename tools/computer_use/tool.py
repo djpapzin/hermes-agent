@@ -293,25 +293,108 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     if not action:
         return json.dumps({"error": "missing `action`"})
     session_id = str(kwargs.get("session_id") or "")  # approval-state / daemon-mode isolation key
+    tool_call_id = str(kwargs.get("tool_call_id") or "") or None
+    from tools.computer_use.checkpoint import (
+        begin_operation,
+        record_checkpoint,
+        record_operation_result,
+    )
     if (err := _reject_unsafe(action, args)) is not None:
         return err
     scopes = ([action] if action in _ACTIONS and _ACTIONS[action].destructive else []) + (
         ["bring_to_front"] if args.get("bring_to_front") or (action == "focus_app" and args.get("raise_window")) else [])
     for scope in scopes:
         if (err := _request_approval(scope, args)) is not None:
+            record_checkpoint(
+                action=action,
+                session_id=session_id,
+                backend=None,
+                approval_scopes=scopes,
+                status="approval_denied",
+            )
             return err
     try:
         backend = _get_backend(session_id=session_id)
     except Exception as e:
+        record_checkpoint(
+            action=action,
+            session_id=session_id,
+            backend=None,
+            approval_scopes=scopes,
+            status="failed",
+        )
         return json.dumps({"error": f"computer_use backend unavailable: {e}",
                            "hint": "If the cua-driver binary is missing, run `hermes computer-use install`. "
                                    "If a Python dependency is missing, the error above shows the exact install command."})
+    operation = begin_operation(
+        action=action,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        backend=backend,
+        approval_scopes=scopes,
+    )
+    if operation.duplicate:
+        if operation.prior_status == "checkpoint_unavailable":
+            return json.dumps({
+                "ok": False,
+                "code": "checkpoint_unavailable",
+                "error": (
+                    "Hermes could not durably claim this computer-use input. "
+                    "No desktop action was sent; retry after the parent job's gateway store recovers."
+                ),
+                "next_step": "retry_after_checkpoint_store_recovers",
+            })
+        return json.dumps({
+            "ok": False,
+            "code": "duplicate_action_no_replay",
+            "error": (
+                "This computer-use input already has a durable pending or completed outcome. "
+                "Hermes did not replay it; reacquire fresh desktop state before deciding whether to act again."
+            ),
+            "next_step": "fresh_state",
+        })
     try:
         with _backend_lock:
             call_lock = _backend_call_locks.setdefault(session_id, threading.RLock())
         with call_lock:
-            return _dispatch(backend, action, args, session_id=session_id or None)
+            result = _dispatch(backend, action, args, session_id=session_id or None)
+            result = _with_transport_notice(backend, result)
+            if operation.operation_id:
+                record_operation_result(
+                    action=action,
+                    session_id=session_id,
+                    backend=backend,
+                    approval_scopes=scopes,
+                    operation_id=operation.operation_id,
+                    result=result,
+                )
+            else:
+                record_checkpoint(
+                    action=action,
+                    session_id=session_id,
+                    backend=backend,
+                    approval_scopes=scopes,
+                    result=result,
+                )
+            return result
     except Exception as e:
+        if operation.operation_id:
+            record_operation_result(
+                action=action,
+                session_id=session_id,
+                backend=backend,
+                approval_scopes=scopes,
+                operation_id=operation.operation_id,
+                error=e,
+            )
+        else:
+            record_checkpoint(
+                action=action,
+                session_id=session_id,
+                backend=backend,
+                approval_scopes=scopes,
+                status="uncertain",
+            )
         logger.exception("computer_use %s failed", action)
         return json.dumps({"error": f"{action} failed: {e}"})
 
@@ -447,6 +530,28 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any], se
                        bring_to_front=bool(args.get("bring_to_front")), **({} if spec.input else {"session_id": session_id}))
     return res if isinstance(res, (str, dict)) else _maybe_follow_capture(backend, res, bool(args.get("capture_after")),
                                                                          session_id=session_id)
+
+
+def _with_transport_notice(backend: ComputerUseBackend, result: Any) -> Any:
+    """Attach one safe reconnect notice to the next result from a replaced transport.
+
+    The computer-use result is delivered through the originating channel (including Telegram), so this keeps the
+    operator informed without introducing a second notification path or exposing desktop/session credentials.
+    """
+    consume = getattr(backend, "consume_transport_notice", None)
+    notice = consume() if callable(consume) else None
+    if not notice:
+        return result
+    fields = {"transport_reconnected": True, "transport_notice": notice}
+    if isinstance(result, dict):
+        return {**result, **fields}
+    if isinstance(result, str):
+        with contextlib.suppress(json.JSONDecodeError):
+            payload = json.loads(result)
+            if isinstance(payload, dict):
+                return json.dumps({**payload, **fields})
+        return json.dumps({"result": result, **fields})
+    return result
 
 # ── Response shaping ────────────────────────────────────────────────────────
 def _classify_action_result(res: ActionResult) -> Dict[str, Any]:
